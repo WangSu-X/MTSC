@@ -21,79 +21,76 @@ Proxy 不负责 Store lookup，不计算 `A`，也不作为 D ready barrier。
 ```mermaid
 classDiagram
     class PDProxy {
-        +handleRequest(request)
-        +cancelSession(sessionKey)
-    }
-    class RouteSelector {
-        +selectPrefill() PrefillEndpoint
-        +selectDecode() DecodeEndpoint
+        +prefill: PrefillEndpoint[]
+        +decode: DecodeEndpoint[]
+        +sessions: dict
+        +status()
+        +completions(request)
+        +chat_completions(request)
+        +close()
+        -_new_session(request, route) TransferSession
+        -_prefill_body(body, session) dict
+        -_decode_body(body, session) dict
+        -_run_prefill(...)
+        -_stream_decode(...)
+        -_handle(request, route) Response
     }
     class TransferSession {
-        +requestId
-        +transferId
-        +prefillEndpoint
-        +decodeEndpoint
-        +state
-        +deadline
+        +request_id: str
+        +transfer_id: str
+        +prefill: PrefillEndpoint
+        +decode: DecodeEndpoint
+        +metrics: RequestMetrics
+        +prefill_task: Task
     }
-    class PRequestSpec {
-        +requestIdHeader
-        +transferId
-        +doRemoteDecode
-        +doRemotePrefill
-        +selectedDpRank
+    class PrefillEndpoint {
+        +api_url: str
+        +engine_id: str
+        +bootstrap_addr: str
+        +dp_rank: int
     }
-    class DRequestSpec {
-        +requestIdHeader
-        +transferId
-        +doRemoteDecode
-        +doRemotePrefill
-        +remoteEngineId
-        +remoteBootstrapAddr
-    }
-    class SessionRegistry {
-        +put(session)
-        +get(sessionKey)
-        +finish(sessionKey)
-    }
-    class PrefillClient {
-        +startPrefill(request, params)
-        +cancel(requestId)
-    }
-    class DecodeClient {
-        +streamDecode(request, params)
-        +cancel(requestId)
+    class DecodeEndpoint {
+        +api_url: str
     }
     class RequestMetrics {
-        +markPrefillStart()
-        +markPrefillEnd(result)
-        +markDecodeStart()
-        +markDecodeFirstChunk()
-        +markDecodeEnd(result)
-        +finalize(outcome)
-        +toJson() string
+        +request_id: str
+        +transfer_id: str
+        +prefill_start_at: float
+        +prefill_end_at: float
+        +decode_start_at: float
+        +decode_first_chunk_at: float
+        +decode_end_at: float
+        +outcome: str
+        +set_body(body)
+        +to_record() dict
     }
     class JsonlMetricsWriter {
-        +enqueue(record)
-        +run()
-        +shutdown()
+        +path: Path
+        +write_failures: int
+        +write(record)
+        +close()
+        -_run()
+    }
+    class ClientSession {
+        <<aiohttp>>
+        +post(url, json, headers)
+        +close()
     }
 
-    PDProxy --> RouteSelector
-    PDProxy --> SessionRegistry
-    PDProxy --> PrefillClient
-    PDProxy --> DecodeClient
-    SessionRegistry o-- TransferSession
-    TransferSession ..> PRequestSpec : builds wire spec
-    TransferSession ..> DRequestSpec : builds wire spec
-    PrefillClient ..> PRequestSpec : sends
-    DecodeClient ..> DRequestSpec : sends
-    TransferSession o-- RequestMetrics
-    PDProxy --> JsonlMetricsWriter
-    JsonlMetricsWriter ..> RequestMetrics : writes finalized record
+    PDProxy o-- PrefillEndpoint
+    PDProxy o-- DecodeEndpoint
+    PDProxy o-- TransferSession : sessions
+    PDProxy *-- JsonlMetricsWriter
+    PDProxy ..> ClientSession : per request
+    TransferSession --> PrefillEndpoint
+    TransferSession --> DecodeEndpoint
+    TransferSession *-- RequestMetrics
+    JsonlMetricsWriter ..> RequestMetrics : writes record
 ```
 
-`TransferSession` 仅存在于 Proxy 内部；`PRequestSpec` 和 `DRequestSpec` 是从 session 投影出的 wire data，而不是对 `TransferSession` 的序列化。
+该图与 `proxy/pd_proxy.py` 当前实现一一对应。路由选择直接由 `PDProxy` 内部的 round-robin cycle 完成，session registry 就是 `PDProxy.sessions`，HTTP client 使用请求级 `aiohttp.ClientSession`。代码中没有独立的 `RouteSelector`、`SessionRegistry`、`PrefillClient` 或 `DecodeClient` 类。
+
+`TransferSession` 仅存在于 Proxy 内部。`PRequestSpec` 和 `DRequestSpec` 是设计层名称，代码中分别由 `PDProxy._prefill_body()` 和 `PDProxy._decode_body()` 构造成普通 `dict`，不是独立类，也不是对 `TransferSession` 的序列化。
 
 ## 3. 核心 Spec
 
@@ -155,7 +152,7 @@ P 请求用于生成 prompt KV，不向客户端返回正常生成结果。`PReq
 }
 ```
 
-`model` 和 prompt/messages 从原始请求复制。仅当原请求存在 `max_completion_tokens` 时才在 P body 中保留它并设为 `1`；`stream_options` 不写入 P body。P 不需要 D hostname、TE port 或 destination block IDs，这些信息稍后由 D Connector 通过 `MooncakeXferMetadata` 发给 P listener。
+`model` 和 prompt/messages 从原始请求复制。仅当原请求存在 `max_completion_tokens` 时才在 P body 中保留它并设为 `1`；`stream_options` 不写入 P body。P 不需要 D hostname、TE port 或 destination block IDs，这些信息稍后由 D Connector 通过 MTSC `PDTransferRequest` 发给 P listener。
 
 ### 3.3 DRequestSpec
 
@@ -179,13 +176,14 @@ D 请求保留原始 model、prompt/messages、sampling parameters、`max_tokens
       "do_remote_prefill": true,
       "remote_engine_id": "<selected-prefill-engine>",
       "remote_bootstrap_addr": "http://prefill-host:bootstrap-port",
+      "remote_dp_rank": 0,
       "transfer_id": "xfer-<request-id>"
     }
   }
 }
 ```
 
-`model`、prompt/messages、sampling parameters、`stream` 和 token limits 均从原始请求原样复制。`remote_engine_id` 必须与 P HTTP 请求选中的 DP engine 一致。`remote_bootstrap_addr` 只用于查询该 engine 下各 TP/PP worker 的 ZMQ listener，不是 KV 数据传输地址。
+`model`、prompt/messages、sampling parameters、`stream` 和 token limits 均从原始请求原样复制。`remote_engine_id` 与 `remote_dp_rank` 必须精确指向 P HTTP 请求选中的 DP replica。`remote_bootstrap_addr` 只用于查询该 engine 下各 TP/PP worker 的 ZMQ listener，不是 KV 数据传输地址。
 
 **P/D wire spec 字段不变式**
 
@@ -195,6 +193,7 @@ Proxy 发送 P/D 请求前必须校验：
 P.X-Request-Id == D.X-Request-Id == request_id
 P.transfer_id  == D.transfer_id  == TransferSession.transfer_id
 D.remote_engine_id == selected P engine_id
+D.remote_dp_rank == selected P dp_rank
 D.remote_bootstrap_addr == selected P bootstrap address
 ```
 
@@ -206,15 +205,13 @@ D.remote_bootstrap_addr == selected P bootstrap address
 sequenceDiagram
     participant C as Client
     participant X as PDProxy
-    participant R as RouteSelector
     participant P as Prefill API
     participant D as Decode API
     participant M as JSONL Metrics Writer
 
     C->>X: inference request
     X->>X: record request_received_at
-    X->>R: select P and D
-    R-->>X: fixed P/D endpoints
+    X->>X: select P and D from round-robin cycles
     X->>X: create request_id and transfer_id
     X->>X: build PRequestSpec and DRequestSpec
     par start P

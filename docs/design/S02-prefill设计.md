@@ -3,6 +3,8 @@
 > 上位文档：[S00-整体设计](./S00-整体设计.md)  
 > 参考实现：`vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py` 与 `mooncake/store/`
 
+> 实现边界：只复用底层 `MooncakeDistributedStore`、`TransferEngine` 和无状态 helper；不创建原生 Mooncake Connector/Scheduler/Worker 实例。
+
 ## 1. 设计定位
 
 MTSC 不为 Prefill 和 Decode 实现两套 Connector。P/D 共用同一套 `connector.py`、`scheduler.py`、`worker.py` 和 metadata protocol，内部根据进程侧 role、引擎侧 role 和 request params 选择逻辑。
@@ -111,7 +113,7 @@ P Proxy 将 `max_tokens=1`，因此正常 P 请求以 length-capped 状态结束
 - 启动 Store recv/save 后台线程；
 - P worker 启动 ZMQ listener，并向 bootstrap 注册 side-channel address。
 
-由一个 `BufferRegistrationManager` 负责注册和销毁顺序。即使 Store 和 PD 初版使用两个 TE 实例，也不得让两个子组件独立抢占 Connector shutdown 所有权。
+当前由 `MTSCWorker.register_kv_caches()` 和 `MTSCWorker.close()` 统一编排注册、fence、销毁与异常回滚顺序。Store 和 PD 使用各自底层对象，但不各自抢占 Connector shutdown 所有权。
 
 #### `start_load_kv(forward_context)`
 
@@ -141,11 +143,11 @@ P 侧执行顺序：
 
 1. 从当前 `MTSCConnectorMetadata` 中将未发布的 Store GET 加入 recv queue；
 2. 为可保存的 blocks record CUDA event，将 Store PUT 加入 save queue；
-3. 将 PD placeholder/source-ready/abort deltas 同步到 `PDSendCoordinator`；
+3. 通过 `PDTransfer.apply_updates()` 同步 PD placeholder/source-ready/abort deltas；
 4. 轮询 Store GET completion 和 failed block IDs；
 5. 轮询 Store PUT completion；
 6. 轮询 PD TE WRITE completion/timeout；
-7. 通过 `PCompletionAggregator` 返回：
+7. 由 `MTSCWorker._aggregate_sends()` 聚合 Store/PD send completion 并返回：
 
 ```text
 (finished_sending, finished_recving)
@@ -163,112 +165,147 @@ P 侧执行顺序：
 ```mermaid
 classDiagram
     class MTSCConnector {
-        +role: KVConnectorRole
-        +kvRole: str
-        +getNumNewMatchedTokens(request, computed)
-        +updateStateAfterAlloc(request, blocks, external)
-        +buildConnectorMeta(output)
-        +updateConnectorOutput(output)
-        +requestFinished(request, blocks)
-        +registerKVCaches(caches)
-        +startLoadKV(context)
-        +waitForLayerLoad(layer)
-        +saveKVLayer(layer, cache, metadata)
-        +waitForSave()
-        +getFinished(finishedIds)
+        +scheduler: MTSCScheduler
+        +worker: MTSCWorker
+        +get_num_new_matched_tokens(request, computed)
+        +update_state_after_alloc(request, blocks, external)
+        +build_connector_meta(output) MTSCConnectorMetadata
+        +request_finished_all_groups(request, blocks)
+        +register_kv_caches(caches)
+        +handle_preemptions(metadata)
+        +get_finished(finished_ids)
+        +shutdown()
     }
     class MTSCScheduler {
-        +storeLookupStates
-        +pdSendStates
-        +pendingDeltas
-        +getNumNewMatchedTokens(request, computed)
-        +updateStateAfterAlloc(request, blocks, external)
-        +buildConnectorMeta(output)
-        +requestFinished(request, blocks)
+        +lookup_client: StoreLookupClient
+        -_decisions: dict
+        -_tracked: dict
+        -_pending_store: StoreRequest[]
+        -_pending_pd: PDSendUpdate[]
+        -_pending_requirements: dict
+        +get_num_new_matched_tokens(request, computed)
+        +update_state_after_alloc(request, blocks, external)
+        +build_connector_meta(output) MTSCConnectorMetadata
+        +request_finished(request, blocks)
+        +update_connector_output(output)
     }
     class MTSCWorker {
-        +registerKVCaches(caches)
-        +getFinished(finishedIds)
-        +shutdown()
+        +store: StoreIO
+        +pd: PDTransfer
+        -_send: dict
+        +register_kv_caches(caches)
+        +handle_preemptions(metadata)
+        +get_finished(finished_ids, metadata)
+        +close()
     }
-    class PRequestState {
-        +requestId
-        +transferId
-        +storeState
-        +prefillState
-        +pdSendState
-        +storeSaveState
-        +loadBlockIds
-        +sourceBlockIds
+    class _LookupDecision {
+        +local_tokens: int
+        +store_tokens: int
+        +target_tokens: int
+    }
+    class _TrackedRequest {
+        +request: Request
+        +block_ids: tuple
+        +token_count: int
+        +saved_tokens: int
     }
     class StoreLookupClient {
-        +lookup(requestId, hashes) OptionalInt
-        +discard(requestId)
+        -_futures: dict
+        +lookup(request_id, token_count, hashes, asynchronous)
+        +discard(request_id)
+        +reset() bool
+        +close()
     }
     class StoreLookupServer {
-        +lookup(tokenLength, hashes) int
-        +resetStore() bool
+        -_owner: StoreIO
+        -_serve()
+        +close()
     }
-    class StoreIOCoordinator {
-        +enqueueLoad(spec)
-        +enqueueSave(spec, cudaEvent)
-        +pollRecvCompletions()
-        +pollSendCompletions()
-        +takeLoadErrors() BlockIds
+    class StoreIO {
+        -_loads: dict
+        -_saves: dict
+        +register(caches)
+        +lookup(token_count, hashes) int
+        +enqueue_load(request)
+        +enqueue_save(request, event)
+        +poll(finished_ids)
+        +take_errors() set
+        +finish_preempted_loads(ids)
+        +finish_preempted_saves(ids)
+        +close()
     }
-    class PDSendCoordinator {
-        +registerPlaceholder(transferId)
-        +setSourceReady(transferId, blocks)
-        +handlePullMetadata(metadata)
-        +pollCompletions()
-        +abort(transferId)
+    class PDTransfer {
+        -_sources: dict
+        +regions: TransferRegion[]
+        +schema: PDTransferSchema
+        +register(caches)
+        +apply_updates(updates)
+        +poll()
+        +close()
     }
     class BootstrapServer {
-        +registerWorker(engineId, rank, address)
-        +queryWorkers() WorkerAddressMap
+        +workers: dict
+        +register(payload)
+        +query()
+        +close()
     }
-    class PListener {
-        +listen()
-        +handleTransferRequest(metadata)
-        +sendResponse(response)
+    class _Source {
+        +request_id: str
+        +transfer_id: str
+        +block_ids: tuple
+        +published: bool
+        +abort: bool
+        +expected: int
+        +terminal: int
+        +active_writes: int
     }
-    class TransferPlanner {
-        +validate(metadata, state)
-        +buildWriteDescriptors() Descriptors
+    class MTSCConnectorMetadata {
+        +store_requests: StoreRequest[]
+        +decode_plans: DTwoStageLoadPlan[]
+        +pd_send_updates: PDSendUpdate[]
+        +send_requirements: dict
+        +finished_request_ids: set
+        +preempted_request_ids: set
+    }
+    class StoreRequest
+    class DTwoStageLoadPlan
+    class PDSendUpdate
+    class SendRequirement
+    class TransferRegion
+    class PDTransferSchema
+    class MooncakeDistributedStore {
+        <<external>>
     }
     class TransferEngine {
-        +batchTransferSyncWrite(session, src, dst, lengths)
-    }
-    class PCompletionAggregator {
-        +markStoreRecvTerminal(requestId)
-        +markStoreSaveTerminal(requestId)
-        +markPDSendTerminal(requestId)
-        +finishedRecving() RequestIds
-        +finishedSending() RequestIds
-    }
-    class BufferRegistrationManager {
-        +registerStore(caches)
-        +registerPD(caches)
-        +shutdown()
+        <<external>>
     }
 
-    MTSCConnector --> MTSCScheduler : scheduler process
-    MTSCConnector --> MTSCWorker : worker process
-    MTSCScheduler o-- PRequestState
-    MTSCScheduler --> StoreLookupClient
+    MTSCConnector *-- MTSCScheduler : scheduler role
+    MTSCConnector *-- MTSCWorker : worker role
+    MTSCScheduler *-- StoreLookupClient
+    MTSCScheduler o-- _LookupDecision
+    MTSCScheduler o-- _TrackedRequest
+    MTSCScheduler ..> MTSCConnectorMetadata : builds
     StoreLookupClient ..> StoreLookupServer : ZMQ request
-    MTSCWorker --> StoreIOCoordinator
-    MTSCWorker --> StoreLookupServer
-    MTSCWorker --> PDSendCoordinator
-    MTSCWorker --> PCompletionAggregator
-    MTSCWorker --> BufferRegistrationManager
-    PDSendCoordinator --> PListener
-    PListener --> BootstrapServer
-    PListener --> TransferPlanner
-    TransferPlanner --> TransferEngine
+    MTSCWorker *-- StoreIO
+    MTSCWorker *-- PDTransfer
+    MTSCWorker ..> MTSCConnectorMetadata : consumes
+    StoreIO *-- StoreLookupServer : rank 0
+    StoreIO --> MooncakeDistributedStore
+    PDTransfer *-- BootstrapServer : producer launcher
+    PDTransfer o-- _Source
+    PDTransfer o-- TransferRegion
+    PDTransfer *-- PDTransferSchema
+    PDTransfer --> TransferEngine
+    MTSCConnectorMetadata o-- StoreRequest
+    MTSCConnectorMetadata o-- DTwoStageLoadPlan
+    MTSCConnectorMetadata o-- PDSendUpdate
+    MTSCConnectorMetadata o-- SendRequirement
 ```
 
 `MTSCConnector` 是 vLLM 看到的唯一 Connector 类。它在 scheduler process 中创建 `MTSCScheduler`，在 worker process 中创建 `MTSCWorker`。P/D 引擎使用相同类，只是各 hook 内根据 role 进入不同分支。
+
+当前实现没有单独的 `PRequestState`、`StoreIOCoordinator`、`PDSendCoordinator`、`PCompletionAggregator` 或 `BufferRegistrationManager` 类：scheduler 长生命周期状态分别保存在 `_LookupDecision/_TrackedRequest` 和若干 pending collection 中；worker completion 聚合由 `MTSCWorker.get_finished()`、`StoreIO.poll()` 与 `PDTransfer.poll()` 直接完成；注册与 shutdown 顺序也由 `MTSCWorker` 统一编排。
 
 ## 4. 统一 Metadata Spec
 
@@ -382,7 +419,7 @@ vLLM scheduler 会截断 external-computed prefix，并让 P 本地重算缺失�
 PD 传输有两个异步条件：
 
 ```text
-d_pull_received := P listener 已收到 D MooncakeXferMetadata
+d_pull_received := P listener 已收到 D PDTransferRequest
 p_source_ready  := P request_finished 已提供 source block IDs
 can_write       := d_pull_received AND p_source_ready
 ```
@@ -401,7 +438,7 @@ P source ready 只能在 Prefill 正常完成、scheduler 调用 `request_finish
 
 ### 6.3 TE WRITE
 
-P listener 收到的 `MooncakeXferMetadata` 包含 D TE endpoint、D TP rank/size、destination block IDs 和 registered regions。P 在 source ready 后构造：
+P listener 收到的 MTSC `PDTransferRequest` 包含 D TE endpoint、D TP rank/size、destination block IDs 和 registered regions。P 在 source ready 后构造：
 
 ```text
 remote_session = D_TE_hostname:D_TE_port
@@ -416,7 +453,7 @@ lengths        = aligned transfer lengths
 batch_transfer_sync_write(remote_session, src_ptrs, dst_ptrs, lengths)
 ```
 
-TE WRITE 完成后，P 在原 ZMQ request/response 通道上返回 `MooncakeXferResponse`。P 不会另外向 D 发送一份 xfer metadata 让 D 执行 TE READ。
+TE WRITE 完成后，P 在原 ZMQ request/response 通道上返回 MTSC `PDTransferResponse`。P 不会另外向 D 发送一份 xfer metadata 让 D 执行 TE READ。
 
 ## 7. P 侧完整时序图
 
@@ -444,7 +481,7 @@ sequenceDiagram
     PS->>PS: request becomes WAITING_FOR_REMOTE_KVS
     PS->>PW: build_connector_meta for this step
     par D pull can arrive early
-        D->>L: MooncakeXferMetadata
+        D->>L: PDTransferRequest
         L->>L: bind transfer_id and wait source ready
     and P Store load
         PW->>PW: start_load_kv is no-op
@@ -460,7 +497,7 @@ sequenceDiagram
     L->>TE: batch_transfer_sync_write
     TE->>D: write KV into D blocks
     TE-->>L: write result
-    L-->>D: MooncakeXferResponse
+    L-->>D: PDTransferResponse
     PW-->>PS: get_finished returns finished_sending
     PS->>PS: free delayed P blocks
 ```
@@ -541,9 +578,11 @@ P_FINISHED_SENDING = request_finished_seen
 
 不能将 Store load completion 错误地当成 P request 的 block-free completion，也不能在 PD send 完成但 Store PUT 仍在读 GPU block 时提前释放 blocks。
 
+PD source 的 terminal 计数按实际接收方 fan-out 计算。TP 映射贡献 `handshake_target_ranks()` 的目标数；当 P/D PP size 不同时，每个 P PP worker 还会被所有 D PP ranks 请求，因此期望完成数为 `tp_fanout * d_pp_size`。只有所有目标 terminal 且没有 active TE WRITE 时，才允许报告 `finished_sending`。单个 write 抛错同样必须推进 terminal 计数；P abort 且没有 D 到达时由 TTL 清理，但不产生伪造的 send completion。
+
 ## 10. P 侧 Async Save
 
-Store save 和 Store load 共用 `StoreIOCoordinator`，但使用独立 queue 和 completion state。P 默认仅保存本次新计算的完整 prompt blocks，不重复保存从 Store 加载的 prefix。
+Store save 和 Store load 共用 `StoreIO`，但分别使用 `_save_pool/_saves` 与 `_load_pool/_loads`，completion state 也相互独立。P 默认仅保存本次新计算的完整 prompt blocks，不重复保存从 Store 加载的 prefix。
 
 ```text
 build_connector_meta emits save specs

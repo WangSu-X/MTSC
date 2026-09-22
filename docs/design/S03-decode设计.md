@@ -5,6 +5,8 @@
 > P 侧设计：[S02-prefill设计](./S02-prefill设计.md)  
 > 参考实现：`vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py` 与 `mooncake/store/`
 
+> 实现边界：只复用底层 `MooncakeDistributedStore`、`TransferEngine` 和无状态 helper；不创建原生 Mooncake Connector/Scheduler/Worker 实例。
+
 ## 1. 设计定位
 
 MTSC 不为 Prefill 和 Decode 实现两套 Connector。P/D 共用同一套 `connector.py`、`scheduler.py`、`worker.py` 和 metadata protocol，内部根据进程侧 role、引擎侧 role 和 request params 选择逻辑。
@@ -17,6 +19,7 @@ MVP 中 D 引擎配置为 consumer，Proxy 发给 D 的请求包含：
   "do_remote_prefill": true,
   "remote_engine_id": "<selected-prefill-engine>",
   "remote_bootstrap_addr": "http://prefill-host:bootstrap-port",
+  "remote_dp_rank": 0,
   "transfer_id": "xfer-<request-id>"
 }
 ```
@@ -78,7 +81,7 @@ D 侧在首次 remote-prefill allocation 中完成：
 
 - 保存 `[L,T)` 的全部 destination block IDs；
 - 保存 Store lookup 得到的 `H` 和对应 block hashes；
-- 建立 `DRequestState`，初始两阶段状态为 `STORE_PENDING`；
+- scheduler 建立不可变 `DTwoStageLoadPlan`；worker 接收 metadata 后建立 `_DLoadState`，初始状态为 `STORE_PENDING`；
 - 将 Store 计划区间设为 `[L,H)`；
 - 将 PD 候选区间设为 `[L,T)`，但此时不得固化或发送最终 suffix；
 - 将 request 标记为 metadata 待发布。
@@ -138,15 +141,15 @@ D request 正常进入 Decode 后，两阶段 load 已经终止，因此该 hook
 - 向 PD Transfer Engine 注册同一批 D destination buffers；
 - 启动 Store load/save 后台线程；
 - 启动 PD receiver event loop；
-- 初始化 bootstrap client、两阶段 coordinator 和 completion aggregator。
+- 初始化 `StoreIO`、`PDTransfer` 及 `MTSCWorker` 内部的 `_DLoadState/_SendState` collection。
 
-Store 与 PD 可以使用不同 TE 实例，但 buffer 注册、shutdown 和 block lifetime 必须由统一的 `BufferRegistrationManager` 管理。
+Store 与 PD 使用各自底层对象，但 buffer 注册、preemption fence、shutdown 和 block lifetime 由 `MTSCWorker` 统一编排。
 
 #### `start_load_kv(forward_context)`
 
 MVP 中保持 no-op。
 
-原生 Mooncake PD Connector 在该 hook 发布 PD request；MTSC 为保证 Store GET 与 P WRITE 严格串行，将两阶段 load 统一放到 `get_finished()` 发布和推进。这样只有在 Store completion 已确定实际边界 `A` 后，才会产生最终 `MooncakeXferMetadata`。
+原生 Mooncake PD Connector 在该 hook 发布 PD request；MTSC 为保证 Store GET 与 P WRITE 严格串行，将两阶段 load 统一放到 `get_finished()` 发布和推进。这样只有在 Store completion 已确定实际边界 `A` 后，才会产生最终 MTSC `PDTransferRequest`。
 
 未来支持 layerwise load 时，可以重新划分发布点，但不能破坏同一 destination block 的单写者时序。
 
@@ -174,7 +177,7 @@ MVP 不在 forward 尾部同步等待 Store PUT，该 hook 为 no-op。D blocks 
 4. 轮询 Store GET completion 和 failed block IDs；
 5. 对 Store 已终止的请求计算本 worker 的实际连续边界 `A`；
 6. 固化 `A`，构造 `[A,T)` 的 PD destination block IDs；
-7. 查询或复用 P bootstrap worker map，发送 `MooncakeXferMetadata`；
+7. 查询或复用 P bootstrap worker map，发送 `PDTransferRequest`；
 8. 轮询所有必需 P worker 的 `CONTINUE/FINISH/ERROR` 响应；
 9. 验证 local、Store、PD 对 `[0,T)` 的覆盖；
 10. 轮询 D async-save completion；
@@ -187,118 +190,135 @@ MVP 不在 forward 尾部同步等待 Store PUT，该 hook 为 no-op。D blocks 
 ```mermaid
 classDiagram
     class MTSCConnector {
-        +role: KVConnectorRole
-        +kvRole: str
-        +getNumNewMatchedTokens(request, computed)
-        +updateStateAfterAlloc(request, blocks, external)
-        +buildConnectorMeta(output)
-        +updateConnectorOutput(output)
-        +requestFinished(request, blocks)
-        +registerKVCaches(caches)
-        +startLoadKV(context)
-        +waitForLayerLoad(layer)
-        +saveKVLayer(layer, cache, metadata)
-        +waitForSave()
-        +getFinished(finishedIds)
+        +scheduler: MTSCScheduler
+        +worker: MTSCWorker
+        +get_num_new_matched_tokens(request, computed)
+        +update_state_after_alloc(request, blocks, external)
+        +build_connector_meta(output) MTSCConnectorMetadata
+        +register_kv_caches(caches)
+        +handle_preemptions(metadata)
+        +get_finished(finished_ids)
+        +get_block_ids_with_load_errors() set
+        +shutdown()
     }
     class MTSCScheduler {
-        +storeLookupStates
-        +dLoadPlans
-        +pendingDeltas
-        +getNumNewMatchedTokens(request, computed)
-        +updateStateAfterAlloc(request, blocks, external)
-        +buildConnectorMeta(output)
-        +requestFinished(request, blocks)
+        +lookup_client: StoreLookupClient
+        -_decisions: dict
+        -_pending_store: StoreRequest[]
+        -_pending_decode: dict
+        -_tracked: dict
+        +get_num_new_matched_tokens(request, computed)
+        +update_state_after_alloc(request, blocks, external)
+        +build_connector_meta(output) MTSCConnectorMetadata
+        +request_finished(request, blocks)
     }
     class MTSCWorker {
-        +registerKVCaches(caches)
-        +getFinished(finishedIds)
-        +shutdown()
+        +store: StoreIO
+        +pd: PDTransfer
+        -_decode: dict
+        -_send: dict
+        -_load_errors: set
+        +register_kv_caches(caches)
+        +handle_preemptions(metadata)
+        +get_finished(finished_ids, metadata)
+        +get_block_ids_with_load_errors() set
+        -_actual_store_prefix(plan, invalid) int
+        -_suffix_blocks(plan, actual) list
+        -_start_pd(state, actual) bool
+        +close()
     }
-    class DRequestState {
-        +requestId
-        +transferId
-        +localPrefixTokens
-        +storeCandidateTokens
-        +actualStorePrefixTokens
-        +targetPrefixTokens
-        +storeState
-        +pdState
-        +saveState
-        +destinationBlockIds
-        +issuedFlags
+    class _LookupDecision {
+        +local_tokens: int
+        +store_tokens: int
+        +target_tokens: int
+    }
+    class DTwoStageLoadPlan {
+        +request_id: str
+        +transfer_id: str
+        +local_prefix_tokens: int
+        +store_candidate_tokens: int
+        +target_prefix_tokens: int
+        +all_block_ids: tuple
+        +external_block_ids: tuple
+        +pd_enabled: bool
+        +wait_for_completion: bool
+        +kv_transfer_params: dict
+    }
+    class _DLoadState {
+        +plan: DTwoStageLoadPlan
+        +stage: str
+        +created_at: float
+        +pd_started_at: float
+        +suffix_block_ids: list
+    }
+    class _SendState {
+        +required: SendRequirement
+        +store_done: bool
+        +pd_done: bool
+        +complete: bool
     }
     class StoreLookupClient {
-        +lookup(requestId, hashes) OptionalInt
-        +discard(requestId)
+        +lookup(request_id, token_count, hashes, asynchronous)
+        +discard(request_id)
+        +reset() bool
+        +close()
     }
-    class StoreLookupServer {
-        +lookup(tokenLength, hashes) int
+    class StoreIO {
+        +load_timeout: float
+        +enqueue_load(request)
+        +enqueue_save(request, event)
+        +poll(finished_ids)
+        +take_errors() set
+        +finish_preempted_loads(ids)
+        +finish_preempted_saves(ids)
+        +close()
     }
-    class DTwoStageLoadCoordinator {
-        +acceptPlan(plan)
-        +enqueueStoreLoad(state)
-        +advanceStoreCompletion(state)
-        +freezeActualPrefix(state)
-        +startPDPull(state)
-        +validateCoverage(state)
-        +abort(state)
+    class PDTransfer {
+        +schema: PDTransferSchema
+        +regions: TransferRegion[]
+        +receive(request_id, transfer_id, blocks, engine, bootstrap, dp_rank)
+        +finish_receives(ids)
+        +poll()
+        +reformat_npu_blocks(blocks, remote_tp_size)
+        -_query_workers(address, engine_id, dp_rank)
+        -_validate_coverage(request_id, blocks, responses, expected)
+        +close()
     }
-    class StoreIOCoordinator {
-        +enqueueLoad(spec)
-        +enqueueSave(spec, cudaEvent)
-        +pollRecvCompletions()
-        +pollSendCompletions()
-        +takeLoadErrors() BlockIds
+    class MTSCConnectorMetadata {
+        +store_requests: StoreRequest[]
+        +decode_plans: DTwoStageLoadPlan[]
+        +pd_send_updates: PDSendUpdate[]
+        +send_requirements: dict
+        +finished_request_ids: set
+        +preempted_request_ids: set
     }
-    class PDPullCoordinator {
-        +resolveWorkers(engineId, bootstrap)
-        +sendXferMetadata(state, suffixBlocks)
-        +pollResponses()
-        +cancel(transferId)
-    }
-    class BootstrapClient {
-        +query(address) WorkerAddressMap
-    }
-    class IntegrityTracker {
-        +markLocal(range)
-        +markStore(range)
-        +markPD(range)
-        +firstUncoveredBlock() int
-        +isComplete() bool
-    }
-    class DCompletionAggregator {
-        +markLoadTerminal(requestId)
-        +markSaveTerminal(requestId)
-        +finishedRecving() RequestIds
-        +finishedSending() RequestIds
-        +invalidBlocks() BlockIds
-    }
-    class BufferRegistrationManager {
-        +registerStore(caches)
-        +registerPD(caches)
-        +shutdown()
-    }
+    class StoreRequest
+    class PDSendUpdate
+    class SendRequirement
+    class PDTransferSchema
+    class TransferRegion
 
-    MTSCConnector --> MTSCScheduler : scheduler process
-    MTSCConnector --> MTSCWorker : worker process
-    MTSCScheduler o-- DRequestState
-    MTSCScheduler --> StoreLookupClient
-    StoreLookupClient ..> StoreLookupServer : ZMQ request
-    MTSCWorker --> DTwoStageLoadCoordinator
-    MTSCWorker --> StoreLookupServer
-    MTSCWorker --> StoreIOCoordinator
-    MTSCWorker --> PDPullCoordinator
-    MTSCWorker --> DCompletionAggregator
-    MTSCWorker --> BufferRegistrationManager
-    DTwoStageLoadCoordinator o-- DRequestState
-    DTwoStageLoadCoordinator --> StoreIOCoordinator
-    DTwoStageLoadCoordinator --> PDPullCoordinator
-    DTwoStageLoadCoordinator --> IntegrityTracker
-    PDPullCoordinator --> BootstrapClient
+    MTSCConnector *-- MTSCScheduler : scheduler role
+    MTSCConnector *-- MTSCWorker : worker role
+    MTSCScheduler *-- StoreLookupClient
+    MTSCScheduler o-- _LookupDecision
+    MTSCScheduler ..> DTwoStageLoadPlan : builds
+    MTSCScheduler ..> MTSCConnectorMetadata : builds
+    MTSCWorker *-- StoreIO
+    MTSCWorker *-- PDTransfer
+    MTSCWorker o-- _DLoadState
+    MTSCWorker o-- _SendState
+    MTSCWorker ..> MTSCConnectorMetadata : consumes
+    _DLoadState *-- DTwoStageLoadPlan
+    _SendState *-- SendRequirement
+    MTSCConnectorMetadata o-- StoreRequest
+    MTSCConnectorMetadata o-- DTwoStageLoadPlan
+    MTSCConnectorMetadata o-- PDSendUpdate
+    PDTransfer *-- PDTransferSchema
+    PDTransfer o-- TransferRegion
 ```
 
-`MTSCConnector` 仍是 vLLM 看到的唯一 Connector 类。D 设计中的 `DRequestState` 和 `DTwoStageLoadCoordinator` 是共用 Connector 在 consumer 路径下创建的内部对象，不是第二套 Connector。
+`MTSCConnector` 仍是 vLLM 看到的唯一 Connector 类。当前代码没有独立的 `DRequestState`、`DTwoStageLoadCoordinator`、`PDPullCoordinator`、`IntegrityTracker` 或 `DCompletionAggregator` 类。不可变计划由 `DTwoStageLoadPlan` 表示；worker 运行态由 `_DLoadState` 表示；`MTSCWorker.get_finished()` 直接推进 `STORE_PENDING -> STORE_DONE -> PD_PENDING -> terminal`，并组合 `StoreIO.poll()`、`PDTransfer.poll()` 和 `_load_errors` 得到 vLLM completion。
 
 ## 4. 统一 Metadata Spec
 
@@ -362,12 +382,12 @@ classDiagram
 MTSC 必须区分 PD data plane topology 和 Store object topology：
 
 ```text
-PDTransferTopology
+PD data plane
   -> 支持 P/D 使用不同 TP/PP
   -> 根据 TP ratio 对 KV region 切片或聚合
   -> MLA 按 replicated KV 处理
 
-StoreTopologyPolicy
+Store object namespace
   -> MVP 只读取与 D 同构的 Store objects
   -> 不在 Store GET 中做 TP shard 的切片、聚合或重排
   -> MLA 使用单 KV-head namespace 和 replicated load
@@ -384,76 +404,121 @@ PD suffix = [L,T)
 
 PD topology 不兼容时无法保证 P KV 正确落到 D destination regions，必须 fail closed，并返回 invalid blocks 与 `finished_recving`。
 
-### 5.2 核心类图
+### 5.2 拓扑相关类图
 
 ```mermaid
 classDiagram
-    class TransferTopologyManager {
-        +localSpec: WorkerTopologySpec
-        +resolvePDTargets(engineId, bootstrap) TargetWorkers
-        +validateStoreSignature(signature) bool
-        +buildPDPlan(remoteDirectory) PDTransferPlan
-        +buildStoreNamespaces() StoreNamespaces
+    class PDTransfer {
+        +engine_id: str
+        +dp_rank: int
+        +tp_rank: int
+        +tp_size: int
+        +pp_rank: int
+        +pp_size: int
+        +schema: PDTransferSchema
+        +regions: TransferRegion[]
+        -_query_workers(address, engine_id, dp_rank)
+        -_aligned_regions(request)
+        -_validate_region_plan(...)
+        -_validate_coverage(...)
+        -_write_one(decode_id, source, request)
     }
-    class WorkerTopologySpec {
-        +engineId
-        +dpRank
-        +tpRank
-        +tpSize
-        +ppRank
-        +ppSize
-        +blockSize
-        +isMLA
-        +numKVHeads
-        +regions
+    class BootstrapServer {
+        +workers: dict
+        +register(payload)
+        +query() dict
+        +close()
     }
-    class BootstrapDirectory {
-        +engineId
-        +workersByTpAndPp
-        +topologyVersion
+    class WorkerRegistration {
+        +engine_id: str
+        +dp_rank: int
+        +tp_rank: int
+        +tp_size: int
+        +pp_rank: int
+        +pp_size: int
+        +address: str
     }
-    class PDTransferTopology {
-        +tpRatio(remoteTpSize) int
-        +targetPRanks(dRank, pTpSize) int[]
-        +targetPpRanks(dPpRank, directory) int[]
-        +buildRegionPlan(local, remote) RegionPlan
+    class TransferTopology {
+        <<vLLM>>
+        +handshake_target_ranks(remote_tp_size)
+        +local_replicates_kv_cache: bool
     }
-    class StoreTopologyPolicy {
-        +compatibilitySignature(spec) str
-        +effectiveKVRank(spec) int
-        +requiredNamespaces(spec) Namespace[]
-        +isCompatible(objectSignature) bool
+    class _NPUTransferTopology {
+        +tp_rank: int
+        +tp_size: int
+        +block_size: int
+        +is_mla: bool
+        +local_replicates_kv_cache: bool
+        +handshake_target_ranks(remote_tp_size)
     }
-    class RegionPlan {
-        +pTpRank
-        +pPpRank
-        +dTpRank
-        +sourceOffset
-        +destinationOffset
-        +length
-        +layerNames
-        +groupIndices
-        +sendBytes
+    class TransferRegion {
+        +layer_name: str
+        +layer_index: int
+        +group_index: int
+        +base_address: int
+        +block_length: int
+        +kv_block_length: int
     }
-    class PDPullCoordinator {
-        +sendXferMetadata(target, suffixBlocks)
-        +trackRequiredResponses(plan)
+    class PDTransferSchema {
+        +topology_version: int
+        +model_id: str
+        +model_revision: str
+        +cache_dtype: str
+        +cache_layout: str
+        +block_size: int
+        +is_mla: bool
     }
-    class StoreIOCoordinator {
-        +lookup(namespaces, hashes)
-        +load(keys, destinationBlocks)
+    class PDTransferRequest {
+        +hostname: str
+        +rpc_port: int
+        +tp_size: int
+        +tp_rank: int
+        +pp_size: int
+        +pp_rank: int
+        +schema: PDTransferSchema
+        +requests: dict
+        +region_base_addresses: list
+        +block_lengths: list
+        +kv_block_lengths: list
+    }
+    class PDTransferResponse {
+        +status: PDResponseStatus
+        +completed: list
+        +failed: list
+        +error: str
+        +covered_regions: dict
+    }
+    class PDResponseStatus {
+        <<enumeration>>
+        FINISH
+        CONTINUE
+        ERROR
+    }
+    class StoreIO {
+        +tp_size: int
+        +pp_size: int
+        +pcp_size: int
+        +dcp_size: int
+        +block_size: int
+        +hash_block_size: int
+        -_lookup_prefixes: tuple
     }
 
-    TransferTopologyManager o-- WorkerTopologySpec
-    TransferTopologyManager --> BootstrapDirectory
-    TransferTopologyManager --> PDTransferTopology
-    TransferTopologyManager --> StoreTopologyPolicy
-    PDTransferTopology --> RegionPlan
-    PDPullCoordinator --> PDTransferTopology
-    StoreIOCoordinator --> StoreTopologyPolicy
+    PDTransfer *-- PDTransferSchema
+    PDTransfer o-- TransferRegion
+    PDTransfer --> TransferTopology : CUDA path
+    PDTransfer --> _NPUTransferTopology : Ascend path
+    PDTransfer ..> BootstrapServer : exact DP query
+    BootstrapServer o-- WorkerRegistration
+    PDTransfer ..> PDTransferRequest : D sends
+    PDTransfer ..> PDTransferResponse : P replies
+    PDTransferRequest *-- PDTransferSchema
+    PDTransferResponse --> PDResponseStatus
 ```
 
-`TransferTopologyManager` 是 D worker 内统一入口，但内部保留两个 policy。不能因为 PD 已支持异构 TP，就让 Store 路径未经验证地读取不同 TP namespace 的对象。
+代码中没有独立的 `TransferTopologyManager`、`PDTransferTopology`、`StoreTopologyPolicy` 或 `RegionPlan` 类。PD 拓扑入口就是 `PDTransfer`：CUDA 路径复用 vLLM `TransferTopology`，Ascend 路径使用 MTSC `_NPUTransferTopology`；region 对齐、slice 长度校验和 coverage 校验分别由其私有方法完成。
+
+Store 兼容性也没有单独的 policy 对象。`store_topology_namespace()` 是纯函数，根据 model/revision、TP/PP/PCP/DCP、block/hash size、KV layout/dtype、MLA 和 group schema 生成稳定 namespace；`store_tp_layout()` 是 MLA/普通 KV 的 Store rank 映射纯函数。`StoreIO` 在构造 database/key prefix 时调用它们。不能因为 PD 已支持异构 TP/PP，就让 Store 路径未经 namespace 隔离地读取不同 topology 的对象。
 
 ### 5.3 Bootstrap worker directory
 
@@ -475,6 +540,8 @@ bootstrap 查询返回：
 {
   "0": {
     "engine_id": "<p-engine-id>",
+    "tp_size": 2,
+    "pp_size": 1,
     "worker_addr": {
       "0": {
         "0": "tcp://p-tp0-pp0:port"
@@ -487,7 +554,7 @@ bootstrap 查询返回：
 }
 ```
 
-外层 key 是 P 的 DP engine index。Proxy 选中的 `remote_engine_id` 必须与该 entry 一致；D 不得在 bootstrap 返回的其他 DP replica 中重新选源。
+外层 key 是 P 的 DP rank。D 必须用 Proxy 下发的 `remote_dp_rank` 精确选择 entry，并校验 entry 的 `engine_id` 与 `remote_engine_id` 一致；不得扫描或回退到其他 DP replica。
 
 D 从 `worker_addr` 推导 P 的 TP/PP worker directory：
 
@@ -496,7 +563,7 @@ p_tp_size = number of tp_rank entries
 p_pp_ranks[p_tp_rank] = registered pp_rank entries
 ```
 
-MVP 延续 Mooncake 的地址发现模式：bootstrap 不转发 transfer metadata 和 KV bytes。具体 KV region metadata 由 D 在 `MooncakeXferMetadata` 中发给目标 P listener，P 使用本地注册信息做最终 region validation。
+MVP 延续 Mooncake 的地址发现模式：bootstrap 不转发 transfer metadata 和 KV bytes。具体 KV region metadata 由 D 在 MTSC `PDTransferRequest` 中发给目标 P listener，P 使用本地注册信息做最终 region validation。
 
 bootstrap entry 必须满足：
 
@@ -769,7 +836,7 @@ flowchart TD
     J --> K{MLA?}
     K -->|no| L[Plan KV-head source and destination slices]
     K -->|yes| M[Plan replicated full-page transfer and sender dedup]
-    L --> N[Send rank-local MooncakeXferMetadata]
+    L --> N[Send rank-local PDTransferRequest]
     M --> N
     N --> O[Collect all required target responses]
     O --> P{All D layers and groups covered?}
@@ -883,29 +950,40 @@ remote_engine_id + remote_bootstrap_addr
   -> query P bootstrap
   -> obtain P TP/PP listener addresses
   -> build rank-local suffix destination blocks [A,T)
-  -> send MooncakeXferMetadata to P listeners
+  -> send PDTransferRequest to P listeners
 ```
 
-`MooncakeXferMetadata` 包含：
+MTSC `PDTransferRequest` 包含：
 
 ```json
 {
-  "remote_hostname": "<d-te-host>",
-  "remote_port": 0,
-  "remote_tp_size": 2,
-  "remote_tp_rank": 0,
-  "req_blocks": {
+  "hostname": "<d-te-host>",
+  "rpc_port": 0,
+  "tp_size": 2,
+  "tp_rank": 0,
+  "pp_size": 1,
+  "pp_rank": 0,
+  "schema": {
+    "topology_version": 1,
+    "model_id": "<model-id>",
+    "model_revision": "<revision>",
+    "cache_dtype": "<dtype>",
+    "cache_layout": "<layout>",
+    "block_size": 16,
+    "is_mla": false
+  },
+  "requests": {
     "<d-request-id>": [
       "xfer-<request-id>",
       [[25, 26, 27, 28]]
     ]
   },
-  "kv_caches_base_addr": [0],
-  "block_lens": [0],
-  "kv_block_lens": [0],
-  "registered_layer_names": [],
-  "registered_layer_indices": [],
-  "registered_group_indices": []
+  "region_base_addresses": [0],
+  "block_lengths": [0],
+  "kv_block_lengths": [0],
+  "layer_names": [],
+  "layer_indices": [],
+  "group_indices": []
 }
 ```
 
@@ -924,16 +1002,16 @@ P batch_transfer_sync_write(
 )
 ```
 
-P 通过原 ZMQ channel 返回 `MooncakeXferResponse`。D 只有在所有必需 P TP/PP worker 都对本 request 返回终态成功后，才把 PD coverage 标记为完成。
+P 通过原 ZMQ channel 返回 MTSC `PDTransferResponse`，其中包含本次实际写入的 D region indices。D 只有在所有必需 P TP/PP worker 都返回终态成功、且每个需要数据的 D region 的 TP fan-in coverage 恰好满足预期后，才把 PD coverage 标记为完成。P source 的释放计数同时包含 TP fan-out 和异构 PP fan-out，不能在部分 D PP worker 尚未到达时提前释放。
 
 ### 7.3 零长度握手
 
-当 `A == T` 时，D 已从 local/Store 获得全部 KV，但仍向 P 发送 `req_blocks` 中 block list 为空的请求并等待 ACK。
+当 `A == T` 时，D 已从 local/Store 获得全部 KV，但仍向 P 发送 `requests` 中 block list 为空的请求并等待 ACK。
 
 该握手用于：
 
 - 通知 P 本次 session 不需要数据；
-- 让 P 的 `PDSendCoordinator` 进入 terminal；
+- 让 P 的 `PDTransfer._Source` 进入 terminal；
 - 解除 P 为 `transfer_id` 延迟释放的 source blocks；
 - 让 Store 部分命中和全命中共享同一终态协议。
 
@@ -974,7 +1052,7 @@ sequenceDiagram
     DW->>DW: derive and freeze actual prefix A
     DW->>B: query selected P engine workers
     B-->>DW: TP and PP listener map
-    DW->>PL: MooncakeXferMetadata for suffix A to T
+    DW->>PL: PDTransferRequest for suffix A to T
     PL->>PL: wait for P source ready
     PL->>TE: batch_transfer_sync_write
     TE->>DW: write suffix into D destination blocks
@@ -991,7 +1069,7 @@ sequenceDiagram
     end
 ```
 
-bootstrap 查询是 metadata-only 操作，可以与 Store GET 预连接并行；最终 `MooncakeXferMetadata` 不得在 `A` 固化前发送，否则 Store 和 P 可能同时写相同 D blocks。
+bootstrap 查询是 metadata-only 操作，可以与 Store GET 预连接并行；最终 `PDTransferRequest` 不得在 `A` 固化前发送，否则 Store 和 P 可能同时写相同 D blocks。
 
 ## 9. D 侧流程图
 
@@ -1080,11 +1158,10 @@ Store completion 不等于 `D_FINISHED_RECVING`；P 的某一个 worker 返回�
 
 MTSC 不设置“整个 D 一次只能拉一个 request”的全局锁。
 
-- 每个 request 有独立 `DRequestState`；
+- 每个 request 有独立 `_DLoadState`，其中引用不可变 `DTwoStageLoadPlan`；
 - 一个 schedule step 可以发布多个两阶段 plans；
-- Store loads 进入共享 recv queue；默认线程数可以为 1，因此单个 TP worker 默认按 request 串行执行 Store `batch_get`；
-- 增加 `VLLM_MOONCAKE_LOAD_RECV_THREADS` 后可并行处理多个 Store load；
-- PD requests 按 remote P engine 和 worker address 聚合，同一 `MooncakeXferMetadata.req_blocks` 可以携带多个 requests；
+- Store loads 进入 `StoreIO._load_pool`；默认 `mtsc_store_load_workers=2`，可通过该配置调整单 worker 并行 GET 数；
+- 每个 `_DLoadState` 当前独立启动一次 `PDTransfer.receive()`；wire schema 支持 `PDTransferRequest.requests` map，但当前发送路径每条消息只放一个 request；
 - P 侧 sender thread pool 可以并行执行多个 TE batches；
 - 不同 D TP workers 独立处理自己的 KV shards。
 
@@ -1124,7 +1201,8 @@ save queue 同时限制 task 数和字节数。MVP 过载时 `SKIPPED`，不阻�
 
 - bootstrap 查不到指定 `remote_engine_id` 时 fail closed；
 - P/D model、layout、TP mapping、registered regions 不匹配时拒绝传输；
-- 等待 P source ready、ZMQ response 或 TE WRITE 超时后进入 terminal failure；
+- P 等待 source ready 超时后返回 terminal failure；
+- D 一旦把 destination addresses 发给 P，就必须等 P terminal response 作为 DMA fence，不能仅凭本地 ZMQ timeout 释放 blocks；
 - 任一必需 rank/group 失败都不得报告成功；
 - 已终止 request 的延迟 response 只记录并丢弃，不得复活 session。
 
@@ -1138,6 +1216,8 @@ D 分开记录：
 - `prefill_ready_timeout`；
 - `te_transfer_timeout`；
 - `session_ttl`。
+
+当前 Mooncake 同步 Store GET 和 TE WRITE 都没有安全取消原语。Store GET 超时会先标记请求失败，但仍等待底层调用终止后才允许 block 回收；随后将请求涉及的 Store blocks 标为 invalid，进入 P suffix 或本地重算。PD request 在 destination addresses 已发布后同样以 terminal response 为安全 fence，不能用“超时即释放”实现，否则会产生 late-write。
 
 所有日志和 metrics 携带 `request_id`、`transfer_id`、TP/PP rank。请求终态记录：
 
