@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import socket
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -38,10 +39,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
     MooncakeStoreCoordinator,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
-    BlobBlockHashes,
     ChunkedTokenDatabase,
     KeyMetadata,
-    PoolKey,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -49,6 +48,36 @@ from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import BlockHash, resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import KVCacheConfig
+
+
+class _CompatBlobBlockHashes(Sequence[BlockHash]):
+    """Lazy fixed-width hash view for vLLM versions before 0.26."""
+
+    def __init__(self, blob: memoryview, hash_len: int) -> None:
+        self._blob = blob
+        self._hash_len = hash_len
+        self._length = len(blob) // hash_len if hash_len else 0
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(self._length))]
+        if index < 0:
+            index += self._length
+        if not 0 <= index < self._length:
+            raise IndexError(index)
+        offset = index * self._hash_len
+        return BlockHash(bytes(self._blob[offset : offset + self._hash_len]))
+
+
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        BlobBlockHashes,
+    )
+except ImportError:
+    BlobBlockHashes = _CompatBlobBlockHashes  # type: ignore[misc]
 
 from .device import (
     DeviceEvent,
@@ -75,6 +104,40 @@ def _parse_size(value: Any) -> int:
         if text.endswith(suffix):
             return int(float(text[: -len(suffix)]) * scale)
     return int(text)
+
+
+def _key_prefix(
+    metadata: KeyMetadata,
+    namespace: str,
+    *,
+    tp_rank: int | None = None,
+    pcp_rank: int | None = None,
+    dcp_rank: int | None = None,
+    pp_rank: int | None = None,
+) -> str:
+    """Build a Store key prefix without relying on version-specific helpers."""
+    base = (
+        f"{metadata.model_name}"
+        f"@tp_rank:{metadata.tp_rank if tp_rank is None else tp_rank}"
+        f"@pcp{metadata.pcp_rank if pcp_rank is None else pcp_rank}"
+        f"@dcp{metadata.dcp_rank if dcp_rank is None else dcp_rank}"
+        f"@pp_rank:{metadata.pp_rank if pp_rank is None else pp_rank}"
+        f"@group:{metadata.group_id}"
+    )
+    return f"{namespace}@{base}" if namespace else base
+
+
+def _key_string(prefix: str, block_hash: BlockHash) -> str:
+    return f"{prefix}@{block_hash.hex()}"
+
+
+def _make_external_cached_pool(
+    hash_block_size: int, present: set[tuple[int, bytes]]
+) -> ExternalCachedBlockPool:
+    parameters = inspect.signature(ExternalCachedBlockPool).parameters
+    if "hash_block_size" in parameters:
+        return ExternalCachedBlockPool(hash_block_size, present)
+    return ExternalCachedBlockPool(present)
 
 
 def store_tp_layout(
@@ -425,14 +488,19 @@ class StoreIO:
             if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
             else False
         )
-        self.coordinator = MooncakeStoreCoordinator(
-            groups,
-            scheduler_block_size=self.block_size,
-            hash_block_size=self.hash_block_size,
-            use_eagle=use_eagle,
-            retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
-        )
-        cache_namespace = store_topology_namespace(
+        coordinator_kwargs: dict[str, Any] = {
+            "scheduler_block_size": self.block_size,
+            "hash_block_size": self.hash_block_size,
+            "use_eagle": use_eagle,
+        }
+        if "retention_interval" in inspect.signature(
+            MooncakeStoreCoordinator
+        ).parameters:
+            coordinator_kwargs["retention_interval"] = (
+                envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+            )
+        self.coordinator = MooncakeStoreCoordinator(groups, **coordinator_kwargs)
+        self.cache_namespace = store_topology_namespace(
             vllm_config,
             groups,
             tp_size=self.tp_size,
@@ -448,7 +516,6 @@ class StoreIO:
             pcp_rank=self.pcp_rank,
             dcp_rank=self.dcp_rank,
             pp_rank=self.pp_rank,
-            cache_prefix=cache_namespace,
         )
         self.databases = [
             ChunkedTokenDatabase(
@@ -521,8 +588,13 @@ class StoreIO:
             )
         self._lookup_prefixes = tuple(
             tuple(
-                PoolKey.build_prefix(
-                    db.metadata, tp_rank=tp, pcp_rank=pcp, dcp_rank=dcp, pp_rank=pp
+                _key_prefix(
+                    db.metadata,
+                    self.cache_namespace,
+                    tp_rank=tp,
+                    pcp_rank=pcp,
+                    dcp_rank=dcp,
+                    pp_rank=pp,
                 )
                 for tp, pcp, dcp, pp in ranks
             )
@@ -587,12 +659,79 @@ class StoreIO:
             database.set_block_len(block_lengths)
         logger.info("MTSC Store registered %d regions", len(addresses))
 
+    def _lookup_masks(self, token_count: int) -> tuple[list[bool] | None, ...]:
+        lookup_mask = getattr(self.coordinator, "lookup_mask", None)
+        if lookup_mask is None:
+            # vLLM 0.23 did not expose lookup_mask. Querying every key is a
+            # conservative superset; find_longest_cache_hit still decides the
+            # valid continuous prefix.
+            return tuple(None for _ in self.databases)
+        return lookup_mask(token_count)
+
+    def _store_masks(
+        self, token_count: int, save_from: int, prompt_tokens: int | None
+    ) -> tuple[list[bool] | None, ...]:
+        store_mask = self.coordinator.store_mask
+        if "start_token" in inspect.signature(store_mask).parameters:
+            return store_mask(
+                token_count, save_from, num_prompt_tokens=prompt_tokens
+            )
+        # vLLM 0.23 returns masks for [0, token_count). Convert them to the
+        # suffix-relative masks expected by MTSC's incremental save path.
+        masks = store_mask(token_count)
+        return tuple(
+            None
+            if mask is None
+            else mask[cdiv(save_from, database.block_size) :]
+            for mask, database in zip(masks, self.databases, strict=True)
+        )
+
+    def _database_key(self, database: ChunkedTokenDatabase, value: Any) -> str:
+        # vLLM 0.23 process_tokens yields PoolKey; newer versions yield
+        # BlockHash and expose key_for(). Namespace locally in both cases so
+        # topology isolation does not depend on KeyMetadata.cache_prefix.
+        if hasattr(value, "to_string"):
+            base = value.to_string()
+        else:
+            base = database.key_for(value)
+        return f"{self.cache_namespace}@{base}" if self.cache_namespace else base
+
+    def _process_tokens(
+        self,
+        database: ChunkedTokenDatabase,
+        token_count: int,
+        block_hashes: Sequence[BlockHash],
+        start_token: int,
+        *,
+        chunk_mask: list[bool] | None = None,
+        put_step: int = 1,
+        put_step_rank: int = 0,
+    ) -> Iterator[tuple[int, int, str]]:
+        """Normalize vLLM 0.23 and newer ChunkedTokenDatabase APIs."""
+        if put_step <= 0:
+            raise ValueError("put_step must be positive")
+        start_chunk = cdiv(start_token, database.block_size)
+        for start, end, value in database.process_tokens(
+            token_count, block_hashes, start_token
+        ):
+            chunk = start // database.block_size
+            relative = chunk - start_chunk
+            if chunk_mask is not None and (
+                relative < 0
+                or relative >= len(chunk_mask)
+                or not chunk_mask[relative]
+            ):
+                continue
+            if chunk % put_step != put_step_rank:
+                continue
+            yield start, end, self._database_key(database, value)
+
     def lookup(self, token_count: int, hashes: Sequence[BlockHash]) -> int:
         if token_count <= 0 or not hashes:
             return 0
         keys: list[str] = []
         candidates: list[tuple[int, bytes]] = []
-        masks = self.coordinator.lookup_mask(token_count)
+        masks = self._lookup_masks(token_count)
         for group_index, database in enumerate(self.databases):
             group_hashes = self.coordinator.block_hashes_for_spec(
                 hashes, self.groups[group_index].kv_cache_spec
@@ -606,7 +745,7 @@ class StoreIO:
                     continue
                 block_hash = group_hashes[index]
                 keys.extend(
-                    PoolKey.build_key_string(prefix, block_hash.hex())
+                    _key_string(prefix, block_hash)
                     for prefix in self._lookup_prefixes[group_index]
                 )
                 candidates.append((group_index, bytes(block_hash)))
@@ -622,7 +761,9 @@ class StoreIO:
             )
         }
         _, hit = self.coordinator.find_longest_cache_hit(
-            hashes, token_count, ExternalCachedBlockPool(self.hash_block_size, present)
+            hashes,
+            token_count,
+            _make_external_cached_pool(self.hash_block_size, present),
         )
         return hit
 
@@ -654,7 +795,8 @@ class StoreIO:
         sizes: list[list[int]] = []
         block_ids: list[int] = []
         for group_index, database in enumerate(self.databases):
-            for start, end, block_hash in database.process_tokens(
+            for start, end, key in self._process_tokens(
+                database,
                 request.load.store_tokens,
                 request.block_hashes,
                 request.load.local_tokens,
@@ -665,7 +807,7 @@ class StoreIO:
                 address, size, block_id = database.prepare_value(
                     start, end, request.block_ids[group_index]
                 )
-                keys.append(database.key_for(block_hash))
+                keys.append(key)
                 addresses.append(address)
                 sizes.append(size)
                 block_ids.append(block_id)
@@ -702,15 +844,14 @@ class StoreIO:
         )
         if token_count <= save_from:
             return
-        masks = self.coordinator.store_mask(
-            token_count, save_from, num_prompt_tokens=request.prompt_tokens
-        )
+        masks = self._store_masks(token_count, save_from, request.prompt_tokens)
         keys: list[str] = []
         addresses: list[list[int]] = []
         sizes: list[list[int]] = []
         for group_index, database in enumerate(self.databases):
             phase = (self.tp_rank + group_index) % self.put_step
-            for start, end, block_hash in database.process_tokens(
+            for start, end, key in self._process_tokens(
+                database,
                 token_count,
                 request.block_hashes,
                 save_from,
@@ -721,7 +862,7 @@ class StoreIO:
                 address, size, _ = database.prepare_value(
                     start, end, request.block_ids[group_index]
                 )
-                keys.append(database.key_for(block_hash))
+                keys.append(key)
                 addresses.append(address)
                 sizes.append(size)
         if not keys:

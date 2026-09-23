@@ -46,6 +46,9 @@ from mtsc.scheduler import _groups
 from mtsc.store import (
     StoreIO,
     StoreLookupClient,
+    _CompatBlobBlockHashes,
+    _key_prefix,
+    _key_string,
     store_topology_namespace,
     store_tp_layout,
 )
@@ -525,6 +528,95 @@ class NPUDataPathTest(unittest.TestCase):
             pd._npu_nz_pair([k_cache, v_cache], [0])
 
         self.assertEqual(calls, ["sync", "gather", "scatter"])
+
+
+class Vllm023CompatibilityTest(unittest.TestCase):
+    def test_blob_block_hashes_is_a_lazy_fixed_width_sequence(self) -> None:
+        hashes = _CompatBlobBlockHashes(memoryview(b"aaaabbbbcccc"), 4)
+
+        self.assertEqual(len(hashes), 3)
+        self.assertEqual(bytes(hashes[0]), b"aaaa")
+        self.assertEqual(bytes(hashes[-1]), b"cccc")
+        self.assertEqual([bytes(value) for value in hashes[1:]], [b"bbbb", b"cccc"])
+        self.assertEqual(b"".join(hashes), b"aaaabbbbcccc")
+        with self.assertRaises(IndexError):
+            _ = hashes[3]
+
+    def test_local_key_builder_does_not_require_new_pool_key_helpers(self) -> None:
+        metadata = SimpleNamespace(
+            model_name="model",
+            tp_rank=0,
+            pcp_rank=0,
+            dcp_rank=0,
+            pp_rank=0,
+            group_id=2,
+        )
+        prefix = _key_prefix(metadata, "namespace", tp_rank=3, pp_rank=1)
+
+        self.assertEqual(
+            prefix,
+            "namespace@model@tp_rank:3@pcp0@dcp0@pp_rank:1@group:2",
+        )
+        self.assertEqual(_key_string(prefix, b"\x01\x02"), prefix + "@0102")
+
+    def test_old_database_pool_keys_and_put_striping_are_normalized(self) -> None:
+        class OldPoolKey:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+            def to_string(self) -> str:
+                return self.value
+
+        class OldDatabase:
+            block_size = 16
+
+            def process_tokens(self, token_count, block_hashes, mask_num=0):
+                for chunk, block_hash in enumerate(block_hashes):
+                    start = chunk * self.block_size
+                    if start >= token_count:
+                        break
+                    if start < mask_num:
+                        continue
+                    yield (
+                        start,
+                        min(start + self.block_size, token_count),
+                        OldPoolKey(f"base@{block_hash.hex()}"),
+                    )
+
+        store = object.__new__(StoreIO)
+        store.cache_namespace = "namespace"
+        rows = list(
+            store._process_tokens(
+                OldDatabase(),
+                64,
+                [b"a", b"b", b"c", b"d"],
+                0,
+                chunk_mask=[True, True, True, True],
+                put_step=2,
+                put_step_rank=0,
+            )
+        )
+
+        self.assertEqual(
+            rows,
+            [
+                (0, 16, "namespace@base@61"),
+                (32, 48, "namespace@base@63"),
+            ],
+        )
+
+    def test_old_full_store_mask_is_sliced_for_incremental_save(self) -> None:
+        class OldCoordinator:
+            @staticmethod
+            def store_mask(token_count):
+                self.assertEqual(token_count, 64)
+                return ([True, False, True, True],)
+
+        store = object.__new__(StoreIO)
+        store.coordinator = OldCoordinator()
+        store.databases = [SimpleNamespace(block_size=16)]
+
+        self.assertEqual(store._store_masks(64, 32, None), ([True, True],))
 
 
 class MLALayoutTest(unittest.TestCase):
