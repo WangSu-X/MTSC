@@ -1,9 +1,11 @@
 # MTSC KVCachePool 与 KVTransfer 设计
 
 > 上位文档：[S00-整体设计](./S00-整体设计.md)  
-> 接口草稿：[draft_design.py](../../mtsc/draft_design.py)
+> 正式接口：[kv_cache_pool.py](../../mtsc/kv_cache_pool.py)、[kv_transfer.py](../../mtsc/kv_transfer.py)
 
-本文定义外部 KV 能力的抽象契约；现有 `StoreIO`、`PDTransfer` 是落地参考，尚未改为这些 ABC 的实现。实现差异见第 4、5 节。
+本文定义外部 KV 能力的抽象契约，现已由 `MooncakeKVCachePool(KVCachePool)` 和
+`MooncakeKVTransfer(KVTransfer)` 实现。接口与对应 Mooncake 实现放在同一个模块中，
+具体类持有 namespace、内存注册、bootstrap 和底层 I/O；Worker 通过 ABC 提交事件和消费结果。
 
 ## 1. 背景
 
@@ -78,6 +80,8 @@ classDiagram
     class KVTransfer {
         <<abstract>>
         register(kv_caches)
+        prepare(request_id, transfer_id)
+        cancel(request_id, transfer_id)
         send(SendEvent)
         recv(RecvEvent)
         poll() TransferPollResult
@@ -116,6 +120,7 @@ classDiagram
 | Pool `lookup()` | 只查询远程可用前缀，不分配 block、不搬运数据 |
 | Pool `load()` | 将指定 token 范围加载到已分配 block，通常每个 allocation 生命周期一个逻辑任务 |
 | Pool `save()` | 接收增量保存范围，同 request 的 pending 工作在安全条件下合并 |
+| Transfer `prepare()` / `cancel()` | 登记尚未 ready 的 P 会话；永久取消并拒绝迟到请求 |
 | Transfer `send()` | P 发布已经 ready 的源 block 表，等待 D 请求后发送 |
 | Transfer `recv()` | D 发现目标 P workers，提交目标 block 表，等待 P 写入和终态通知 |
 | `poll()` / `take_errors()` | 收取安全终态与无效目标 block；Worker 决定 fallback 或最终上报 |
@@ -178,7 +183,7 @@ P、D 均可独立 lookup/load/save。图中突出 D 两阶段加载和 P 源 bl
 | 结构 | 必要字段与含义 |
 |---|---|
 | `LoadEvent` | `request_id`、完整 `block_ids` / `block_hashes`、token 范围 `[start_load,end_load)` |
-| `SaveEvent` | `request_id`、完整 `block_ids` / `block_hashes`、token 范围 `[start_save,end_save)`、可选 `ready_event` |
+| `SaveEvent` | `request_id`、完整 `block_ids` / `block_hashes`、token 范围 `[start_save,end_save)`、可选 `ready_event` / `prompt_tokens`（用于 hybrid 保存 mask） |
 | `LoadResult` | `request_id`、实际可用前缀终点 `loaded_tokens`、可选 `error` |
 | `SaveResult` | `request_id`、本轮聚合保存的可选 `error` |
 | `SendEvent` | 本地 `request_id`、跨侧 `transfer_id`、完整源 `block_ids` |
@@ -241,26 +246,75 @@ finished_sending = request 已结束
 
 中间 `SaveResult` 只更新 Worker 的保存状态，不能直接进入最终 `finished_sending`。新 save 到达后重新标记保存未完成。request 结束时没有 outstanding save 的情况，也应利用已有状态完成释放判断。
 
-`preempt()` 可以阻塞：取消 pending 工作，fence 无法安全取消的运行任务，清理未收取结果和错误后才允许复用 block。D 已发布目标内存时必须等待远端写停止；timeout、取消本地 Future 或忽略迟到响应均不能单独证明安全。`close()` 同样先 fence，再释放注册内存与后端资源。
+`preempt()` 可以阻塞：取消 pending 工作，fence 无法安全取消的运行任务，清理未收取结果和错误后才允许复用 block。
+P 尚未 `send()` 时没有发布源内存，抢占保留早到的 D 等待者，可在恢复后用原 `transfer_id` 发布新的 ready blocks。
+永久取消必须通过 `cancel(request_id, transfer_id)` 结束该会话；已发布 send/recv 的尝试则退休 ID，后续重试使用新 ID。
+`prepare()` 将本地 request 与未 ready 的会话关联，也允许 `cancel()` 在尚未 prepare 时退休指定 ID。D 已发布目标内存时必须等待远端写停止；timeout、取消本地 Future 或忽略迟到响应均不能单独证明安全。`close()` 同样先 fence，再释放注册内存与后端资源。
 
-## 4. 关键代码路径
+## 4. Mooncake 实现与并行映射
 
-| 功能 | 现有代码路径 | 接入新契约的变化 |
-|---|---|---|
-| vLLM hooks | [connector.py](../../mtsc/connector.py)：`register_kv_caches`、`get_finished`、`get_block_ids_with_load_errors` | 保持外部 hooks，由 Worker 消费 ABC 结果 |
-| Lookup / 分配 | [scheduler.py](../../mtsc/scheduler.py)：`get_num_new_matched_tokens`、`update_state_after_alloc`；[store.py](../../mtsc/store.py)：`StoreLookupClient/Server` | 保留轻量查询 client，将服务端查询映射为 Pool `lookup` |
-| 增量保存 | scheduler `_save` / `build_connector_meta` → worker `_accept_metadata` → StoreIO `enqueue_save` / `_save` | 分离 `SaveEvent`，在 Pool 内合并 pending 工作 |
-| 两阶段加载 | [worker.py](../../mtsc/worker.py)：`get_finished`、`_actual_store_prefix`、`_suffix_blocks`、`_start_pd` | 使用 `LoadResult.loaded_tokens` 固化 A，再提交 `RecvEvent` |
-| 源发布与直传 | scheduler `request_finished` → [pd.py](../../mtsc/pd.py)：`apply_updates`、`_serve`、`_write_one` | ready 源发布映射为 `send`；`receive` 映射为 `recv` |
-| 完成聚合 | StoreIO `poll(finished_request_ids)` → worker `_aggregate_sends` → scheduler `update_connector_output` | 将 request-end gating 移至 Worker；中间保存结果不能直接透传 |
-| 内存回收 | worker `handle_preemptions` → StoreIO `finish_preempted_loads/saves`、PDTransfer `finish_receives` | 由 ABC `preempt` / `close` 提供相应 fence 保证 |
+### 4.1 实现入口
 
-当前 Store 为每个 request 保存一个 future 列表，直到 request 结束才上报保存完成，尚未合并 pending。当前 PD 使用 placeholder、ready/abort 更新和 request ID 完成集合；最小 send/recv 事件尚未替换这套协议。现有 Store load 后的 NPU 转换还调用 PD 方法，也需在独立后端适配时解耦。
+| 功能 | 当前代码路径 |
+|---|---|
+| 正式 ABC、事件与结果 | `mtsc/kv_cache_pool.py`、`mtsc/kv_transfer.py` |
+| Pool 生命周期与 I/O | `mtsc/kv_cache_pool.py`：lookup RPC、namespace、注册、GET/PUT、load 聚合、pending save 合并、错误与 fence |
+| Transfer 生命周期与 I/O | `mtsc/kv_transfer.py`：bootstrap、注册、region 对齐与 WRITE、prepare/send/recv/cancel、去重、退休 ID 与 fence |
+| Worker 编排 | `mtsc/worker.py`：消费 metadata、Pool-first、以 loaded_tokens 固化 A、聚合 request 结束后的释放依赖 |
+| Backend 配置 | `mtsc/worker.py` 私有工厂：`mtsc_pool_backend` / `mtsc_transfer_backend`，默认且当前仅支持 `mooncake` |
+| 共享协议 | `mtsc/protocol.py`：Scheduler/Worker metadata 与 P/D wire 结构 |
+| 设备布局转换 | `mtsc/utils.py`：共享设备事件、注册区域、NPU 转换与有效 KV 分片数 |
+| KV 字节分片映射 | `mtsc/kv_transfer.py`：`kv_slice_plan()`，处理 TP 分片与复制 rank |
 
-## 5. TODO
+scheduler-worker metadata 保留现有 wire 结构，Worker 将其转换为不可变事件快照。
+Pool 不接收 request-end 信息，Worker 的 `_save_pending` 与 `_send` 分别管理当前保存工作及最终释放依赖。
+两个 Mooncake 类直接实现 ABC；旧的任务生命周期、完成 API 和兼容导出已移除。
 
-- 落地 Mooncake Pool/Transfer adapter 与 backend 创建配置；保留 namespace、group mask、TP/PP 匹配和覆盖校验。
-- 实现 save 合并及 Worker 保存状态聚合，覆盖结果未收取时新 save 到达、仅 D 保存、request 结束时已无在途保存等情况。
-- 明确 Transfer 的抢占后恢复与永久取消：当前 P 抢占会保留早到的 D 等待者；需补足尚未 `send()` 的会话取消及迟到请求处理，不直接照搬 retire ID 的草稿语义。
-- 完善 hybrid cache 的保存 metadata（当前 coordinator 使用 `prompt_tokens`）、token/chunk 对齐及占位 block 规则；将 NPU 布局转换抽取为共享能力，定义 Pool load 的可用布局保证。
-- 为上述契约补充测试，包括多次 save 合并、错误累计、多子任务 fence、空 recv 握手、抢占和 shutdown；再验证一个 FileSystem 等替代后端。
+### 4.2 Pool 并行与 MLA
+
+Pool 不执行跨 TP/PP/PCP/DCP 布局转换；默认 topology namespace 包含这些维度及 model、dtype、layout、group schema。
+DP 是副本身份，不进入 KV 分片 key 的布局坐标，兼容副本可以共享缓存。
+
+MLA 在 TP 间复制 latent KV，同一 namespace 内使用有效 KV head 数 1 和共享 TP key；
+各 rank 按 chunk 分摊 PUT，每个 rank 都能加载完整副本。暂不移除 namespace 中的 TP size，
+因此 MLA 也不额外启用跨 TP size 的 Pool 复用。
+
+### 4.3 Transfer TP/PP/DP
+
+物理 TP rank 用于发现与控制会话，唯一 KV 分片用于数据切片：
+
+```text
+MHA/GQA: effective_tp = min(tp_size, total_kv_heads)
+MLA:     effective_tp = 1
+replica_count = tp_size / effective_tp
+```
+
+P/D TP size 保持整数倍要求。每个 D rank 的 P peer 集合中，同一个 KV 分片只选择一个发送者。
+P 分片较细时拼接到 D 的对应 byte offset；P 分片较粗时取 D 所需切片。
+覆盖次数按唯一分片计算，避免 GQA 在 TP 超过 KV head 数时漏算或重复计算；MLA 始终复制完整 page。
+
+PP size 相同时联系配对 rank，不同时联系对应 TP 的全部 P PP workers，再按全局 layer 身份及 region 顺序取交集。
+兼容 group/layout 仍是前提，不支持任意 group 语义或 block 大小转换。
+DP 使用 Proxy 指定的 engine/DP 身份选择 P 副本，不进行跨副本聚合或隐式请求迁移。
+PCP/DCP size 进入 Transfer schema 并要求一致。
+
+Transfer 协议版本为 2，携带双方 engine/DP 身份、目标容量及内存描述。每个源会话绑定一个 D 副本/拓扑，
+按唯一 `(engine, DP, TP, PP)` 目标聚合终态；重复请求只等待原任务，不再次 WRITE 或重复计数。
+同一目标修改 destination 描述会被拒绝。退休 ID 保留到后端 close，阻止迟到请求再次读取已释放源 blocks。
+
+### 4.4 Fence 与清理
+
+任何接收 peer 失败后，仍等待其余已发布目标地址的 peer 终态，才报告 recv 失败。
+源超时不能结束 active WRITE；空目标仍完成控制握手。
+P shutdown 保留控制 socket，直到在途 handler 发出终态响应，再关闭 listener 和注册内存。
+Pool timeout 标记失败但等待同步 GET 返回。pending save 可取消，running save 必须停止源读取后才能复用 blocks。
+
+## 5. 验证与后续工作
+
+`tests/test_backends.py` 覆盖具体后端的 save 合并、ready 信号、累计错误、增量结果、部分 load、timeout、
+抢占、空 recv、迟到请求、目标去重、指定 DP 身份、多 peer fence，以及模拟 TE 字节写入的异构 TP/PP/MLA。
+`tests/test_mtsc.py` 保留 namespace、MLA key、设备注册、coverage、lookup、Proxy 和 legacy helper 回归测试。
+这些测试不代表真实 Mooncake/GPU E2E 已通过。
+
+后续验证：真实 GPU/Mooncake 的同构及异构 TP/PP E2E、MLA 模型与 Ascend NZ 实机验证；
+替代 Pool 后端可在相同 ABC 下另行实现。非整数倍 TP 和跨 Pool 布局复用不在本版范围。

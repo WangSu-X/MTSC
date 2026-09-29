@@ -11,20 +11,42 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 
-from .device import new_device_event
-from .pd import PDTransfer
+from .kv_cache_pool import KVCachePool, LoadEvent, SaveEvent
+from .kv_transfer import KVTransfer, RecvEvent, SendEvent
 from .protocol import (
     DTwoStageLoadPlan,
     MTSCConnectorMetadata,
     SendRequirement,
     StoreRequest,
 )
-from .store import StoreIO
+from .utils import new_device_event
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+
+def _backend(config, key: str) -> str:
+    extra = config.kv_transfer_config.kv_connector_extra_config
+    backend = extra.get(key, "mooncake")
+    if backend != "mooncake":
+        raise ValueError(f"Unsupported {key}: {backend!r}")
+    return backend
+
+
+def _create_pool(config, kv_cache_config) -> KVCachePool:
+    _backend(config, "mtsc_pool_backend")
+    from .kv_cache_pool import MooncakeKVCachePool
+
+    return MooncakeKVCachePool(config, kv_cache_config)
+
+
+def _create_transfer(config, kv_cache_config) -> KVTransfer:
+    _backend(config, "mtsc_transfer_backend")
+    from .kv_transfer import MooncakeKVTransfer
+
+    return MooncakeKVTransfer(config, kv_cache_config)
 
 
 @dataclass
@@ -51,11 +73,11 @@ class _SendState:
 
 class MTSCWorker:
     def __init__(self, config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
-        self.store = StoreIO(config, kv_cache_config)
+        self.pool: KVCachePool = _create_pool(config, kv_cache_config)
         try:
-            self.pd = PDTransfer(config, kv_cache_config)
+            self.transfer: KVTransfer = _create_transfer(config, kv_cache_config)
         except Exception:
-            self.store.close()
+            self.pool.close()
             raise
         assert config.kv_transfer_config is not None
         self.is_producer = config.kv_transfer_config.kv_role == "kv_producer"
@@ -65,14 +87,12 @@ class MTSCWorker:
                 "mtsc_pd_timeout_seconds", 180.0
             )
         )
-        self.group_block_sizes = tuple(
-            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
-        )
         self._decode: dict[str, _DLoadState] = {}
         self._plain_store_loads: dict[str, StoreRequest] = {}
         self._send: dict[str, _SendState] = {}
         self._ignored_pd_recvs: set[str] = set()
         self._load_errors: set[int] = set()
+        self._save_pending: set[str] = set()
         self._closed = False
 
     def register_kv_caches(
@@ -81,14 +101,14 @@ class MTSCWorker:
             str, torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
         ],
     ) -> None:
-        self.store.register(kv_caches)
+        self.pool.register(kv_caches)
         try:
-            self.pd.register(kv_caches)
+            self.transfer.register(kv_caches)
         except Exception:
             try:
-                self.pd.close()
+                self.transfer.close()
             finally:
-                self.store.close()
+                self.pool.close()
             raise
         logger.info("MTSC registered Store and PD data planes")
 
@@ -99,14 +119,16 @@ class MTSCWorker:
         # vLLM invokes this hook before the current model step can overwrite
         # recycled blocks. A PUT reads GPU memory asynchronously, so it must be
         # fenced here rather than in wait_for_save().
-        self.store.finish_preempted_saves(request_ids)
-        self.store.finish_preempted_loads(request_ids)
-        self.pd.finish_receives(request_ids)
         for request_id in request_ids:
+            self.pool.preempt(request_id)
+            self.transfer.preempt(request_id)
+            self._save_pending.discard(request_id)
             self._decode.pop(request_id, None)
             self._plain_store_loads.pop(request_id, None)
             self._send.pop(request_id, None)
             self._ignored_pd_recvs.discard(request_id)
+        # Error sets are consumed in the same cycle as their terminal result;
+        # preempt() clears any backend-owned errors before block reuse.
 
     def _accept_metadata(self, metadata: MTSCConnectorMetadata) -> None:
         decode_ids = set(self._decode)
@@ -117,15 +139,66 @@ class MTSCWorker:
             save_event = new_device_event()
             save_event.record()
         for request in metadata.store_requests:
+            block_ids = tuple(tuple(group) for group in request.block_ids)
+            hashes = tuple(bytes(value) for value in request.block_hashes)
             if request.load is not None and request.load.enabled:
-                self.store.enqueue_load(request)
+                self.pool.load(
+                    LoadEvent(
+                        request.request_id,
+                        block_ids,
+                        hashes,
+                        request.load.local_tokens,
+                        request.load.store_tokens,
+                    )
+                )
                 if request.request_id not in decode_ids:
                     self._plain_store_loads[request.request_id] = request
             if request.save:
-                self.store.enqueue_save(request, save_event)
-        self.pd.apply_updates(metadata.pd_send_updates)
+                self.pool.save(
+                    SaveEvent(
+                        request.request_id,
+                        block_ids,
+                        hashes,
+                        request.save_from,
+                        request.token_count,
+                        save_event,
+                        request.prompt_tokens,
+                    )
+                )
+                self._save_pending.add(request.request_id)
+                state = self._send.get(request.request_id)
+                if state is not None:
+                    state.store_done = False
+        ready_updates = [
+            update for update in metadata.pd_send_updates if update.source_ready
+        ]
+        if ready_updates:
+            # send() publishes readable source memory. This fences preceding
+            # device writes before the transport can access those addresses.
+            ready = new_device_event()
+            ready.record()
+            ready.synchronize()
+        for update in metadata.pd_send_updates:
+            if update.abort:
+                self.transfer.cancel(update.request_id, update.transfer_id)
+            elif update.source_ready:
+                self.transfer.send(
+                    SendEvent(
+                        update.request_id,
+                        update.transfer_id,
+                        tuple(tuple(group) for group in update.block_ids),
+                    )
+                )
+            else:
+                self.transfer.prepare(update.request_id, update.transfer_id)
         for request_id, requirement in metadata.send_requirements.items():
-            self._send.setdefault(request_id, _SendState(requirement))
+            self._send.setdefault(
+                request_id,
+                _SendState(
+                    requirement,
+                    store_done=request_id not in self._save_pending,
+                ),
+            )
         for plan in metadata.decode_plans:
             if plan.request_id in self._decode:
                 continue
@@ -143,24 +216,6 @@ class MTSCWorker:
                 plan.store_candidate_tokens,
                 plan.target_prefix_tokens,
             )
-
-    @staticmethod
-    def _actual_store_prefix(
-        plan: DTwoStageLoadPlan, invalid_block_ids: set[int]
-    ) -> int:
-        if not invalid_block_ids:
-            return plan.store_candidate_tokens
-        actual = plan.store_candidate_tokens
-        for group_ids, block_size in zip(
-            plan.all_block_ids, plan.group_block_sizes, strict=True
-        ):
-            start = cdiv(plan.local_prefix_tokens, block_size)
-            end = cdiv(plan.store_candidate_tokens, block_size)
-            for block_index in range(start, min(end, len(group_ids))):
-                if group_ids[block_index] in invalid_block_ids:
-                    actual = min(actual, block_index * block_size)
-                    break
-        return max(plan.local_prefix_tokens, actual)
 
     @staticmethod
     def _store_candidate_block_ids(plan: DTwoStageLoadPlan) -> set[int]:
@@ -205,13 +260,15 @@ class MTSCWorker:
             state.stage = "DONE"
             return False
         params = plan.kv_transfer_params
-        self.pd.receive(
-            plan.request_id,
-            plan.transfer_id,
-            suffix,
-            str(params["remote_engine_id"]),
-            str(params["remote_bootstrap_addr"]),
-            int(params.get("remote_dp_rank", 0)),
+        self.transfer.recv(
+            RecvEvent(
+                plan.request_id,
+                plan.transfer_id,
+                tuple(tuple(group) for group in suffix),
+                str(params["remote_bootstrap_addr"]),
+                str(params["remote_engine_id"]),
+                int(params.get("remote_dp_rank", 0)),
+            )
         )
         state.stage = "PD_PENDING"
         state.pd_started_at = time.monotonic()
@@ -227,19 +284,18 @@ class MTSCWorker:
         return True
 
     def _aggregate_sends(self, store_done: set[str], pd_done: set[str]) -> set[str]:
-        completed: set[str] = set()
+        self._save_pending.difference_update(store_done)
         for request_id in store_done:
             state = self._send.get(request_id)
-            if state is None:
-                completed.add(request_id)
-            else:
+            if state is not None:
                 state.store_done = True
         for request_id in pd_done:
             state = self._send.get(request_id)
-            if state is None:
-                completed.add(request_id)
-            else:
+            if state is not None:
                 state.pd_done = True
+        completed = set()
+        # Only request_finished creates a release dependency. Intermediate
+        # backend results never release blocks of an active request.
         for request_id, state in list(self._send.items()):
             if state.complete:
                 completed.add(request_id)
@@ -250,107 +306,74 @@ class MTSCWorker:
         self, finished_req_ids: set[str], metadata: MTSCConnectorMetadata
     ) -> tuple[set[str] | None, set[str] | None]:
         self._accept_metadata(metadata)
-        all_finished = finished_req_ids | metadata.finished_request_ids
-        store_send, store_recv = self.store.poll(all_finished)
-        store_errors = self.store.take_errors()
-        staged_blocks: set[int] = set()
-        for state in self._decode.values():
-            staged_blocks.update(self._store_candidate_block_ids(state.plan))
+        pool_results = self.pool.poll()
+        store_errors = self.pool.take_errors()
+        staged_ids = set(self._decode)
+        staged_blocks = {
+            block
+            for state in self._decode.values()
+            for block in self._store_candidate_block_ids(state.plan)
+        }
         self._load_errors.update(store_errors - staged_blocks)
+        loads = {result.request_id: result for result in pool_results.loads}
+        finished_recv = set()
+        for request_id in loads.keys() - staged_ids:
+            self._plain_store_loads.pop(request_id, None)
+            finished_recv.add(request_id)
 
-        for request_id in store_recv:
-            request = self._plain_store_loads.pop(request_id, None)
-            if request is not None:
-                self.pd.reformat_npu_blocks(
-                    self._plain_store_loaded_blocks(request, store_errors),
-                    self.pd.tp_size,
-                )
-
-        finished_recv: set[str] = set()
         for request_id, state in list(self._decode.items()):
             if state.stage == "STORE_DONE":
-                started = self._start_pd(state, state.plan.local_prefix_tokens)
-                if not started:
-                    if state.plan.wait_for_completion:
-                        finished_recv.add(request_id)
-                    del self._decode[request_id]
-            elif state.stage == "STORE_PENDING" and request_id in store_recv:
-                actual = self._actual_store_prefix(state.plan, store_errors)
+                actual = state.plan.local_prefix_tokens
+            elif state.stage == "STORE_PENDING" and request_id in loads:
+                actual = loads[request_id].loaded_tokens
+                if (
+                    not state.plan.local_prefix_tokens
+                    <= actual
+                    <= state.plan.store_candidate_tokens
+                ):
+                    raise ValueError("Pool returned an invalid loaded prefix")
                 logger.info(
-                    "MTSC D Store terminal: request_id=%s L=%d H=%d A=%d",
+                    "MTSC D Pool terminal: request_id=%s L=%d H=%d A=%d",
                     request_id,
                     state.plan.local_prefix_tokens,
                     state.plan.store_candidate_tokens,
                     actual,
                 )
-                self.pd.reformat_npu_blocks(
-                    self._store_loaded_blocks(state.plan, actual), self.pd.tp_size
-                )
-                started = self._start_pd(state, actual)
-                if not started:
-                    if state.plan.wait_for_completion:
-                        finished_recv.add(request_id)
-                    del self._decode[request_id]
-
-        pd_send, pd_recv, pd_failed = self.pd.poll()
-        ignored = (pd_recv | pd_failed) & self._ignored_pd_recvs
-        self._ignored_pd_recvs.difference_update(ignored)
-        pd_recv -= ignored
-        pd_failed -= ignored
-        for request_id, state in list(self._decode.items()):
-            if state.stage != "PD_PENDING":
+            else:
                 continue
-            failed = request_id in pd_failed
-            if request_id not in pd_recv and not failed:
-                continue
-            if failed:
-                for group in state.suffix_block_ids:
-                    self._load_errors.update(block for block in group if block >= 0)
-                logger.warning(
-                    "MTSC D PD suffix failed: request_id=%s reason=transfer_error",
-                    request_id,
-                )
-            if state.plan.wait_for_completion:
-                finished_recv.add(request_id)
-            del self._decode[request_id]
+            if not self._start_pd(state, actual):
+                if state.plan.wait_for_completion:
+                    finished_recv.add(request_id)
+                del self._decode[request_id]
 
-        # Plain P-side Store loads are not represented by a D state.
-        finished_recv.update(store_recv - set(self._decode))
-        finished_send = self._aggregate_sends(store_send, pd_send)
+        transfer_results = self.transfer.poll()
+        transfer_errors = self.transfer.take_errors()
+        self._load_errors.update(transfer_errors)
+        for result in transfer_results.recvs:
+            request_id = result.request_id
+            if request_id in self._ignored_pd_recvs:
+                self._ignored_pd_recvs.discard(request_id)
+                self._decode.pop(request_id, None)
+                continue
+            state = self._decode.pop(request_id, None)
+            if state is not None:
+                if result.error is not None:
+                    # Preserve fallback even if the backend could not prove
+                    # which subset of its requested regions is usable.
+                    self._load_errors.update(
+                        block
+                        for group in state.suffix_block_ids
+                        for block in group
+                        if block >= 0
+                    )
+                if state.plan.wait_for_completion:
+                    finished_recv.add(request_id)
+
+        finished_send = self._aggregate_sends(
+            {result.request_id for result in pool_results.saves},
+            {result.request_id for result in transfer_results.sends},
+        )
         return finished_send or None, finished_recv or None
-
-    @staticmethod
-    def _store_loaded_blocks(
-        plan: DTwoStageLoadPlan, actual_store_prefix: int
-    ) -> list[list[int]]:
-        result: list[list[int]] = []
-        for group, block_size in zip(
-            plan.all_block_ids, plan.group_block_sizes, strict=True
-        ):
-            start = cdiv(plan.local_prefix_tokens, block_size)
-            end = min(cdiv(actual_store_prefix, block_size), len(group))
-            result.append(group[start:end])
-        return result
-
-    def _plain_store_loaded_blocks(
-        self, request: StoreRequest, invalid_block_ids: set[int]
-    ) -> list[list[int]]:
-        if request.load is None:
-            return [[] for _ in request.block_ids]
-        result: list[list[int]] = []
-        for group, block_size in zip(
-            request.block_ids, self.group_block_sizes, strict=True
-        ):
-            start = cdiv(request.load.local_tokens, block_size)
-            end = min(cdiv(request.load.store_tokens, block_size), len(group))
-            result.append(
-                [
-                    block
-                    for block in group[start:end]
-                    if block >= 0 and block not in invalid_block_ids
-                ]
-            )
-        return result
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         errors, self._load_errors = self._load_errors, set()
@@ -361,6 +384,6 @@ class MTSCWorker:
             return
         self._closed = True
         try:
-            self.pd.close()
+            self.transfer.close()
         finally:
-            self.store.close()
+            self.pool.close()

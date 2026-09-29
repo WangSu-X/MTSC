@@ -141,14 +141,16 @@ classDiagram
         +handle_preemptions(...)
         +get_finished(...)
     }
-    class StoreIO {
-        +enqueue_load(...)
-        +enqueue_save(...)
+    class MooncakeKVCachePool {
+        +load(...)
+        +save(...)
         +poll(...)
     }
-    class PDTransfer {
+    class MooncakeKVTransfer {
         +receive(...)
-        +apply_updates(...)
+        +prepare(...)
+        +send(...)
+        +cancel(...)
         +poll(...)
     }
     class PDProxy {
@@ -195,8 +197,8 @@ classDiagram
 
     MTSCScheduler ..> VllmLogger
     MTSCWorker ..> VllmLogger
-    StoreIO ..> VllmLogger
-    PDTransfer ..> VllmLogger
+    MooncakeKVCachePool ..> VllmLogger
+    MooncakeKVTransfer ..> VllmLogger
     PDProxy ..> PythonLogger
     PDProxy *-- JsonlMetricsWriter
     PDProxy o-- RequestMetrics

@@ -99,6 +99,8 @@ class PDTransferSchema(msgspec.Struct, frozen=True):
     cache_layout: str
     block_size: int
     is_mla: bool
+    pcp_size: int = 1
+    dcp_size: int = 1
 
 
 class PDTransferRequest(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
@@ -118,6 +120,12 @@ class PDTransferRequest(msgspec.Struct, omit_defaults=True):  # type: ignore[cal
     layer_names: list[str] = msgspec.field(default_factory=list)
     layer_indices: list[int] = msgspec.field(default_factory=list)
     group_indices: list[int] = msgspec.field(default_factory=list)
+    # Explicit replica identities for the concrete KVTransfer backend.
+    engine_id: str = ""
+    dp_rank: int = 0
+    remote_engine_id: str = ""
+    remote_dp_rank: int = 0
+    destination_num_blocks: int = 0
 
 
 class PDTransferResponse(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]

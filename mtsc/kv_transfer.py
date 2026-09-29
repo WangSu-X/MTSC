@@ -1,0 +1,1453 @@
+"""Worker KV transfer contract and Mooncake Transfer Engine implementation."""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+import time
+from abc import ABC, abstractmethod
+from collections import Counter, defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Any
+
+import httpx
+import msgspec
+import torch
+import uvicorn
+import zmq
+import zmq.asyncio
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from vllm import envs
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    TransferTopology,
+    get_current_attn_backends,
+)
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.logger import init_logger
+from vllm.model_executor.models.utils import extract_layer_index
+from vllm.platforms import current_platform
+from vllm.utils.network_utils import get_ip, make_zmq_path
+from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec, SlidingWindowMLASpec
+
+from .protocol import (
+    PDResponseStatus,
+    PDTransferRequest,
+    PDTransferResponse,
+    PDTransferSchema,
+)
+from .utils import (
+    BlockIds,
+    KVLayoutAdapter,
+    cache_tensors,
+    effective_tp,
+    is_npu_platform,
+    npu_kv_nz_enabled,
+    npu_registration_regions,
+)
+
+
+@dataclass(frozen=True)
+class SendEvent:
+    """Publish the request's ready source KV for P-D transfer.
+
+    block_ids is the full source block table, grouped and ordered by KV cache
+    group. All listed KV must be safe to read when send() is called. D selects
+    a suffix by providing its destination block table in RecvEvent.
+    Source blocks remain valid and unchanged until the send result is polled
+    or preempt() returns.
+    """
+
+    request_id: str
+    transfer_id: str
+    block_ids: BlockIds
+
+
+@dataclass(frozen=True)
+class RecvEvent:
+    """Request a source KV suffix into D's allocated destination blocks.
+
+    block_ids contains only blocks to receive, grouped and ordered by KV cache
+    group; it excludes blocks already populated locally. For each group, P
+    copies the last len(destination_group) source blocks in order. Empty groups
+    require no transfer. Source and destination tables describe the same prefix
+    endpoint with compatible group/block layouts; arbitrary ranges are unsupported.
+    The backend resolves matching P workers through bootstrap_addr and publishes
+    destination memory information derived from register().
+    """
+
+    request_id: str
+    transfer_id: str
+    block_ids: BlockIds
+    bootstrap_addr: str
+    remote_engine_id: str
+    remote_dp_rank: int
+
+
+@dataclass(frozen=True)
+class TransferResult:
+    """Terminal result for one local send or recv, identified by request_id.
+
+    error=None indicates success. A send result means source KV is no longer
+    being read; a recv result means destination KV is no longer being written.
+    Only a successful recv guarantees all requested destination KV is usable.
+    Failed recv block IDs are exposed separately through take_errors().
+    """
+
+    request_id: str
+    error: str | None = None
+
+
+@dataclass
+class TransferPollResult:
+    sends: list[TransferResult] = field(default_factory=list)
+    recvs: list[TransferResult] = field(default_factory=list)
+
+
+class KVTransfer(ABC):
+    """D-initiated P-D direct transfer, implemented by P writing into D.
+
+    P: register -> prefill completes -> send(ready source KV) -> poll().
+    D: register -> recv(destination + bootstrap) -> poll(recv completion).
+    send() and the remote recv request may arrive in either order. Transfer
+    starts only after send() publishes ready KV and a receiver request is present.
+    P writes the requested KV, then notifies D of completion or failure.
+
+    request_id identifies local work and results, without a task handle.
+    transfer_id matches P and D requests, whose local request IDs may differ.
+    It is a unique cross-worker attempt ID supplied by the connector; retries
+    use a new transfer_id so delayed messages cannot match new block ownership.
+    It is not a backend-generated task ID requiring a result-to-request map.
+
+    At most one uncollected send and one uncollected recv per local request;
+    duplicate submissions of the same kind raise ValueError. Events are
+    immutable metadata snapshots. Layout, topology, endpoint registration,
+    protocol timeouts and peer discovery caching belong to backend setup.
+    The backend validates peer identity, layout and block-table compatibility and
+    derives TP/PP pairing and complete destination coverage before success.
+    Callers serialize public calls; the backend synchronizes background work.
+
+    This interface owns transfer and memory-access fences. Request scheduling,
+    block allocation, persistence and cache lookup belong to the connector
+    and KVCachePool. There is no request-end notification or public state machine.
+    """
+
+    @abstractmethod
+    def register(
+        self,
+        kv_caches: dict[
+            str, torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
+        ],
+    ) -> None:
+        """Register local KV memory on both P and D before send/recv.
+
+        On P, also expose the worker control endpoint through bootstrap.
+        Memory descriptors and transport addresses are backend-owned; callers
+        only provide block IDs. Tensors stay alive until close(). Re-registering
+        while transfers are pending is unsupported.
+        """
+
+    @abstractmethod
+    def prepare(self, request_id: str, transfer_id: str) -> None:
+        """Associate an unready P session so it can be cancelled before send.
+
+        This registers identity only; it never publishes source memory.
+        Repeated registration of the same association is harmless.
+        """
+
+    @abstractmethod
+    def cancel(self, request_id: str, transfer_id: str) -> None:
+        """Permanently retire a P session, including one not yet prepared.
+
+        Wake early receivers with failure and fence any active source reads.
+        Unlike an unready P preemption, this session cannot be resumed.
+        """
+
+    @abstractmethod
+    def send(self, send_event: SendEvent) -> None:
+        """Publish ready source KV without waiting for a receiver or I/O.
+
+        Calling send() marks this source ready; the caller ensures device writes
+        are complete and visible to the transport before calling. P must
+        retain source blocks while waiting and during writes. Fan-out to D
+        workers is managed internally: publish one send result only after all
+        expected targets are terminal and all source reads have stopped.
+        A source with no receiver may expire according to backend policy;
+        retire its transfer_id before reporting failure so late pulls cannot
+        access released blocks.
+        """
+
+    @abstractmethod
+    def recv(self, recv_event: RecvEvent) -> None:
+        """Submit a receive request without waiting for discovery or I/O.
+
+        Resolve matching P workers through bootstrap_addr, scoped by remote
+        engine and DP identity. Send them the transfer_id, destination block
+        table and local memory descriptors. P waits for send() and writes
+        directly into D; D waits for every required worker's terminal response.
+        Report success only after all destination KV is ready for local use,
+        including any required device synchronization or layout conversion.
+        """
+
+    @abstractmethod
+    def poll(self) -> TransferPollResult:
+        """Drain terminal send/recv results without waiting for I/O.
+
+        Return each result once, including failures. Source block release is
+        authorized by send completion; destination reuse by recv completion.
+        If blocks are used by other operations, those must also be fenced.
+        Publish failed recv block IDs with their result and drain take_errors()
+        in the same polling cycle before block/request reuse.
+        """
+
+    @abstractmethod
+    def take_errors(self) -> set[int]:
+        """Drain invalid physical local block IDs from polled recv failures.
+
+        Non-blocking. Report unusable blocks from RecvEvent.block_ids; if partial
+        coverage cannot be proved, invalidate all listed destination blocks.
+        Preserve the existing local prefix, which is not in that table. Send failures
+        do not invalidate local source KV. The connector reports these IDs
+        through get_block_ids_with_load_errors() for scheduler recovery.
+        """
+
+    @abstractmethod
+    def preempt(self, request_id: str) -> None:
+        """Cancel and fence the request's local send/recv before block reuse.
+
+        Unpublished P sessions have no source memory and may retain early D
+        waiters for resumed prefill. Published send and recv attempts are retired;
+        retries of those attempts need a new transfer_id. Cancel queued work,
+        and fence active transfers. On D, remote P writes must stop before
+        returning; a local timeout or discarded response alone is insufficient.
+        May block if safe cancellation is unavailable. On return no transfer
+        accesses the request's local blocks; pending results, block errors and
+        local bookkeeping are cleared. Calls with no tracked request are safe.
+        """
+
+    @abstractmethod
+    def close(self) -> None:
+        """Stop accepting work and fence local reads and remote writes.
+
+        Notify pending peers as needed and release registered memory/transport
+        resources only after transfers stop accessing them. Idempotent;
+        subsequent send/recv submissions raise RuntimeError.
+        """
+
+
+logger = init_logger(__name__)
+
+
+def _run_loop(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+def _bootstrap_address(config: VllmConfig) -> tuple[str, int]:
+    parallel = config.parallel_config
+    if parallel.local_engines_only:
+        host = "127.0.0.1"
+    elif parallel.nnodes_within_dp > 1:
+        host = parallel.master_addr
+    else:
+        host = parallel.data_parallel_master_ip
+    return host, envs.VLLM_MOONCAKE_BOOTSTRAP_PORT
+
+
+def _launch_bootstrap(config: VllmConfig) -> bool:
+    parallel = config.parallel_config
+    if get_tensor_model_parallel_rank() != 0 or get_pp_group().rank_in_group != 0:
+        return False
+    if parallel.local_engines_only:
+        return parallel.data_parallel_rank_local == 0
+    return parallel.data_parallel_index == 0
+
+
+class WorkerRegistration(BaseModel):
+    engine_id: str
+    dp_rank: int
+    tp_rank: int
+    tp_size: int
+    pp_rank: int
+    pp_size: int
+    address: str
+
+
+class BootstrapServer:
+    """Small registry owned by MTSC; no retry/routing policy lives here."""
+
+    def __init__(self, port: int) -> None:
+        self.workers: dict[int, dict[str, Any]] = {}
+        self.app = FastAPI()
+        self.app.post("/register")(self.register)
+        self.app.get("/query")(self.query)
+        self.server = uvicorn.Server(
+            uvicorn.Config(self.app, host="0.0.0.0", port=port, log_level="warning")
+        )
+        self.thread = threading.Thread(
+            target=self.server.run, name="mtsc-bootstrap", daemon=True
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+        while not self.server.started:
+            time.sleep(0.05)
+
+    async def register(self, payload: WorkerRegistration) -> dict[str, str]:
+        entry = self.workers.setdefault(
+            payload.dp_rank,
+            {
+                "engine_id": payload.engine_id,
+                "tp_size": payload.tp_size,
+                "pp_size": payload.pp_size,
+                "worker_addr": {},
+            },
+        )
+        if entry["engine_id"] != payload.engine_id:
+            raise HTTPException(400, "engine_id mismatch")
+        if entry["tp_size"] != payload.tp_size or entry["pp_size"] != payload.pp_size:
+            raise HTTPException(400, "worker topology mismatch")
+        if not 0 <= payload.tp_rank < payload.tp_size:
+            raise HTTPException(400, "invalid tp_rank")
+        if not 0 <= payload.pp_rank < payload.pp_size:
+            raise HTTPException(400, "invalid pp_rank")
+        tp_entry = entry["worker_addr"].setdefault(payload.tp_rank, {})
+        if payload.pp_rank in tp_entry:
+            if tp_entry[payload.pp_rank] == payload.address:
+                return {"status": "ok"}
+            raise HTTPException(400, "worker rank already registered")
+        tp_entry[payload.pp_rank] = payload.address
+        return {"status": "ok"}
+
+    async def query(self) -> dict[int, dict[str, Any]]:
+        return self.workers
+
+    def close(self) -> None:
+        if self.server.started:
+            self.server.should_exit = True
+            self.thread.join(timeout=5)
+
+
+@dataclass(frozen=True)
+class TransferRegion:
+    layer_name: str
+    layer_index: int
+    group_index: int
+    base_address: int
+    block_length: int
+    kv_block_length: int
+
+
+@dataclass
+class _NPUTransferTopology:
+    """The subset of TransferTopology needed by the Ascend direct path.
+
+    Ascend attention backends expose split K/V tensors whose backend shape has
+    a leading K/V dimension.  The upstream CUDA-oriented TransferTopology
+    validates a single blocks-first tensor, so it cannot be constructed for
+    that layout.
+    """
+
+    tp_rank: int
+    tp_size: int
+    block_size: int
+    engine_id: str
+    is_mla: bool
+    total_num_kv_heads: int
+    virtually_split_kv_in_blocks: bool = False
+
+    @property
+    def local_replicates_kv_cache(self) -> bool:
+        return self.is_mla or self.tp_size > self.total_num_kv_heads
+
+    def handshake_target_ranks(self, remote_tp_size: int) -> list[int]:
+        if self.tp_size >= remote_tp_size:
+            if self.tp_size % remote_tp_size:
+                raise ValueError("P/D TP sizes must have an integer ratio")
+            return [self.tp_rank // (self.tp_size // remote_tp_size)]
+        if remote_tp_size % self.tp_size:
+            raise ValueError("P/D TP sizes must have an integer ratio")
+        ratio = remote_tp_size // self.tp_size
+        return [self.tp_rank * ratio + offset for offset in range(ratio)]
+
+
+def kv_slice_plan(p_rank, p_size, d_rank, d_size, p_bytes, d_bytes, kv_heads, is_mla):
+    """Return copy flag, byte slices and effective source/target shard counts.
+
+    Rank discovery uses physical TP ranks. Byte slicing uses unique KV shards,
+    selecting one sender per replicated shard within each D rank's peer set.
+    """
+    if max(p_size, d_size) % min(p_size, d_size):
+        raise ValueError("P/D TP sizes must have an integer ratio")
+    p_shards = effective_tp(p_size, kv_heads, is_mla)
+    d_shards = effective_tp(d_size, kv_heads, is_mla)
+    p_copies, d_copies = p_size // p_shards, d_size // d_shards
+    if p_size >= d_size:
+        first_peer = d_rank * (p_size // d_size)
+        representative = max(first_peer, (p_rank // p_copies) * p_copies)
+        if p_rank != representative:
+            return False, 0, 0, 0, p_shards, d_shards
+    p_shard, d_shard = p_rank // p_copies, d_rank // d_copies
+    if p_shards >= d_shards:
+        ratio = p_shards // d_shards
+        if p_shard // ratio != d_shard:
+            raise ValueError("P/D KV shard pairing mismatch")
+        return True, 0, (p_shard % ratio) * p_bytes, p_bytes, p_shards, d_shards
+    ratio = d_shards // p_shards
+    if d_shard // ratio != p_shard:
+        raise ValueError("P/D KV shard pairing mismatch")
+    return True, (d_shard % ratio) * d_bytes, 0, d_bytes, p_shards, d_shards
+
+
+@dataclass
+class _Session:
+    request_id: str
+    transfer_id: str
+    block_ids: BlockIds = ()
+    ready: threading.Event = field(default_factory=threading.Event)
+    published: bool = False
+    abort: bool = False
+    expected: int = 0
+    completed: int = 0
+    terminal: int = 0
+    active_writes: int = 0
+    expires_at: float = float("inf")
+    peer: tuple | None = None
+    targets: dict[tuple, asyncio.Future] = field(default_factory=dict)
+    descriptors: dict[tuple, tuple] = field(default_factory=dict)
+
+
+class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
+    """Own TE registration, parallel mapping, WRITE and fenced sessions.
+
+    Retired attempt IDs prevent late pulls from reaching recycled memory.
+    Unpublished P sessions survive preemption so early D waiters can resume.
+    """
+
+    def __init__(self, config: VllmConfig, kv_cache_config: Any) -> None:
+        try:
+            from mooncake.engine import TransferEngine
+        except ImportError as exc:
+            raise ImportError("Mooncake TransferEngine bindings are required") from exc
+        assert config.kv_transfer_config is not None
+        transfer = config.kv_transfer_config
+        assert transfer.engine_id is not None
+        self.config = config
+        self.num_blocks = config.cache_config.num_gpu_blocks
+        self.engine_id = transfer.engine_id
+        self.is_producer = transfer.kv_role == "kv_producer"
+        self.is_consumer = transfer.kv_role == "kv_consumer"
+        self.extra = transfer.kv_connector_extra_config
+        self.timeout = float(
+            self.extra.get(
+                "mtsc_pd_timeout_seconds", envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+            )
+        )
+        self.device_id = torch.accelerator.current_device_index()
+        current_platform.set_device(self.device_id)
+        self.engine = TransferEngine()
+        self.hostname = get_ip()
+        default_protocol = "ascend" if is_npu_platform() else "rdma"
+        ret = self.engine.initialize(
+            self.hostname,
+            "P2PHANDSHAKE",
+            self.extra.get("mooncake_protocol", default_protocol),
+            self.extra.get("device_name", ""),
+        )
+        if ret != 0:
+            raise RuntimeError(f"Mooncake TransferEngine initialization failed: {ret}")
+        self.rpc_port = self.engine.get_rpc_port()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.pp_rank = get_pp_group().rank_in_group
+        self.pp_size = config.parallel_config.pipeline_parallel_size
+        parallel = config.parallel_config
+        self.dp_rank = (
+            parallel.data_parallel_rank_local
+            if parallel.local_engines_only
+            else parallel.data_parallel_index
+        )
+        model = config.model_config
+        topology_args = {
+            "tp_rank": self.tp_rank,
+            "tp_size": self.tp_size,
+            "block_size": config.cache_config.block_size,
+            "engine_id": self.engine_id,
+            "is_mla": model.use_mla,
+            "total_num_kv_heads": model.get_total_num_kv_heads(),
+        }
+        if is_npu_platform():
+            self.topology = _NPUTransferTopology(**topology_args)
+        else:
+            self.topology = TransferTopology(
+                **topology_args,
+                is_mamba=kv_cache_config.has_mamba_layers,
+                attn_backends=get_current_attn_backends(config),
+            )
+        self.npu_kv_nz = npu_kv_nz_enabled(config)
+        if is_npu_platform():
+            cache_layout = "npu-nz" if self.npu_kv_nz else "npu-normal"
+        else:
+            cache_layout = "mla" if model.use_mla else "hnd"
+        self.schema = PDTransferSchema(
+            topology_version=2,
+            pcp_size=getattr(parallel, "prefill_context_parallel_size", 1),
+            dcp_size=getattr(parallel, "decode_context_parallel_size", 1),
+            model_id=str(model.model),
+            model_revision=str(getattr(model, "revision", None) or ""),
+            cache_dtype=str(
+                model.dtype
+                if config.cache_config.cache_dtype == "auto"
+                else config.cache_config.cache_dtype
+            ),
+            cache_layout=cache_layout,
+            block_size=config.cache_config.block_size,
+            is_mla=model.use_mla,
+        )
+        self.kv_caches: dict[
+            str, torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
+        ] = {}
+        self.layer_specs: dict[str, Any] = {}
+        self.layer_groups: dict[str, int] = {}
+        for group_index, group in enumerate(kv_cache_config.kv_cache_groups):
+            specs = getattr(group.kv_cache_spec, "kv_cache_specs", {})
+            for layer in group.layer_names:
+                self.layer_specs[layer] = specs.get(layer, group.kv_cache_spec)
+                self.layer_groups[layer] = group_index
+        self.regions: list[TransferRegion] = []
+        self._registered_storage: list[int] = []
+        self._sources: dict[str, _Session] = {}
+        self._source_lock = threading.Lock()
+        self._finished_send: set[str] = set()
+        self._finished_recv: set[str] = set()
+        self._failed_recv: set[str] = set()
+        self._result_lock = threading.Lock()
+        self._remote_workers: dict[tuple[str, str, int], dict[int, dict[int, str]]] = {}
+        self._receive_futures: dict[str, Future[None]] = {}
+        self._receive_lock = threading.Lock()
+        self._encoder = msgspec.msgpack.Encoder()
+        self._request_decoder = msgspec.msgpack.Decoder(PDTransferRequest)
+        self._response_decoder = msgspec.msgpack.Decoder(PDTransferResponse)
+        self._ctx = zmq.asyncio.Context()
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=_run_loop, args=(self._loop,), name="mtsc-pd", daemon=True
+        )
+        self._loop_thread.start()
+        self._listener_future = None
+        self._serve_tasks: set[asyncio.Task[None]] = set()
+        self._closing = False
+        self._send_pool = ThreadPoolExecutor(
+            max_workers=max(1, int(self.extra.get("num_workers", 10))),
+            thread_name_prefix="mtsc-te-write",
+            initializer=lambda: current_platform.set_device(self.device_id),
+        )
+        self._bootstrap = None
+        if self.is_producer and _launch_bootstrap(config):
+            _, port = _bootstrap_address(config)
+            self._bootstrap = BootstrapServer(port)
+            self._bootstrap.start()
+        self._source_changed = threading.Condition(self._source_lock)
+        self._retired: set[str] = set()
+        self._prepared: dict[str, str] = {}
+        self._send_events: dict[str, SendEvent] = {}
+        self._recv_events: dict[str, RecvEvent] = {}
+        self._send_failures: dict[str, str] = {}
+        self._invalid: dict[str, set[int]] = {}
+        self._registered = False
+        self._closed = False
+
+    def _check_open(self) -> None:
+        if self._closed or self._closing:
+            raise RuntimeError("KV transfer is closed")
+
+    def register(self, kv_caches) -> None:
+        self._check_open()
+        if self._registered:
+            raise RuntimeError("KV transfer memory is already registered")
+        self.kv_caches = kv_caches
+        is_npu = is_npu_platform()
+        if is_npu:
+            pointers, lengths = npu_registration_regions(kv_caches)
+        else:
+            pointers, lengths = [], []
+        seen: set[int] = set()
+        for layer_name, raw in kv_caches.items():
+            spec = self.layer_specs.get(layer_name)
+            if spec is None:
+                continue
+            if isinstance(spec, MambaSpec):
+                if not isinstance(raw, (list, tuple)) or not raw:
+                    raise TypeError(
+                        f"Mamba cache {layer_name!r} must be a non-empty sequence"
+                    )
+                # The convolution state is transferred. The SSM state is
+                # recomputed from the final prompt token on Decode.
+                cache_list = [raw[0]]
+            elif is_npu:
+                cache_list = cache_tensors(raw)
+            else:
+                if not isinstance(raw, torch.Tensor):
+                    raise TypeError(f"Attention cache {layer_name!r} must be a tensor")
+                cache_list = self.topology.get_transfer_cache_regions(raw, spec)
+            if isinstance(cache_list, torch.Tensor):
+                cache_list = [cache_list]
+            for cache in cache_list:
+                storage = cache.untyped_storage()
+                if not is_npu and storage.data_ptr() not in seen:
+                    seen.add(storage.data_ptr())
+                    pointers.append(storage.data_ptr())
+                    lengths.append(storage.nbytes())
+                block_length = cache.stride(0) * cache.element_size()
+                if is_npu:
+                    # Ascend exposes K/V (or MLA nope/rope) as independent
+                    # blocks-first tensors. Each region transfers its own page.
+                    kv_length = block_length
+                elif isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
+                    kv_length = spec.page_size_bytes
+                elif self.topology.virtually_split_kv_in_blocks and not isinstance(
+                    spec, MambaSpec
+                ):
+                    kv_length = block_length // 2
+                else:
+                    kv_length = block_length
+                self.regions.append(
+                    TransferRegion(
+                        layer_name,
+                        extract_layer_index(layer_name),
+                        self.layer_groups[layer_name],
+                        cache.data_ptr(),
+                        block_length,
+                        kv_length,
+                    )
+                )
+        if not pointers:
+            raise RuntimeError("No PD KV regions registered")
+        if is_npu:
+            # Mooncake's Ascend wrapper registers HCCL regions one by one;
+            # batch_register_memory is the CUDA/RDMA path.
+            for pointer, length in zip(pointers, lengths, strict=True):
+                ret = self.engine.register_memory(pointer, length)
+                if ret != 0:
+                    raise RuntimeError(f"Mooncake TE memory registration failed: {ret}")
+                self._registered_storage.append(pointer)
+        else:
+            ret = self.engine.batch_register_memory(pointers, lengths)
+            if ret != 0:
+                raise RuntimeError(f"Mooncake TE memory registration failed: {ret}")
+            self._registered_storage = pointers
+        if self.is_producer:
+            ready = threading.Event()
+            self._listener_future = asyncio.run_coroutine_threadsafe(
+                self._listen(ready), self._loop
+            )
+            if not ready.wait(timeout=self.timeout):
+                self._listener_future.cancel()
+                raise TimeoutError("MTSC P listener startup timed out")
+            if self._listener_future.done():
+                # Do not turn bootstrap/listener initialization errors into a
+                # silent, permanent engine startup hang.
+                self._listener_future.result()
+        self._registered = True
+
+    def prepare(self, request_id: str, transfer_id: str) -> None:
+        self._check_open()
+        if not self.is_producer:
+            raise ValueError("Only P can prepare a source session")
+        with self._source_lock:
+            previous = self._prepared.get(request_id)
+            if previous is not None and previous != transfer_id:
+                raise ValueError("Request already belongs to another transfer attempt")
+            if transfer_id in self._retired:
+                raise ValueError("Transfer attempt is retired")
+            source = self._sources.setdefault(
+                transfer_id, _Session(request_id, transfer_id)
+            )
+            if source.request_id and source.request_id != request_id:
+                raise ValueError("Transfer attempt belongs to another request")
+            source.request_id = request_id
+            self._prepared[request_id] = transfer_id
+
+    def send(self, event: SendEvent) -> None:
+        self._check_open()
+        if not self._registered:
+            raise RuntimeError("Register KV memory before send")
+        if event.request_id in self._send_events:
+            raise ValueError("Uncollected send for request")
+        self.prepare(event.request_id, event.transfer_id)
+        with self._source_lock:
+            source = self._sources[event.transfer_id]
+            source.block_ids = event.block_ids
+            source.published = True
+            source.expires_at = time.monotonic() + self.timeout
+            self._send_events[event.request_id] = event
+            source.ready.set()
+            if source.expected > 0 and source.terminal >= source.expected:
+                self._retire_locked(source)
+
+    def recv(self, event: RecvEvent) -> None:
+        self._check_open()
+        if not self._registered:
+            raise RuntimeError("Register KV memory before recv")
+        if event.request_id in self._recv_events or event.request_id in self._invalid:
+            raise ValueError("Uncollected recv or block errors for request")
+        if event.transfer_id in self._retired:
+            raise ValueError("Transfer attempt is retired")
+        self._recv_events[event.request_id] = event
+        try:
+            self._submit_receive(
+                event.request_id,
+                event.transfer_id,
+                [list(ids) for ids in event.block_ids],
+                event.remote_engine_id,
+                event.bootstrap_addr,
+                event.remote_dp_rank,
+            )
+        except Exception:
+            self._recv_events.pop(event.request_id, None)
+            raise
+
+    def _retire_locked(self, source: _Session, *, report: bool = True) -> None:
+        if source.active_writes:
+            raise RuntimeError("Cannot retire a source with active WRITEs")
+        source.abort = True
+        source.ready.set()
+        self._retired.add(source.transfer_id)
+        self._sources.pop(source.transfer_id, None)
+        if report and source.published:
+            with self._result_lock:
+                if (
+                    source.completed < source.expected
+                    or source.completed != source.terminal
+                ):
+                    self._send_failures[source.request_id] = (
+                        "Transfer target failed or timed out"
+                    )
+                self._finished_send.add(source.request_id)
+
+    async def _serve(self, identity, payload, socket) -> None:
+        completed = []
+        failed = []
+        coverage = {}
+        try:
+            if self._closing:
+                raise RuntimeError("P transfer is closing")
+            request = self._request_decoder.decode(payload)
+            if request.schema != self.schema:
+                raise ValueError("P/D transfer schema mismatch")
+            if (
+                request.remote_engine_id != self.engine_id
+                or request.remote_dp_rank != self.dp_rank
+            ):
+                raise ValueError("P engine/DP identity mismatch")
+            if not request.engine_id:
+                raise ValueError("D engine identity is missing")
+            if request.destination_num_blocks <= 0:
+                raise ValueError("D registered block capacity is missing")
+            ranks = self.topology.handshake_target_ranks(request.tp_size)
+            if request.tp_rank not in ranks:
+                raise ValueError("D TP rank is not paired with this P rank")
+            if request.pp_size <= 0 or not 0 <= request.pp_rank < request.pp_size:
+                raise ValueError("Invalid D PP identity")
+            if self.pp_size == request.pp_size and self.pp_rank != request.pp_rank:
+                raise ValueError("D PP rank is not paired with this P rank")
+            peer = (
+                request.engine_id,
+                request.dp_rank,
+                request.tp_size,
+                request.pp_size,
+            )
+            target = (
+                request.engine_id,
+                request.dp_rank,
+                request.tp_rank,
+                request.pp_rank,
+            )
+            for decode_id, (transfer_id, _) in request.requests.items():
+                descriptor = (
+                    decode_id,
+                    request.hostname,
+                    request.rpc_port,
+                    tuple(tuple(ids) for ids in request.requests[decode_id][1]),
+                    tuple(request.region_base_addresses),
+                    tuple(request.block_lengths),
+                    tuple(request.kv_block_lengths),
+                    tuple(request.layer_names),
+                    tuple(request.layer_indices),
+                    tuple(request.group_indices),
+                )
+                with self._source_lock:
+                    if transfer_id in self._retired:
+                        source = None
+                    else:
+                        source = self._sources.setdefault(
+                            transfer_id, _Session("", transfer_id)
+                        )
+                        if source.peer is not None and source.peer != peer:
+                            raise ValueError(
+                                "Transfer attempt belongs to another D replica/topology"
+                            )
+                        source.peer = peer
+                        source.expected = len(ranks) * (
+                            1 if self.pp_size == request.pp_size else request.pp_size
+                        )
+                        previous = source.targets.get(target)
+                        if (
+                            previous is not None
+                            and source.descriptors[target] != descriptor
+                        ):
+                            raise ValueError(
+                                "Duplicate target changed destination memory"
+                            )
+                        if previous is None:
+                            previous = asyncio.get_running_loop().create_future()
+                            source.targets[target] = previous
+                            source.descriptors[target] = descriptor
+                            owner = True
+                        else:
+                            owner = False
+                if source is None:
+                    failed.append(decode_id)
+                    continue
+                if owner:
+                    ok, covered = await self._write_target(source, request, decode_id)
+                    previous.set_result((ok, covered))
+                else:
+                    # A duplicate pull joins the original fence. It must never
+                    # write again or increment source completion twice.
+                    ok, covered = await asyncio.shield(previous)
+                if ok:
+                    completed.append(decode_id)
+                    coverage[decode_id] = sorted(covered)
+                else:
+                    failed.append(decode_id)
+            response = PDTransferResponse(
+                PDResponseStatus.FINISH,
+                completed or None,
+                failed or None,
+                "transfer failed" if failed else None,
+                coverage or None,
+            )
+        except Exception as exc:  # noqa: BLE001 - control response boundary
+            response = PDTransferResponse(PDResponseStatus.ERROR, error=str(exc))
+        await socket.send_multipart((identity, self._encoder.encode(response)))
+
+    async def _write_target(self, source, request, decode_id):
+        ready = await asyncio.to_thread(source.ready.wait, self.timeout)
+        with self._source_lock:
+            active = (
+                ready and not source.abort and source.transfer_id not in self._retired
+            )
+            if active:
+                source.active_writes += 1
+        ok, covered = False, set()
+        try:
+            if active:
+                ok, covered = await self._write_one(decode_id, source, request)
+        except Exception as exc:  # noqa: BLE001 - native WRITE result boundary
+            logger.warning(
+                "MTSC Transfer WRITE failed: request_id=%s transfer_id=%s error=%s",
+                source.request_id,
+                source.transfer_id,
+                exc,
+            )
+            ok, covered = False, set()
+        finally:
+            with self._source_changed:
+                if active:
+                    source.active_writes -= 1
+                source.terminal += 1
+                source.completed += int(ok)
+                if source.active_writes == 0:
+                    self._source_changed.notify_all()
+                    if (
+                        self._sources.get(source.transfer_id) is source
+                        and source.published
+                        and source.terminal >= source.expected
+                    ):
+                        self._retire_locked(source)
+        return ok, covered
+
+    def poll(self) -> TransferPollResult:
+        result = TransferPollResult()
+        with self._source_lock:
+            for source in list(self._sources.values()):
+                if (
+                    source.published
+                    and source.active_writes == 0
+                    and source.expires_at < time.monotonic()
+                ):
+                    # No receiver is a failure too, although source memory is safe.
+                    source.expected = max(source.expected, source.completed + 1)
+                    self._retire_locked(source)
+        with self._receive_lock:
+            terminal = {
+                rid for rid, future in self._receive_futures.items() if future.done()
+            }
+        with self._result_lock:
+            for request_id in self._finished_send:
+                result.sends.append(
+                    TransferResult(
+                        request_id,
+                        self._send_failures.pop(request_id, None),
+                    )
+                )
+                self._send_events.pop(request_id, None)
+                self._prepared.pop(request_id, None)
+            self._finished_send.clear()
+            for request_id in terminal:
+                event = self._recv_events.pop(request_id, None)
+                if event is None:
+                    continue
+                failed = request_id in self._failed_recv
+                if failed:
+                    self._invalid[request_id] = {
+                        block for ids in event.block_ids for block in ids if block >= 0
+                    }
+                result.recvs.append(
+                    TransferResult(
+                        request_id,
+                        "Transfer receive failed" if failed else None,
+                    )
+                )
+                self._finished_recv.discard(request_id)
+                self._failed_recv.discard(request_id)
+                self._retired.add(event.transfer_id)
+        with self._receive_lock:
+            for request_id in terminal:
+                self._receive_futures.pop(request_id, None)
+        return result
+
+    def take_errors(self) -> set[int]:
+        result = {block for ids in self._invalid.values() for block in ids}
+        self._invalid.clear()
+        return result
+
+    def cancel(self, request_id: str, transfer_id: str) -> None:
+        with self._source_changed:
+            source = self._sources.get(transfer_id)
+            if source is not None:
+                if source.request_id and source.request_id != request_id:
+                    raise ValueError("Cannot cancel another request's session")
+                source.abort = True
+                source.ready.set()
+                while source.active_writes:
+                    self._source_changed.wait()
+                self._retire_locked(source, report=False)
+            self._retired.add(transfer_id)
+            self._prepared.pop(request_id, None)
+            self._send_events.pop(request_id, None)
+        with self._result_lock:
+            self._finished_send.discard(request_id)
+            self._send_failures.pop(request_id, None)
+
+    def preempt(self, request_id: str) -> None:
+        event = self._recv_events.get(request_id)
+        self._fence_receives({request_id})
+        if event is not None:
+            self._retired.add(event.transfer_id)
+            self._recv_events.pop(request_id, None)
+        self._invalid.pop(request_id, None)
+        transfer_id = self._prepared.get(request_id)
+        if transfer_id is not None:
+            with self._source_lock:
+                source = self._sources.get(transfer_id)
+                unready = source is not None and not source.published
+            if not unready:
+                self.cancel(request_id, transfer_id)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._closing = True
+        with self._source_lock:
+            for source in self._sources.values():
+                source.abort = True
+                source.ready.set()
+        # D may have already published destination addresses. A remote P can
+        # legally keep writing until its terminal response arrives, so fence
+        # every receive before registered cache memory can be torn down.
+        with self._receive_lock:
+            receive_ids = set(self._receive_futures)
+        self._fence_receives(receive_ids)
+        # A running WRITE still uses both registered GPU memory and the TE.
+        self._send_pool.shutdown(wait=True, cancel_futures=True)
+        if self._loop.is_running():
+
+            async def close_context() -> None:
+                # ZMQ sockets belong to this event-loop thread. Destroying the
+                # context from the vLLM main thread can trip libzmq's signaler
+                # assertion during process shutdown.
+                if self._serve_tasks:
+                    await asyncio.gather(
+                        *tuple(self._serve_tasks), return_exceptions=True
+                    )
+                # Keep the ROUTER alive until terminal responses have been
+                # delivered. Closing it earlier can strand D's receive fence.
+                if self._listener_future is not None:
+                    self._listener_future.cancel()
+                    await asyncio.sleep(0)
+                self._ctx.destroy(linger=0)
+                await asyncio.sleep(0)
+                await self._loop.shutdown_default_executor()
+
+            future = asyncio.run_coroutine_threadsafe(close_context(), self._loop)
+            future.result()
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop_thread.join()
+            self._loop.close()
+        if self._bootstrap is not None:
+            self._bootstrap.close()
+        if self._registered_storage:
+            try:
+                if is_npu_platform() or not hasattr(
+                    self.engine, "batch_unregister_memory"
+                ):
+                    results = [
+                        self.engine.unregister_memory(pointer)
+                        for pointer in self._registered_storage
+                    ]
+                    if any(result != 0 for result in results):
+                        logger.warning("MTSC TE memory unregistration partially failed")
+                else:
+                    ret = self.engine.batch_unregister_memory(self._registered_storage)
+                    if ret != 0:
+                        logger.warning(
+                            "MTSC TE memory unregistration failed: ret=%s", ret
+                        )
+            except Exception as exc:  # noqa: BLE001 - binding teardown boundary
+                logger.warning("MTSC TE memory unregistration failed: error=%s", exc)
+            finally:
+                self._registered_storage = []
+        self._sources.clear()
+        self._prepared.clear()
+        self._send_events.clear()
+        self._recv_events.clear()
+        self._invalid.clear()
+        self._retired.clear()
+        self._finished_send.clear()
+        self._finished_recv.clear()
+        self._failed_recv.clear()
+        self._send_failures.clear()
+        self.kv_caches.clear()
+
+    async def _register_worker(self, side_port: int) -> None:
+        host, port = _bootstrap_address(self.config)
+        payload = WorkerRegistration(
+            engine_id=self.engine_id,
+            dp_rank=self.dp_rank,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            address=make_zmq_path("tcp", self.hostname, side_port),
+        )
+        url = make_zmq_path("http", host, port) + "/register"
+        # Bootstrap is an internal control-plane hop. Never route it through
+        # process-wide HTTP(S)_PROXY settings.
+        async with httpx.AsyncClient(trust_env=False) as client:
+            for _ in range(120):
+                try:
+                    response = await client.post(url, json=payload.model_dump())
+                    response.raise_for_status()
+                    return
+                except httpx.ConnectError:
+                    await asyncio.sleep(0.25)
+        raise RuntimeError(f"MTSC bootstrap unavailable: {url}")
+
+    async def _listen(self, ready: threading.Event) -> None:
+        socket = self._ctx.socket(zmq.ROUTER)
+        try:
+            port = socket.bind_to_random_port(f"tcp://{self.hostname}")
+            await self._register_worker(port)
+            ready.set()
+            while True:
+                identity, payload = await socket.recv_multipart()
+                task = asyncio.create_task(self._serve(identity, payload, socket))
+                self._serve_tasks.add(task)
+                task.add_done_callback(self._serve_tasks.discard)
+        except (asyncio.CancelledError, zmq.ContextTerminated):
+            pass
+        except Exception:
+            ready.set()
+            raise
+        finally:
+            socket.close(linger=0)
+
+    def _aligned_regions(
+        self, request: PDTransferRequest
+    ) -> list[tuple[TransferRegion, TransferRegion, int]]:
+        remote = [
+            TransferRegion(name, index, group, base, block, kv)
+            for name, index, group, base, block, kv in zip(
+                request.layer_names,
+                request.layer_indices,
+                request.group_indices,
+                request.region_base_addresses,
+                request.block_lengths,
+                request.kv_block_lengths,
+                strict=True,
+            )
+        ]
+        by_key: dict[tuple[str, int], tuple[TransferRegion, int]] = {}
+        counts: defaultdict[str, int] = defaultdict(int)
+        for remote_index, region in enumerate(remote):
+            key = (region.layer_name, counts[region.layer_name])
+            counts[region.layer_name] += 1
+            by_key[key] = (region, remote_index)
+        result: list[tuple[TransferRegion, TransferRegion, int]] = []
+        counts.clear()
+        for region in self.regions:
+            key = (region.layer_name, counts[region.layer_name])
+            counts[region.layer_name] += 1
+            match = by_key.get(key)
+            if match is None:
+                # Different PP partitions legitimately have non-overlapping
+                # local layers. D validates the union of all P responses.
+                continue
+            other, remote_index = match
+            if (
+                other.layer_index != region.layer_index
+                or other.group_index != region.group_index
+            ):
+                raise ValueError(
+                    f"P/D region identity mismatch for {region.layer_name!r}"
+                )
+            result.append((region, other, remote_index))
+        return result
+
+    @staticmethod
+    def _validate_region_plan(
+        local: TransferRegion,
+        remote: TransferRegion,
+        local_size: int,
+        remote_size: int,
+        replicated: bool,
+        source_offset: int,
+        destination_offset: int,
+        length: int,
+    ) -> None:
+        if local.block_length <= 0 or remote.block_length <= 0 or length <= 0:
+            raise ValueError("P/D region lengths must be positive")
+        if source_offset + length > local.block_length:
+            raise ValueError("P source slice exceeds its registered block")
+        if destination_offset + length > remote.block_length:
+            raise ValueError("D destination slice exceeds its registered block")
+        if replicated:
+            if local.kv_block_length != remote.kv_block_length:
+                raise ValueError("Replicated P/D KV page sizes do not match")
+            return
+        if local_size == remote_size:
+            valid = local.kv_block_length == remote.kv_block_length
+        elif local_size > remote_size:
+            valid = (
+                local.kv_block_length * (local_size // remote_size)
+                == remote.kv_block_length
+            )
+        else:
+            valid = (
+                remote.kv_block_length * (remote_size // local_size)
+                == local.kv_block_length
+            )
+        if not valid:
+            raise ValueError("P/D KV page lengths do not match their TP ratio")
+
+    async def _write_one(
+        self, decode_id: str, source: _Session, request: PDTransferRequest
+    ) -> tuple[bool, set[int]]:
+        _, destination_groups = request.requests[decode_id]
+        if not any(destination_groups):
+            return True, set()
+        if len(source.block_ids) != len(destination_groups):
+            return False, set()
+        source_groups: list[list[int]] = []
+        for local, remote in zip(source.block_ids, destination_groups, strict=True):
+            if len(local) < len(remote):
+                return False, set()
+            source_groups.append(local[-len(remote) :] if remote else [])
+        src: list[int] = []
+        dst: list[int] = []
+        sizes: list[int] = []
+        covered: set[int] = set()
+        for local_region, remote_region, remote_index in self._aligned_regions(request):
+            group = local_region.group_index
+            if group >= len(destination_groups):
+                raise ValueError(
+                    f"P/D region group {group} exceeds request group count"
+                )
+            if not any(block >= 0 for block in destination_groups[group]):
+                continue
+            copy, src_offset, dst_offset, length, p_shards, d_shards = kv_slice_plan(
+                self.tp_rank,
+                self.tp_size,
+                request.tp_rank,
+                request.tp_size,
+                local_region.kv_block_length,
+                remote_region.kv_block_length,
+                self.topology.total_num_kv_heads,
+                self.topology.is_mla,
+            )
+            if not copy:
+                continue
+            self._validate_region_plan(
+                local_region,
+                remote_region,
+                p_shards,
+                d_shards,
+                False,
+                src_offset,
+                dst_offset,
+                length,
+            )
+            covered.add(remote_index)
+            for source_block, destination_block in zip(
+                source_groups[group], destination_groups[group], strict=True
+            ):
+                if destination_block < 0:
+                    continue  # Sliding-window placeholder, not writable memory.
+                if source_block < 0:
+                    raise ValueError("Requested source block is a placeholder")
+                if source_block >= self.num_blocks:
+                    raise ValueError("Source block exceeds registered memory")
+                if (
+                    request.destination_num_blocks
+                    and destination_block >= request.destination_num_blocks
+                ):
+                    raise ValueError("Destination block exceeds registered memory")
+                src.append(
+                    local_region.base_address
+                    + source_block * local_region.block_length
+                    + src_offset
+                )
+                dst.append(
+                    remote_region.base_address
+                    + destination_block * remote_region.block_length
+                    + dst_offset
+                )
+                sizes.append(length)
+        if not src:
+            return True, covered
+        session = f"{request.hostname}:{request.rpc_port}"
+        ret = await self._loop.run_in_executor(
+            self._send_pool,
+            self.engine.batch_transfer_sync_write,
+            session,
+            src,
+            dst,
+            sizes,
+        )
+        if ret != 0:
+            logger.warning("MTSC TE WRITE failed: request_id=%s ret=%s", decode_id, ret)
+        return ret == 0, covered if ret == 0 else set()
+
+    async def _query_workers(
+        self, address: str, engine_id: str, dp_rank: int
+    ) -> dict[int, dict[int, str]]:
+        key = (address.rstrip("/"), engine_id, dp_rank)
+        if key in self._remote_workers:
+            return self._remote_workers[key]
+        async with httpx.AsyncClient(trust_env=False) as client:
+            response = await client.get(address.rstrip("/") + "/query")
+            response.raise_for_status()
+            entries = response.json()
+        entry = entries.get(str(dp_rank))
+        if entry is None:
+            raise KeyError(f"Remote DP rank {dp_rank} is not registered")
+        if entry.get("engine_id") != engine_id:
+            raise KeyError(
+                f"Remote DP rank {dp_rank} belongs to engine "
+                f"{entry.get('engine_id')!r}, not {engine_id!r}"
+            )
+        workers = {
+            int(tp): {int(pp): addr for pp, addr in pp_map.items()}
+            for tp, pp_map in entry["worker_addr"].items()
+        }
+        tp_size = int(entry.get("tp_size", 0))
+        pp_size = int(entry.get("pp_size", 0))
+        if tp_size <= 0 or pp_size <= 0:
+            raise ValueError("Remote P topology dimensions are missing")
+        if sorted(workers) != list(range(tp_size)):
+            raise ValueError("Remote P TP workers are not fully registered")
+        expected_pp = list(range(pp_size))
+        if any(sorted(pp_map) != expected_pp for pp_map in workers.values()):
+            raise ValueError("Remote P PP workers are not fully registered")
+        self._remote_workers[key] = workers
+        return workers
+
+    def _validate_coverage(
+        self,
+        request_id: str,
+        block_ids: list[list[int]],
+        responses: list[PDTransferResponse],
+        expected: int,
+    ) -> None:
+        """Require every data-carrying D region to have exactly one TP fan-in."""
+        coverage: Counter[int] = Counter()
+        for response in responses:
+            coverage.update((response.covered_regions or {}).get(request_id, []))
+        required = {
+            index
+            for index, region in enumerate(self.regions)
+            if region.group_index < len(block_ids)
+            and any(block >= 0 for block in block_ids[region.group_index])
+        }
+        invalid = [index for index in required if coverage[index] != expected]
+        unexpected = [index for index in coverage if index not in required]
+        if invalid or unexpected:
+            raise ValueError(
+                "P/D region coverage mismatch: "
+                f"expected={expected} invalid={invalid} unexpected={unexpected}"
+            )
+
+    async def _receive(
+        self,
+        request_id: str,
+        transfer_id: str,
+        block_ids: list[list[int]],
+        remote_engine_id: str,
+        bootstrap: str,
+        remote_dp_rank: int,
+    ) -> None:
+        failed = False
+        try:
+            workers = await self._query_workers(
+                bootstrap, remote_engine_id, remote_dp_rank
+            )
+            target_tp = self.topology.handshake_target_ranks(len(workers))
+            addresses: list[str] = []
+            for tp_rank in target_tp:
+                pp_map = workers[tp_rank]
+                pp_ranks = (
+                    [self.pp_rank]
+                    if len(pp_map) == self.pp_size and self.pp_rank in pp_map
+                    else sorted(pp_map)
+                )
+                addresses.extend(pp_map[rank] for rank in pp_ranks)
+            if not addresses:
+                raise RuntimeError("No matching P workers in bootstrap response")
+            request = PDTransferRequest(
+                hostname=self.hostname,
+                rpc_port=self.rpc_port,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                pp_size=self.pp_size,
+                pp_rank=self.pp_rank,
+                schema=self.schema,
+                requests={request_id: (transfer_id, block_ids)},
+                region_base_addresses=[region.base_address for region in self.regions],
+                block_lengths=[region.block_length for region in self.regions],
+                kv_block_lengths=[region.kv_block_length for region in self.regions],
+                layer_names=[region.layer_name for region in self.regions],
+                layer_indices=[region.layer_index for region in self.regions],
+                group_indices=[region.group_index for region in self.regions],
+                engine_id=self.engine_id,
+                dp_rank=self.dp_rank,
+                remote_engine_id=remote_engine_id,
+                remote_dp_rank=remote_dp_rank,
+                destination_num_blocks=self.num_blocks,
+            )
+            payload = self._encoder.encode(request)
+
+            async def call(address: str) -> PDTransferResponse:
+                socket = self._ctx.socket(zmq.DEALER)
+                socket.setsockopt(zmq.LINGER, 0)
+                socket.connect(address)
+                try:
+                    await socket.send(payload)
+                    # Once P has the destination addresses it may already be
+                    # writing. Do not time out locally and release D blocks;
+                    # wait for P's terminal response to fence the DMA.
+                    raw = await socket.recv()
+                    return self._response_decoder.decode(raw)
+                finally:
+                    socket.close(linger=0)
+
+            # A failed peer must not leave sibling WRITEs unfenced.
+            outcomes = await asyncio.gather(
+                *(call(address) for address in addresses), return_exceptions=True
+            )
+            errors = [
+                outcome for outcome in outcomes if isinstance(outcome, BaseException)
+            ]
+            if errors:
+                raise RuntimeError(f"P peer request failed: {errors[0]}")
+            responses = outcomes
+            failed = any(
+                response.status != PDResponseStatus.FINISH
+                or request_id not in (response.completed or [])
+                or request_id in (response.failed or [])
+                for response in responses
+            )
+            if not failed and any(block_ids):
+                p_shards = effective_tp(
+                    len(workers), self.topology.total_num_kv_heads, self.schema.is_mla
+                )
+                d_shards = effective_tp(
+                    self.tp_size, self.topology.total_num_kv_heads, self.schema.is_mla
+                )
+                expected = max(1, p_shards // d_shards)
+                self._validate_coverage(request_id, block_ids, responses, expected)
+            if not failed:
+                self.reformat_npu_blocks(block_ids, len(workers))
+        except Exception as exc:  # noqa: BLE001 - async transport boundary
+            failed = True
+            logger.warning(
+                "MTSC D pull failed: request_id=%s error=%s", request_id, exc
+            )
+        with self._result_lock:
+            (self._failed_recv if failed else self._finished_recv).add(request_id)
+
+    def _submit_receive(
+        self,
+        request_id: str,
+        transfer_id: str,
+        block_ids: list[list[int]],
+        remote_engine_id: str,
+        bootstrap_address: str,
+        remote_dp_rank: int,
+    ) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            self._receive(
+                request_id,
+                transfer_id,
+                block_ids,
+                remote_engine_id,
+                bootstrap_address,
+                remote_dp_rank,
+            ),
+            self._loop,
+        )
+        with self._receive_lock:
+            previous = self._receive_futures.get(request_id)
+            if previous is not None and not previous.done():
+                future.cancel()
+                raise RuntimeError(f"Duplicate PD receive for request {request_id}")
+            self._receive_futures[request_id] = future
+
+    def _fence_receives(self, request_ids: set[str]) -> None:
+        """Fence in-flight P writes before vLLM can recycle D blocks."""
+        futures: list[tuple[str, Future[None]]] = []
+        with self._receive_lock:
+            for request_id in request_ids:
+                future = self._receive_futures.pop(request_id, None)
+                if future is not None:
+                    futures.append((request_id, future))
+        for request_id, future in futures:
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001 - transport fence
+                logger.warning(
+                    "MTSC PD receive fence failed: request_id=%s error=%s",
+                    request_id,
+                    exc,
+                )
+        with self._result_lock:
+            self._finished_recv.difference_update(request_ids)
+            self._failed_recv.difference_update(request_ids)

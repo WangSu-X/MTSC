@@ -19,9 +19,9 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.outputs import KVConnectorOutput
 
-from .device import is_npu_platform, npu_kv_nz_enabled
 from .protocol import MTSCConnectorMetadata
 from .scheduler import MTSCScheduler
+from .utils import is_npu_platform, npu_kv_nz_enabled
 from .worker import MTSCWorker
 
 if TYPE_CHECKING:

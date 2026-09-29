@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.request import RequestStatus
 
+from .kv_cache_pool import StoreLookupClient
 from .protocol import (
     DTwoStageLoadPlan,
     MTSCConnectorMetadata,
@@ -20,7 +21,6 @@ from .protocol import (
     StoreLoadSpec,
     StoreRequest,
 )
-from .store import StoreLookupClient
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -213,7 +213,7 @@ class MTSCScheduler:
                         request.request_id,
                         decision.store_tokens,
                         all_blocks,
-                        request.block_hashes,
+                        list(request.block_hashes),
                         load=load_spec,
                     )
                 )
@@ -242,7 +242,7 @@ class MTSCScheduler:
                     request.request_id,
                     load_spec.store_tokens,
                     all_blocks,
-                    request.block_hashes,
+                    list(request.block_hashes),
                     load=load_spec,
                 )
             )
@@ -297,7 +297,7 @@ class MTSCScheduler:
             tracked.request.request_id,
             complete,
             tuple(group.copy() for group in tracked.block_ids),
-            tracked.request.block_hashes,
+            list(tracked.request.block_hashes),
             save=True,
             save_from=start,
             token_ids=list(tracked.request.all_token_ids[:complete]),

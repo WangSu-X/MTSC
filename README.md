@@ -7,8 +7,10 @@ MTSC 是一个基于 Mooncake Store 和 Transfer Engine（TE）的两阶段 PD K
 - `mtsc.connector.MTSCConnector`：vLLM 外部 KV Connector 入口，P/D 共用同一个实现。
 - `mtsc.scheduler.MTSCScheduler`：执行 Store lookup、KV block 分配和请求生命周期管理。
 - `mtsc.worker.MTSCWorker`：驱动两阶段加载状态机：Store `[L,A)`，然后 PD `[A,T)`。
-- `mtsc.store.StoreIO`：封装 Mooncake Store 的异步 GET/PUT、lookup RPC 和完成通知。
-- `mtsc.pd.PDTransfer`：负责 P worker 注册、D/P 拓扑匹配以及 Mooncake TE 数据传输。
+- `mtsc.protocol`：Scheduler/Worker 共用的 metadata，以及 P/D 请求与响应协议。
+- `mtsc.kv_cache_pool`：`KVCachePool` 接口及 `MooncakeKVCachePool` 实现，包含 lookup RPC、namespace、内存注册、异步 load/save 和 pending save 合并。
+- `mtsc.kv_transfer`：`KVTransfer` 接口及 `MooncakeKVTransfer` 实现，包含 bootstrap、TP/PP/DP 映射、MLA 支持、源会话管理和 TE WRITE。
+- `mtsc.utils`：共享设备事件、内存区域和 KV 布局转换工具。
 - `proxy.pd_proxy`：同时向 Prefill 和 Decode 发起请求，并向两侧传递同一个 `transfer_id`。
 
 ```text
@@ -24,6 +26,46 @@ Decode ── stage 1: Store GET ──► stage 2: pull remaining KV ──► 
 ```
 
 更完整的状态机和协议说明见 [`docs/design`](./docs/design)。
+
+`mtsc/` 保持 7 个核心模块（另有包入口 `__init__.py`）：
+
+```text
+mtsc/
+  __init__.py
+  connector.py
+  scheduler.py
+  worker.py
+  protocol.py
+  kv_cache_pool.py
+  kv_transfer.py
+  utils.py
+```
+
+两个 Mooncake 类直接实现各自的接口；后端创建与配置校验放在 Worker 的私有工厂函数中。
+
+## 后端与并行支持
+
+Worker 默认创建 `MooncakeKVCachePool` 和 `MooncakeKVTransfer`。可在
+`kv_connector_extra_config` 显式设置：
+
+```json
+{
+  "mtsc_pool_backend": "mooncake",
+  "mtsc_transfer_backend": "mooncake"
+}
+```
+
+当前仅提供 Mooncake 后端，未知名称会在初始化时报错。现有 Mooncake Store
+配置文件和 TE 配置参数继续生效。
+
+Pool 支持普通 KV 与 MLA，但不转换 TP/PP/PCP/DCP 布局；默认使用 topology namespace
+隔离不兼容缓存。MLA 在同一 namespace 内跨 TP ranks 共享 key，并分摊完整 chunk 的 PUT。
+Transfer 支持整数倍异构 TP、按 layer 交集匹配的异构 PP，以及不同 DP size/rank 的指定副本路由。
+MHA/GQA 按唯一 KV 分片切片，MLA 复制完整 latent KV 并去除重复发送者。model、dtype、
+block/layout、group 语义及 PCP/DCP 配置仍须兼容。
+
+新的 Transfer 控制协议使用 `topology_version=2`，包含双方 engine/DP 身份和目标 block
+容量。P/D 应一起升级；旧协议会被拒绝。
 
 ## 配置示例
 
