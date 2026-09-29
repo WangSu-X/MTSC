@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import threading
 import time
 import unittest
@@ -30,6 +31,7 @@ from mtsc.kv_transfer import (
     TransferPollResult,
     TransferRegion,
     _NPUTransferTopology,
+    _require_tcp_write_ack,
     effective_tp,
     kv_slice_plan,
 )
@@ -387,6 +389,8 @@ def _transfer():
     transfer.num_blocks = 6
     transfer.tp_rank = transfer.pp_rank = 0
     transfer.timeout = 1
+    transfer.protocol = "rdma"
+    transfer._tcp_write_locks = {}
     transfer.topology = _NPUTransferTopology(0, 1, 16, "p", False, 8)
     transfer.schema = PDTransferSchema(2, "model", "", "float16", "hnd", 16, False)
     transfer._source_lock = threading.Lock()
@@ -442,7 +446,150 @@ class _Socket:
         self.messages.append(msgspec.msgpack.decode(frames[1], type=PDTransferResponse))
 
 
+class TCPCompletionRequirementTest(unittest.TestCase):
+    def test_legacy_engine_rejected_before_transfer(self):
+        with (
+            patch("mtsc.kv_transfer.version", return_value="0.3.10.post1"),
+            self.assertRaisesRegex(RuntimeError, "both P and D"),
+        ):
+            _require_tcp_write_ack("tcp")
+
+    def test_acknowledged_engine_and_forced_legacy_mode(self):
+        with patch("mtsc.kv_transfer.version", return_value="0.3.13.post1"):
+            with patch.dict("os.environ", {"MC_TCP_PROTO": "2"}):
+                _require_tcp_write_ack("tcp")
+            with (
+                patch.dict("os.environ", {"MC_TCP_PROTO": "1"}),
+                self.assertRaisesRegex(RuntimeError, "MC_TCP_PROTO=1"),
+            ):
+                _require_tcp_write_ack("tcp")
+
+    def test_other_transports_do_not_require_tcp_version(self):
+        with patch("mtsc.kv_transfer.version") as installed:
+            _require_tcp_write_ack("rdma")
+            _require_tcp_write_ack("ascend")
+            installed.assert_not_called()
+
+
 class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
+    async def test_tcp_batches_apply_backpressure_for_concurrent_same_peer(self):
+        transfer = _transfer()
+        transfer.protocol = "tcp"
+        transfer._loop = asyncio.get_running_loop()
+        transfer._send_pool = ThreadPoolExecutor(max_workers=2)
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def write(session, src, dst, sizes):
+            calls.append((session, list(src)))
+            if len(calls) == 1:
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("Test did not release receiver ACK")
+            return 0
+
+        transfer.engine = SimpleNamespace(batch_transfer_sync_write=write)
+        first = asyncio.create_task(
+            transfer._write_buffers("peer", list(range(600)), [0] * 600, [1] * 600)
+        )
+        try:
+            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+            second = asyncio.create_task(
+                transfer._write_buffers("peer", [900], [0], [1])
+            )
+            await asyncio.sleep(0.01)
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(first.done())
+            self.assertFalse(second.done())
+            release.set()
+            self.assertEqual(await asyncio.gather(first, second), [0, 0])
+            self.assertEqual([len(src) for _, src in calls], [256, 256, 88, 1])
+            self.assertEqual([i for _, src in calls for i in src], [*range(600), 900])
+        finally:
+            release.set()
+            await first
+            transfer._send_pool.shutdown(wait=True)
+
+    async def test_tcp_schema_rejects_legacy_peer_before_write(self):
+        for local_version, remote_version in [(3, 2), (2, 3)]:
+            with self.subTest(local=local_version, remote=remote_version):
+                transfer = _transfer()
+                transfer.schema = msgspec.structs.replace(
+                    transfer.schema, topology_version=local_version
+                )
+                request = _request(transfer)
+                request.schema = msgspec.structs.replace(
+                    request.schema, topology_version=remote_version
+                )
+                socket = _Socket()
+                await transfer._serve(b"peer", msgspec.msgpack.encode(request), socket)
+                self.assertEqual(socket.messages[0].error, "P/D transfer schema mismatch")
+                self.assertEqual(transfer._sources, {})
+
+    async def test_blocks_first_write_copies_k_and_v_with_tp_slicing(self):
+        class CopyEngine:
+            def batch_register_memory(self, pointers, lengths):
+                return 0
+
+            def batch_transfer_sync_write(self, session, src, dst, sizes):
+                for source, target, size in zip(src, dst, sizes, strict=True):
+                    ctypes.memmove(target, source, size)
+                return 0
+
+        def registered(cache, tp_size, tp_rank):
+            transfer = _transfer()
+            transfer._registered = False
+            transfer.is_producer = False
+            transfer.tp_size, transfer.tp_rank = tp_size, tp_rank
+            transfer.topology = SimpleNamespace(
+                virtually_split_kv_in_blocks=True,
+                total_num_kv_heads=2,
+                is_mla=False,
+                get_transfer_cache_regions=lambda raw, spec: [raw],
+            )
+            transfer.layer_specs = {"layer.0": SimpleNamespace()}
+            transfer.layer_groups = {"layer.0": 0}
+            transfer.regions = []
+            transfer.engine = CopyEngine()
+            transfer._loop = asyncio.get_running_loop()
+            transfer._send_pool = None
+            transfer.register({"layer.0": cache})
+            return transfer
+
+        source = torch.arange(6 * 2 * 2 * 16 * 64, dtype=torch.int32)
+        source = source.reshape(6, 2, 2, 16, 64).permute(0, 1, 3, 2, 4)
+        for tp_size, tp_rank in [(1, 0), (2, 0), (2, 1)]:
+            with self.subTest(tp_size=tp_size, tp_rank=tp_rank):
+                target = torch.full(
+                    (6, 2, 2 // tp_size, 16, 64), -1, dtype=torch.int32
+                ).permute(0, 1, 3, 2, 4)
+                sender = registered(source, 1, 0)
+                receiver = registered(target, tp_size, tp_rank)
+                request = msgspec.structs.replace(
+                    _request(sender),
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    region_base_addresses=[r.base_address for r in receiver.regions],
+                    block_lengths=[r.block_length for r in receiver.regions],
+                    kv_block_lengths=[r.kv_block_length for r in receiver.regions],
+                    layer_names=[r.layer_name for r in receiver.regions],
+                    layer_indices=[r.layer_index for r in receiver.regions],
+                    group_indices=[r.group_index for r in receiver.regions],
+                )
+                ok, covered = await sender._write_one(
+                    "d-r", SimpleNamespace(block_ids=[[2]]), request
+                )
+                expected = (
+                    source[2]
+                    if tp_size == 1
+                    else source[2, :, :, tp_rank : tp_rank + 1, :]
+                )
+                self.assertTrue(ok)
+                self.assertEqual(covered, {0, 1})
+                self.assertTrue(torch.equal(target[4], expected))
+                self.assertTrue(torch.all(target[:4] == -1))
+                self.assertTrue(torch.all(target[5] == -1))
+
     async def test_shutdown_delivers_terminal_response_before_closing_router(self):
         transfer = _transfer()
         entered, release = threading.Event(), threading.Event()

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 import httpx
@@ -18,6 +20,7 @@ import uvicorn
 import zmq
 import zmq.asyncio
 from fastapi import FastAPI, HTTPException
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
 from vllm import envs
 from vllm.config import VllmConfig
@@ -51,6 +54,27 @@ from .utils import (
     npu_kv_nz_enabled,
     npu_registration_regions,
 )
+
+
+def _require_tcp_write_ack(protocol: str) -> None:
+    """Legacy TCP WRITE completes before remote memory is safe to consume."""
+    if protocol != "tcp":
+        return
+    requirement = "mooncake-transfer-engine>=0.3.13.post1"
+    try:
+        installed = Version(version("mooncake-transfer-engine"))
+    except (PackageNotFoundError, InvalidVersion) as exc:
+        raise RuntimeError(f"MTSC TCP requires {requirement} with receiver ACK") from exc
+    if installed < Version("0.3.13.post1"):
+        raise RuntimeError(
+            f"MTSC TCP requires {requirement} on both P and D; found {installed}. "
+            "Legacy TCP reports completion before remote GPU writes finish."
+        )
+    if os.environ.get("MC_TCP_PROTO") == "1":
+        raise RuntimeError(
+            "MTSC TCP requires receiver ACK; unset MC_TCP_PROTO=1 "
+            "to enable acknowledged protocol v2."
+        )
 
 
 @dataclass(frozen=True)
@@ -451,13 +475,17 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         )
         self.device_id = torch.accelerator.current_device_index()
         current_platform.set_device(self.device_id)
+        default_protocol = "ascend" if is_npu_platform() else "rdma"
+        protocol = self.extra.get("mooncake_protocol", default_protocol)
+        _require_tcp_write_ack(protocol)
+        self.protocol = protocol
+        self._tcp_write_locks: dict[str, asyncio.Lock] = {}
         self.engine = TransferEngine()
         self.hostname = get_ip()
-        default_protocol = "ascend" if is_npu_platform() else "rdma"
         ret = self.engine.initialize(
             self.hostname,
             "P2PHANDSHAKE",
-            self.extra.get("mooncake_protocol", default_protocol),
+            protocol,
             self.extra.get("device_name", ""),
         )
         if ret != 0:
@@ -496,7 +524,9 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         else:
             cache_layout = "mla" if model.use_mla else "hnd"
         self.schema = PDTransferSchema(
-            topology_version=2,
+            # Reject legacy MTSC peers before exposing writable memory. Their
+            # TCP transport may fall back to unacknowledged protocol v1.
+            topology_version=3 if protocol == "tcp" else 2,
             pcp_size=getattr(parallel, "prefill_context_parallel_size", 1),
             dcp_size=getattr(parallel, "decode_context_parallel_size", 1),
             model_id=str(model.model),
@@ -627,6 +657,25 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                         kv_length,
                     )
                 )
+                if (
+                    not is_npu
+                    and self.topology.virtually_split_kv_in_blocks
+                    and not isinstance(
+                        spec, (MambaSpec, MLAAttentionSpec, SlidingWindowMLASpec)
+                    )
+                ):
+                    # Blocks-first caches pack K and V into one page. Publish
+                    # both halves as regions so TP slicing copies each half.
+                    self.regions.append(
+                        TransferRegion(
+                            layer_name,
+                            extract_layer_index(layer_name),
+                            self.layer_groups[layer_name],
+                            cache.data_ptr() + kv_length,
+                            block_length,
+                            kv_length,
+                        )
+                    )
         if not pointers:
             raise RuntimeError("No PD KV regions registered")
         if is_npu:
@@ -1235,17 +1284,34 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         if not src:
             return True, covered
         session = f"{request.hostname}:{request.rpc_port}"
-        ret = await self._loop.run_in_executor(
-            self._send_pool,
-            self.engine.batch_transfer_sync_write,
-            session,
-            src,
-            dst,
-            sizes,
-        )
+        ret = await self._write_buffers(session, src, dst, sizes)
         if ret != 0:
             logger.warning("MTSC TE WRITE failed: request_id=%s ret=%s", decode_id, ret)
         return ret == 0, covered if ret == 0 else set()
+
+    async def _write_buffers(self, session, src, dst, sizes) -> int:
+        async def write(start, end):
+            return await self._loop.run_in_executor(
+                self._send_pool,
+                self.engine.batch_transfer_sync_write,
+                session,
+                src[start:end],
+                dst[start:end],
+                sizes[start:end],
+            )
+
+        if self.protocol != "tcp":
+            return await write(0, len(src))
+        # TCP has a bounded descriptor queue per peer. Serialize each peer's
+        # batches and wait for receiver ACKs before admitting more descriptors.
+        # Requests to other peers can still progress independently.
+        lock = self._tcp_write_locks.setdefault(session, asyncio.Lock())
+        async with lock:
+            for start in range(0, len(src), 256):
+                ret = await write(start, start + 256)
+                if ret != 0:
+                    return ret
+        return 0
 
     async def _query_workers(
         self, address: str, engine_id: str, dp_rank: int

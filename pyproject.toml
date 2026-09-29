@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Mooncake two-stage KV connector for vLLM"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+tcp = ["mooncake-transfer-engine>=0.3.13.post1"]
+
 [tool.setuptools.packages.find]
 include = ["mtsc*", "proxy*"]
-

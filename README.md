@@ -2,6 +2,17 @@
 
 MTSC 是一个基于 Mooncake Store 和 Transfer Engine（TE）的两阶段 PD KV 传输组件：Decode 先从 Store 加载命中的前缀，再从 Prefill 拉取剩余 KV。
 
+TCP 部署要求 P/D 均安装 `mooncake-transfer-engine>=0.3.13.post1`，并且不设置
+`MC_TCP_PROTO=1`。此版本使用接收端 ACK，在远端完成 GPU 拷贝后才报告 WRITE
+完成。旧版 TCP 仅确认本地 socket 写完，会导致 Decode 读取尚未完整到达的 KV；
+MTSC 会在启动时拒绝旧版或强制 legacy 模式，并用新的 TCP schema 拒绝旧版
+MTSC 对端。升级时需重启 P/D 的所有 worker：
+
+```bash
+python -m pip install 'mooncake-transfer-engine>=0.3.13.post1'
+unset MC_TCP_PROTO
+```
+
 ## 组件
 
 - `mtsc.connector.MTSCConnector`：vLLM 外部 KV Connector 入口，P/D 共用同一个实现。
@@ -88,9 +99,26 @@ block/layout、group 语义及 PCP/DCP 配置仍须兼容。
 
 ```bash
 export PYTHONPATH=/workspace/MTSC:/workspace/vllm-0.26.0
+export PYTHONHASHSEED=0
 export MOONCAKE_CONFIG_PATH=/workspace/MTSC/mooncake.json
 export VLLM_MOONCAKE_BOOTSTRAP_PORT=8998
 ```
+
+P/D 必须使用相同的 `PYTHONHASHSEED`。未设置时，vLLM 会为每个进程随机生成
+KV block hash 的起始值，导致相同前缀无法跨进程命中 Store。
+
+做 PD 与 native 的严格输出一致性测试时，可在 P/D 和基线进程启动前均设置：
+
+```bash
+export VLLM_BATCH_INVARIANT=1
+```
+
+vLLM 默认的批次及 prefill 分段可能改变 BF16 数值结果，即使 `temperature=0`
+且 seed 相同，也可能让接近并列概率的 token 发生分叉。当前 vLLM 0.23 的
+Qwen2.5-0.5B 测试已在纯 vLLM 中复现该现象，启用上述模式后原 PD 用例的文本
+和返回 logprobs 均匹配基线。cold/warm prefix-cache 的计算路径仍应分别对照；
+该模式的性能影响需单独评估。功能说明见
+[vLLM Batch Invariance](https://docs.vllm.ai/en/latest/features/batch_invariance/)。
 
 ### 2. Prefill
 
@@ -205,6 +233,19 @@ API_URL,ENGINE_ID,BOOTSTRAP_ADDR[,DP_RANK]
 ```
 
 Proxy 会并发请求 P/D，不执行重试；任一后端失败会直接返回错误。每个请求结束后，会向 `--metrics-file` 写入一条 JSONL 记录。
+
+使用 internal DP 时，Proxy 的 `ENGINE_ID` 必须与 bootstrap `/query` 返回的每个
+副本的 ID 一致。例如 vLLM 0.23 会将配置中的 `prefill-0` 改为
+`prefill-0_dp0`、`prefill-0_dp1`，因此 DP=2 的两个 Prefill 路由应分别配置为：
+
+```bash
+--prefill http://127.0.0.1:8100,prefill-0_dp0,http://127.0.0.1:8998,0 \
+--prefill http://127.0.0.1:8100,prefill-0_dp1,http://127.0.0.1:8998,1
+```
+
+错误的 ID 会导致 PD pull 被拒绝，随后由 `recompute` 策略本地重算；仅检查
+HTTP 200 或生成文本不能确认 PD 传输成功。P/D 同机启动时，也应分别配置
+不同的 `kv_connector_extra_config.lookup_rpc_port`，避免 Store lookup IPC 路径冲突。
 
 Store lookup 超时会按 miss 处理。Mooncake 同步 GET 没有安全取消接口，因此 GET 超时后 MTSC 会继续 fence 底层调用，待其终止后将该请求的 Store blocks 标为无效并回退到 P 拉取或本地重算，避免迟到写覆盖已复用的 KV block。
 
