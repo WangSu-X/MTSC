@@ -31,6 +31,7 @@ from mtsc.kv_cache_pool import (
     _key_prefix,
     _key_string,
     _LoadOutcome,
+    _LoadState,
     _SaveState,
     store_topology_namespace,
     store_tp_layout,
@@ -46,24 +47,25 @@ from mtsc.kv_transfer import (
     kv_slice_plan,
 )
 from mtsc.protocol import (
-    DTwoStageLoadPlan,
+    FinishedWait,
+    KVPoolLoadRequest,
+    KVPoolSaveRequest,
+    KVTransferPlan,
+    KVTransferRequest,
+    KVTransferResponse,
+    KVTransferSchema,
+    KVTransferStatus,
     MTSCConnectorMetadata,
-    PDResponseStatus,
-    PDTransferRequest,
-    PDTransferResponse,
-    PDTransferSchema,
-    SendRequirement,
-    StoreLoadSpec,
-    StoreRequest,
 )
 from mtsc.scheduler import _groups
 from mtsc.utils import (
     _transpose_npu_cache_blocks,
     cache_tensors,
     new_device_event,
+    npu_kv_nz_enabled,
     npu_registration_regions,
 )
-from mtsc.worker import MTSCWorker, _DLoadState, _SendState
+from mtsc.worker import MTSCWorker, _FinishedWaitState, _TransferState
 from proxy.pd_proxy import (
     DecodeEndpoint,
     PDProxy,
@@ -72,20 +74,20 @@ from proxy.pd_proxy import (
 )
 
 
-def _plan() -> DTwoStageLoadPlan:
-    return DTwoStageLoadPlan(
+def _plan() -> KVTransferPlan:
+    return KVTransferPlan(
         request_id="d-1",
         transfer_id="xfer-1",
-        local_prefix_tokens=32,
-        store_candidate_tokens=80,
-        target_prefix_tokens=112,
+        local_tokens=32,
+        pool_tokens=80,
+        target_tokens=112,
         all_block_ids=([10, 11, 12, 13, 14, 15, 16],),
         external_block_ids=([12, 13, 14, 15, 16],),
         group_block_sizes=(16,),
         blocks_per_sliding_window=(0,),
-        pd_enabled=True,
+        transfer_enabled=True,
         wait_for_completion=True,
-        kv_transfer_params={
+        transfer_params={
             "transfer_id": "xfer-1",
             "remote_engine_id": "p0",
             "remote_bootstrap_addr": "http://p:8998",
@@ -95,7 +97,7 @@ def _plan() -> DTwoStageLoadPlan:
 
 class TwoStageBoundaryTest(unittest.TestCase):
     @staticmethod
-    def _loaded_prefix(plan: DTwoStageLoadPlan, invalid: set[int]) -> int:
+    def _loaded_prefix(plan: KVTransferPlan, invalid: set[int]) -> int:
         pool = object.__new__(MooncakeKVCachePool)
         pool.databases = [
             SimpleNamespace(block_size=size) for size in plan.group_block_sizes
@@ -104,8 +106,8 @@ class TwoStageBoundaryTest(unittest.TestCase):
             plan.request_id,
             tuple(tuple(ids) for ids in plan.all_block_ids),
             (),
-            plan.local_prefix_tokens,
-            plan.store_candidate_tokens,
+            plan.local_tokens,
+            plan.pool_tokens,
         )
         return pool._loaded_prefix(event, invalid)
 
@@ -122,7 +124,7 @@ class TwoStageBoundaryTest(unittest.TestCase):
         self.assertEqual(self._loaded_prefix(_plan(), {10}), 80)
 
     def test_candidate_block_ids_only_cover_store_interval(self) -> None:
-        self.assertEqual(MTSCWorker._store_candidate_block_ids(_plan()), {12, 13, 14})
+        self.assertEqual(MTSCWorker._pool_candidate_block_ids(_plan()), {12, 13, 14})
 
     def test_full_local_hit_still_notifies_prefill(self) -> None:
         class PD:
@@ -134,18 +136,18 @@ class TwoStageBoundaryTest(unittest.TestCase):
 
         worker = object.__new__(MTSCWorker)
         worker.transfer = PD()
-        worker._ignored_pd_recvs = set()
+        worker._ignored_recvs = set()
         plan = replace(
             _plan(),
-            store_candidate_tokens=32,
-            target_prefix_tokens=32,
+            pool_tokens=32,
+            target_tokens=32,
             external_block_ids=([],),
             wait_for_completion=False,
         )
-        state = _DLoadState(plan=plan, stage="STORE_DONE")
-        self.assertTrue(worker._start_pd(state, 32))
+        state = _TransferState(plan=plan, stage="STORE_DONE")
+        self.assertTrue(worker._start_transfer(state, 32))
         self.assertEqual(len(worker.transfer.requests), 1)
-        self.assertIn(plan.request_id, worker._ignored_pd_recvs)
+        self.assertIn(plan.request_id, worker._ignored_recvs)
 
     def test_mla_replicated_tp_only_uses_one_sender(self) -> None:
         self.assertEqual(
@@ -160,8 +162,8 @@ class TwoStageBoundaryTest(unittest.TestCase):
     def test_partial_prompt_tail_is_pulled_from_prefill(self) -> None:
         plan = replace(
             _plan(),
-            store_candidate_tokens=48,
-            target_prefix_tokens=50,
+            pool_tokens=48,
+            target_tokens=50,
             all_block_ids=([10, 11, 12, 13],),
             external_block_ids=([12, 13],),
         )
@@ -212,12 +214,11 @@ class FailureFallbackTest(unittest.TestCase):
         worker = object.__new__(MTSCWorker)
         worker.pool = store
         worker.transfer = pd
-        worker._save_pending = set()
-        worker.timeout = 180.0
-        worker._decode = {}
-        worker._plain_store_loads = {}
-        worker._send = {}
-        worker._ignored_pd_recvs = set()
+        worker._on_save_requests = {}
+        worker._on_transfer = {}
+        worker._on_load_requests = {}
+        worker._finished_waits = {}
+        worker._ignored_recvs = set()
         worker._load_errors = set()
         worker.group_block_sizes = (16,)
         return worker
@@ -226,7 +227,7 @@ class FailureFallbackTest(unittest.TestCase):
         store = self._Store({"d-1"}, {13})
         pd = self._PD()
         worker = self._worker(store, pd)
-        worker._decode["d-1"] = _DLoadState(_plan(), "STORE_PENDING")
+        worker._on_transfer["d-1"] = _TransferState(_plan(), "STORE_PENDING")
 
         sent, received = worker.get_finished(set(), MTSCConnectorMetadata())
 
@@ -235,34 +236,34 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertEqual(len(pd.receives), 1)
         self.assertEqual(pd.receives[0].block_ids, ((13, 14, 15, 16),))
         self.assertEqual(pd.reformatted, [])  # Layout conversion belongs to Pool.
-        self.assertEqual(worker._decode["d-1"].stage, "PD_PENDING")
+        self.assertEqual(worker._on_transfer["d-1"].stage, "TRANSFER_PENDING")
         self.assertEqual(worker.get_block_ids_with_load_errors(), set())
 
     def test_pd_failure_reports_suffix_for_local_recompute(self) -> None:
         store = self._Store()
         pd = self._PD({"d-1"})
         worker = self._worker(store, pd)
-        state = _DLoadState(_plan(), "STORE_DONE")
-        worker._decode["d-1"] = state
-        self.assertTrue(worker._start_pd(state, 80))
+        state = _TransferState(_plan(), "STORE_DONE")
+        worker._on_transfer["d-1"] = state
+        self.assertTrue(worker._start_transfer(state, 80))
 
         sent, received = worker.get_finished(set(), MTSCConnectorMetadata())
 
         self.assertIsNone(sent)
         self.assertEqual(received, {"d-1"})
         self.assertEqual(worker.get_block_ids_with_load_errors(), {15, 16})
-        self.assertNotIn("d-1", worker._decode)
+        self.assertNotIn("d-1", worker._on_transfer)
 
     def test_plain_pool_load_reports_completion_and_errors(self) -> None:
         store = self._Store({"p-1"}, {11})
         pd = self._PD()
         worker = self._worker(store, pd)
-        worker._plain_store_loads["p-1"] = StoreRequest(
+        worker._on_load_requests["p-1"] = KVPoolLoadRequest(
             request_id="p-1",
-            token_count=48,
             block_ids=([10, 11, 12],),
             block_hashes=[],
-            load=StoreLoadSpec(0, 48, enabled=True),
+            start_token=0,
+            end_token=48,
         )
 
         _, received = worker.get_finished(set(), MTSCConnectorMetadata())
@@ -277,7 +278,6 @@ class FailureFallbackTest(unittest.TestCase):
                 kv_connector="MTSCConnector",
                 kv_connector_module_path="mtsc.connector",
                 kv_role="kv_consumer",
-                engine_id="d0",
             )
         )
         with self.assertRaisesRegex(ValueError, "kv_load_failure_policy=recompute"):
@@ -323,16 +323,14 @@ class TransferTopologyTest(unittest.TestCase):
             tp_rank=1,
             tp_size=2,
             block_size=16,
-            engine_id="d0",
             is_mla=False,
             total_num_kv_heads=8,
         )
         self.assertEqual(topology.handshake_target_ranks(4), [2, 3])
-        self.assertFalse(topology.local_replicates_kv_cache)
 
     @staticmethod
-    def _schema() -> PDTransferSchema:
-        return PDTransferSchema(1, "model", "", "torch.float16", "hnd", 16, False)
+    def _schema() -> KVTransferSchema:
+        return KVTransferSchema(1, "model", "", "torch.float16", "hnd", 16, False)
 
     def test_pp_alignment_uses_layer_intersection(self) -> None:
         pd = object.__new__(MooncakeKVTransfer)
@@ -340,7 +338,7 @@ class TransferTopologyTest(unittest.TestCase):
             TransferRegion("layers.0.attn", 0, 0, 100, 64, 64),
             TransferRegion("layers.2.attn", 2, 0, 200, 64, 64),
         ]
-        request = PDTransferRequest(
+        request = KVTransferRequest(
             hostname="d",
             rpc_port=1,
             tp_size=1,
@@ -348,7 +346,7 @@ class TransferTopologyTest(unittest.TestCase):
             pp_size=1,
             pp_rank=0,
             schema=self._schema(),
-            requests={"r": ("x", [[1]])},
+            requests={"x": ("r", [[1]])},
             region_base_addresses=[300, 400],
             block_lengths=[64, 64],
             kv_block_lengths=[64, 64],
@@ -378,15 +376,15 @@ class TransferTopologyTest(unittest.TestCase):
             TransferRegion("layers.1.attn", 1, 0, 200, 64, 64),
         ]
         valid = [
-            PDTransferResponse(
-                PDResponseStatus.FINISH, ["r"], covered_regions={"r": [0, 1]}
+            KVTransferResponse(
+                KVTransferStatus.COMPLETE, ["r"], covered_regions={"r": [0, 1]}
             )
         ]
         pd._validate_coverage("r", [[10]], valid, expected=1)
 
         duplicate = [
-            PDTransferResponse(
-                PDResponseStatus.FINISH,
+            KVTransferResponse(
+                KVTransferStatus.COMPLETE,
                 ["r"],
                 covered_regions={"r": [0, 0, 1]},
             )
@@ -395,8 +393,8 @@ class TransferTopologyTest(unittest.TestCase):
             pd._validate_coverage("r", [[10]], duplicate, expected=1)
 
         missing = [
-            PDTransferResponse(
-                PDResponseStatus.FINISH, ["r"], covered_regions={"r": [0]}
+            KVTransferResponse(
+                KVTransferStatus.COMPLETE, ["r"], covered_regions={"r": [0]}
             )
         ]
         with self.assertRaisesRegex(ValueError, "coverage mismatch"):
@@ -404,6 +402,27 @@ class TransferTopologyTest(unittest.TestCase):
 
 
 class NPUDataPathTest(unittest.TestCase):
+    def test_npu_nz_config_handles_string_booleans(self) -> None:
+        with patch("mtsc.utils.is_npu_platform", return_value=True):
+            for value, expected in (
+                (False, False),
+                (None, False),
+                (0, False),
+                ("false", False),
+                (" OFF ", False),
+                ("no", False),
+                ("0", False),
+                (True, True),
+                (1, True),
+                ("true", True),
+                (" ON ", True),
+            ):
+                with self.subTest(value=value):
+                    config = SimpleNamespace(additional_config={"enable_kv_nz": value})
+                    self.assertIs(npu_kv_nz_enabled(config), expected)
+        with patch("mtsc.utils.is_npu_platform", return_value=False):
+            self.assertFalse(npu_kv_nz_enabled(config))
+
     def test_device_event_uses_torch_npu(self) -> None:
         class Event:
             pass
@@ -495,7 +514,7 @@ class NPUDataPathTest(unittest.TestCase):
         k_cache = torch.empty((4, 16, 1, 6), dtype=torch.float16)
         v_cache = torch.empty((4, 16, 1, 2), dtype=torch.float16)
         pd = object.__new__(MooncakeKVTransfer)
-        pd._closed = pd._closing = pd._registered = False
+        pd._closed = pd._registered = False
         pd.layer_specs = {"model.layers.0.self_attn": spec}
         pd.layer_groups = {"model.layers.0.self_attn": 0}
         pd.engine = Engine()
@@ -542,7 +561,6 @@ class NPUDataPathTest(unittest.TestCase):
             tp_rank=0,
             tp_size=1,
             block_size=4,
-            engine_id="d0",
             is_mla=True,
             total_num_kv_heads=1,
         )
@@ -685,6 +703,24 @@ class MLALayoutTest(unittest.TestCase):
             tp1 = store_topology_namespace(config, groups, tp_size=1, **kwargs)
             tp1_again = store_topology_namespace(config, groups, tp_size=1, **kwargs)
             tp2 = store_topology_namespace(config, groups, tp_size=2, **kwargs)
+            for value in (None, True, "true"):
+                with self.subTest(namespace_enabled=value):
+                    config.kv_transfer_config.kv_connector_extra_config[
+                        "mtsc_store_topology_namespace"
+                    ] = value
+                    self.assertEqual(
+                        store_topology_namespace(config, groups, tp_size=1, **kwargs),
+                        tp1,
+                    )
+            for value in (False, "false", " OFF ", "0"):
+                with self.subTest(namespace_enabled=value):
+                    config.kv_transfer_config.kv_connector_extra_config[
+                        "mtsc_store_topology_namespace"
+                    ] = value
+                    self.assertEqual(
+                        store_topology_namespace(config, groups, tp_size=1, **kwargs),
+                        "tenant",
+                    )
 
         self.assertEqual(tp1, tp1_again)
         self.assertNotEqual(tp1, tp2)
@@ -727,7 +763,7 @@ class MLALayoutTest(unittest.TestCase):
         )
         cache = torch.empty((4, 16, 8), dtype=torch.float16)
         pd = object.__new__(MooncakeKVTransfer)
-        pd._closed = pd._closing = pd._registered = False
+        pd._closed = pd._registered = False
         pd.layer_specs = {"model.layers.0.self_attn": spec}
         pd.layer_groups = {"model.layers.0.self_attn": 0}
         pd.topology = Topology()
@@ -748,8 +784,10 @@ class MLALayoutTest(unittest.TestCase):
 class CompletionAggregationTest(unittest.TestCase):
     def test_store_and_pd_are_both_required(self) -> None:
         worker = object.__new__(MTSCWorker)
-        worker._save_pending = {"p-1"}
-        worker._send = {"p-1": _SendState(SendRequirement(store=True, pd=True))}
+        worker._on_save_requests = {"p-1": KVPoolSaveRequest("p-1", ([1],), [], 0, 16)}
+        worker._finished_waits = {
+            "p-1": _FinishedWaitState(FinishedWait(store_save=True, kv_transfer=True))
+        }
         self.assertEqual(worker._aggregate_sends({"p-1"}, set()), set())
         self.assertEqual(worker._aggregate_sends(set(), {"p-1"}), {"p-1"})
 
@@ -762,9 +800,8 @@ class PreemptionLifecycleTest(unittest.TestCase):
         store = object.__new__(MooncakeKVCachePool)
         store._task_lock = threading.RLock()
         store._save_states = {"r1": _SaveState(running=future), "r2": _SaveState()}
-        store._loads = store._load_requests = store._load_started_at = {}
-        store._load_timed_out = set()
-        store._load_events = store._invalid = {}
+        store._loads = {}
+        store._invalid = {}
 
         store.preempt("r1")
 
@@ -788,11 +825,11 @@ class PreemptionLifecycleTest(unittest.TestCase):
         worker = object.__new__(MTSCWorker)
         worker.pool = Store()
         worker.transfer = PD()
-        worker._save_pending = set()
-        worker._decode = {}
-        worker._plain_store_loads = {}
-        worker._send = {}
-        worker._ignored_pd_recvs = set()
+        worker._on_save_requests = {}
+        worker._on_transfer = {}
+        worker._on_load_requests = {}
+        worker._finished_waits = {}
+        worker._ignored_recvs = set()
         metadata = MTSCConnectorMetadata(preempted_request_ids={"r1"})
 
         worker.handle_preemptions(metadata)
@@ -802,7 +839,7 @@ class PreemptionLifecycleTest(unittest.TestCase):
     @staticmethod
     def _polling_pd(source: _Session) -> MooncakeKVTransfer:
         pd = object.__new__(MooncakeKVTransfer)
-        pd._closed = pd._closing = False
+        pd._closed = False
         pd._registered = True
         pd._source_lock = threading.Lock()
         pd._source_changed = threading.Condition(pd._source_lock)
@@ -810,12 +847,12 @@ class PreemptionLifecycleTest(unittest.TestCase):
         pd._receive_lock = threading.Lock()
         pd._sources = {source.transfer_id: source}
         pd._finished_send = set()
-        pd._finished_recv = set()
+
         pd._failed_recv = set()
         pd._receive_futures = {}
         pd._retired = set()
         pd._prepared = {}
-        pd._send_events = {}
+        pd._pending_sends = set()
         pd._recv_events = {}
         pd._send_failures = {}
         pd._invalid = {}
@@ -900,24 +937,23 @@ class PreemptionLifecycleTest(unittest.TestCase):
         self.assertNotIn("x1", pd._sources)
 
     def test_timed_out_store_get_is_fenced_then_invalidated(self) -> None:
-        request = StoreRequest(
-            "r1", 32, ([10, 11],), [], load=StoreLoadSpec(0, 32, enabled=True)
-        )
         future: Future[_LoadOutcome] = Future()
         store = object.__new__(MooncakeKVCachePool)
         store._task_lock = threading.RLock()
         store.load_timeout = 1.0
         store.databases = [SimpleNamespace(block_size=16)]
-        store._loads = {"r1": future}
-        store._load_requests = {"r1": request}
-        store._load_events = {"r1": LoadEvent("r1", ((10, 11),), (), 0, 32)}
-        store._load_started_at = {"r1": time.monotonic() - 2}
-        store._load_timed_out = set()
+        store._loads = {
+            "r1": _LoadState(
+                LoadEvent("r1", ((10, 11),), (), 0, 32),
+                future,
+                time.monotonic() - 2,
+            )
+        }
         store._invalid = {}
         store._save_states = {}
 
         self.assertEqual(store.poll().loads, [])
-        self.assertIn("r1", store._load_timed_out)
+        self.assertTrue(store._loads["r1"].timed_out)
         self.assertIn("r1", store._loads)
 
         future.set_result(_LoadOutcome(32, None, set()))
@@ -1054,43 +1090,43 @@ class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
             async def send_multipart(self, frames) -> None:
                 self.frames = frames
 
-        schema = PDTransferSchema(1, "model", "", "float16", "hnd", 16, False)
-        request = PDTransferRequest(
+        schema = KVTransferSchema(1, "model", "", "float16", "hnd", 16, False)
+        request = KVTransferRequest(
             hostname="d",
             rpc_port=1,
             tp_size=1,
             tp_rank=0,
             pp_size=1,
             pp_rank=0,
-            schema=PDTransferSchema(
+            schema=KVTransferSchema(
                 1, "different-model", "", "float16", "hnd", 16, False
             ),
-            requests={"r": ("x", [[1]])},
+            requests={"x": ("r", [[1]])},
             region_base_addresses=[],
             block_lengths=[],
             kv_block_lengths=[],
         )
         pd = object.__new__(MooncakeKVTransfer)
-        pd._closing = False
+        pd._closed = False
         pd.schema = schema
-        pd._request_decoder = msgspec.msgpack.Decoder(PDTransferRequest)
-        pd._response_decoder = msgspec.msgpack.Decoder(PDTransferResponse)
+        pd._request_decoder = msgspec.msgpack.Decoder(KVTransferRequest)
+        pd._response_decoder = msgspec.msgpack.Decoder(KVTransferResponse)
         pd._encoder = msgspec.msgpack.Encoder()
         socket = Socket()
 
         await pd._serve(b"d", pd._encoder.encode(request), socket)
 
         response = pd._response_decoder.decode(socket.frames[1])
-        self.assertEqual(response.status, PDResponseStatus.ERROR)
-        self.assertIn("schema mismatch", response.error)
+        self.assertEqual(response.status, KVTransferStatus.FAILED)
+        self.assertIn("schema mismatch", response.error_message)
 
     async def test_source_completion_counts_heterogeneous_pp_fanout(self) -> None:
         class Socket:
             async def send_multipart(self, _frames) -> None:
                 return
 
-        schema = PDTransferSchema(2, "model", "", "float16", "hnd", 16, False)
-        request = PDTransferRequest(
+        schema = KVTransferSchema(2, "model", "", "float16", "hnd", 16, False)
+        request = KVTransferRequest(
             hostname="d",
             rpc_port=1,
             tp_size=1,
@@ -1098,7 +1134,7 @@ class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
             pp_size=2,
             pp_rank=0,
             schema=schema,
-            requests={"d-r": ("x", [[]])},
+            requests={"x": ("d-r", [[]])},
             region_base_addresses=[],
             block_lengths=[],
             kv_block_lengths=[],
@@ -1112,12 +1148,12 @@ class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
         source.ready.set()
         pd = PreemptionLifecycleTest._polling_pd(source)
         pd.schema = schema
-        pd.topology = _NPUTransferTopology(0, 1, 16, "p", False, 8)
+        pd.topology = _NPUTransferTopology(0, 1, 16, False, 8)
         pd.engine_id = "p"
         pd.dp_rank = pd.tp_rank = pd.pp_rank = 0
         pd.pp_size = 1
         pd.timeout = 0.01
-        pd._request_decoder = msgspec.msgpack.Decoder(PDTransferRequest)
+        pd._request_decoder = msgspec.msgpack.Decoder(KVTransferRequest)
         pd._encoder = msgspec.msgpack.Encoder()
 
         async def write(*_args):

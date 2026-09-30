@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -14,10 +13,11 @@ from vllm.utils.math_utils import cdiv
 from .kv_cache_pool import KVCachePool, LoadEvent, SaveEvent
 from .kv_transfer import KVTransfer, RecvEvent, SendEvent
 from .protocol import (
-    DTwoStageLoadPlan,
+    FinishedWait,
+    KVPoolLoadRequest,
+    KVPoolSaveRequest,
+    KVTransferPlan,
     MTSCConnectorMetadata,
-    SendRequirement,
-    StoreRequest,
 )
 from .utils import new_device_event
 
@@ -50,28 +50,32 @@ def _create_transfer(config, kv_cache_config) -> KVTransfer:
 
 
 @dataclass
-class _DLoadState:
-    plan: DTwoStageLoadPlan
+class _TransferState:
+    """Tracks STORE_PENDING -> STORE_DONE -> TRANSFER_PENDING -> DONE."""
+
+    plan: KVTransferPlan
     stage: str
-    created_at: float = field(default_factory=time.monotonic)
-    pd_started_at: float | None = None
     suffix_block_ids: list[list[int]] = field(default_factory=list)
 
 
 @dataclass
-class _SendState:
-    required: SendRequirement
-    store_done: bool = False
-    pd_done: bool = False
+class _FinishedWaitState:
+    """Aggregates required operations before source blocks can be released."""
+
+    requirements: FinishedWait
+    pool_save_done: bool = False
+    kv_transfer_done: bool = False
 
     @property
     def complete(self) -> bool:
-        return (not self.required.store or self.store_done) and (
-            not self.required.pd or self.pd_done
+        return (not self.requirements.store_save or self.pool_save_done) and (
+            not self.requirements.kv_transfer or self.kv_transfer_done
         )
 
 
 class MTSCWorker:
+    """Executes batch operations and advances pool + transfer loading."""
+
     def __init__(self, config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
         self.pool: KVCachePool = _create_pool(config, kv_cache_config)
         try:
@@ -79,20 +83,14 @@ class MTSCWorker:
         except Exception:
             self.pool.close()
             raise
-        assert config.kv_transfer_config is not None
-        self.is_producer = config.kv_transfer_config.kv_role == "kv_producer"
-        self.is_consumer = config.kv_transfer_config.kv_role == "kv_consumer"
-        self.timeout = float(
-            config.kv_transfer_config.kv_connector_extra_config.get(
-                "mtsc_pd_timeout_seconds", 180.0
-            )
-        )
-        self._decode: dict[str, _DLoadState] = {}
-        self._plain_store_loads: dict[str, StoreRequest] = {}
-        self._send: dict[str, _SendState] = {}
-        self._ignored_pd_recvs: set[str] = set()
+        # Every submitted pool operation is retained until its terminal result.
+        self._on_load_requests: dict[str, KVPoolLoadRequest] = {}
+        self._on_save_requests: dict[str, KVPoolSaveRequest] = {}
+        # Transfers include the initial pool-load stage.
+        self._on_transfer: dict[str, _TransferState] = {}
+        self._finished_waits: dict[str, _FinishedWaitState] = {}
+        self._ignored_recvs: set[str] = set()
         self._load_errors: set[int] = set()
-        self._save_pending: set[str] = set()
         self._closed = False
 
     def register_kv_caches(
@@ -110,7 +108,7 @@ class MTSCWorker:
             finally:
                 self.pool.close()
             raise
-        logger.info("MTSC registered Store and PD data planes")
+        logger.info("MTSC registered pool and transfer data planes")
 
     def handle_preemptions(self, metadata: MTSCConnectorMetadata) -> None:
         request_ids = metadata.preempted_request_ids
@@ -122,117 +120,109 @@ class MTSCWorker:
         for request_id in request_ids:
             self.pool.preempt(request_id)
             self.transfer.preempt(request_id)
-            self._save_pending.discard(request_id)
-            self._decode.pop(request_id, None)
-            self._plain_store_loads.pop(request_id, None)
-            self._send.pop(request_id, None)
-            self._ignored_pd_recvs.discard(request_id)
+            self._on_save_requests.pop(request_id, None)
+            self._on_transfer.pop(request_id, None)
+            self._on_load_requests.pop(request_id, None)
+            self._finished_waits.pop(request_id, None)
+            self._ignored_recvs.discard(request_id)
         # Error sets are consumed in the same cycle as their terminal result;
         # preempt() clears any backend-owned errors before block reuse.
 
-    def _accept_metadata(self, metadata: MTSCConnectorMetadata) -> None:
-        decode_ids = set(self._decode)
-        decode_ids.update(plan.request_id for plan in metadata.decode_plans)
-        save_requests = [request for request in metadata.store_requests if request.save]
+    def _apply_metadata(self, metadata: MTSCConnectorMetadata) -> None:
+        for load_meta in metadata.pool_loads:
+            self.pool.load(
+                LoadEvent(
+                    load_meta.request_id,
+                    tuple(tuple(group) for group in load_meta.block_ids),
+                    tuple(bytes(value) for value in load_meta.block_hashes),
+                    load_meta.start_token,
+                    load_meta.end_token,
+                )
+            )
+            # All loads, including the first transfer stage, share this tracker.
+            self._on_load_requests[load_meta.request_id] = load_meta
         save_event = None
-        if save_requests:
+        if metadata.pool_saves:
             save_event = new_device_event()
             save_event.record()
-        for request in metadata.store_requests:
-            block_ids = tuple(tuple(group) for group in request.block_ids)
-            hashes = tuple(bytes(value) for value in request.block_hashes)
-            if request.load is not None and request.load.enabled:
-                self.pool.load(
-                    LoadEvent(
-                        request.request_id,
-                        block_ids,
-                        hashes,
-                        request.load.local_tokens,
-                        request.load.store_tokens,
-                    )
+        for save_meta in metadata.pool_saves:
+            self.pool.save(
+                SaveEvent(
+                    save_meta.request_id,
+                    tuple(tuple(group) for group in save_meta.block_ids),
+                    tuple(bytes(value) for value in save_meta.block_hashes),
+                    save_meta.start_token,
+                    save_meta.end_token,
+                    save_event,
+                    save_meta.prompt_tokens,
                 )
-                if request.request_id not in decode_ids:
-                    self._plain_store_loads[request.request_id] = request
-            if request.save:
-                self.pool.save(
-                    SaveEvent(
-                        request.request_id,
-                        block_ids,
-                        hashes,
-                        request.save_from,
-                        request.token_count,
-                        save_event,
-                        request.prompt_tokens,
-                    )
-                )
-                self._save_pending.add(request.request_id)
-                state = self._send.get(request.request_id)
-                if state is not None:
-                    state.store_done = False
-        ready_updates = [
-            update for update in metadata.pd_send_updates if update.source_ready
-        ]
+            )
+            self._on_save_requests[save_meta.request_id] = save_meta
+            state = self._finished_waits.get(save_meta.request_id)
+            if state is not None:
+                state.pool_save_done = False
+        ready_updates = [source_state for source_state in metadata.transfer_states if source_state.ready]
         if ready_updates:
             # send() publishes readable source memory. This fences preceding
             # device writes before the transport can access those addresses.
             ready = new_device_event()
             ready.record()
             ready.synchronize()
-        for update in metadata.pd_send_updates:
-            if update.abort:
-                self.transfer.cancel(update.request_id, update.transfer_id)
-            elif update.source_ready:
+        for source_state in metadata.transfer_states:
+            if source_state.cancelled:
+                self.transfer.cancel(source_state.request_id, source_state.transfer_id)
+            elif source_state.ready:
                 self.transfer.send(
                     SendEvent(
-                        update.request_id,
-                        update.transfer_id,
-                        tuple(tuple(group) for group in update.block_ids),
+                        source_state.request_id,
+                        source_state.transfer_id,
+                        tuple(tuple(group) for group in source_state.source_block_ids),
                     )
                 )
             else:
-                self.transfer.prepare(update.request_id, update.transfer_id)
-        for request_id, requirement in metadata.send_requirements.items():
-            self._send.setdefault(
+                self.transfer.prepare(source_state.request_id, source_state.transfer_id)
+        for request_id, requirement in metadata.finished_waits.items():
+            self._finished_waits.setdefault(
                 request_id,
-                _SendState(
+                _FinishedWaitState(
                     requirement,
-                    store_done=request_id not in self._save_pending,
+                    pool_save_done=request_id not in self._on_save_requests,
                 ),
             )
-        for plan in metadata.decode_plans:
-            if plan.request_id in self._decode:
+        for plan in metadata.transfer_plans:
+            if plan.request_id in self._on_transfer:
                 continue
             stage = (
                 "STORE_PENDING"
-                if plan.store_candidate_tokens > plan.local_prefix_tokens
+                if plan.pool_tokens > plan.local_tokens
                 else "STORE_DONE"
             )
-            self._decode[plan.request_id] = _DLoadState(plan, stage)
+            self._on_transfer[plan.request_id] = _TransferState(plan, stage)
             logger.info(
-                "MTSC D state created: request_id=%s stage=%s L=%d H=%d T=%d",
+                "MTSC transfer state created: request_id=%s stage=%s L=%d H=%d T=%d",
                 plan.request_id,
                 stage,
-                plan.local_prefix_tokens,
-                plan.store_candidate_tokens,
-                plan.target_prefix_tokens,
+                plan.local_tokens,
+                plan.pool_tokens,
+                plan.target_tokens,
             )
 
     @staticmethod
-    def _store_candidate_block_ids(plan: DTwoStageLoadPlan) -> set[int]:
+    def _pool_candidate_block_ids(plan: KVTransferPlan) -> set[int]:
         result: set[int] = set()
         for group_ids, block_size in zip(
             plan.all_block_ids, plan.group_block_sizes, strict=True
         ):
-            start = cdiv(plan.local_prefix_tokens, block_size)
-            end = min(cdiv(plan.store_candidate_tokens, block_size), len(group_ids))
+            start = cdiv(plan.local_tokens, block_size)
+            end = min(cdiv(plan.pool_tokens, block_size), len(group_ids))
             result.update(group_ids[start:end])
         return result
 
     @staticmethod
     def _suffix_blocks(
-        plan: DTwoStageLoadPlan, actual_store_prefix: int
+        plan: KVTransferPlan, actual_pool_prefix: int
     ) -> list[list[int]]:
-        offset = actual_store_prefix - plan.local_prefix_tokens
+        offset = actual_pool_prefix - plan.local_tokens
         result: list[list[int]] = []
         for group, block_size, window in zip(
             plan.external_block_ids,
@@ -246,20 +236,21 @@ class MTSCWorker:
             result.append(suffix)
         return result
 
-    def _start_pd(self, state: _DLoadState, actual_store_prefix: int) -> bool:
+    def _start_transfer(self, state: _TransferState, actual_pool_prefix: int) -> bool:
         plan = state.plan
-        suffix = self._suffix_blocks(plan, actual_store_prefix)
+        suffix = self._suffix_blocks(plan, actual_pool_prefix)
         state.suffix_block_ids = suffix
-        if not plan.pd_enabled:
-            if actual_store_prefix < plan.target_prefix_tokens:
+        if not plan.transfer_enabled:
+            if actual_pool_prefix < plan.target_tokens:
                 for group in suffix:
                     self._load_errors.update(block for block in group if block >= 0)
                 logger.warning(
-                    "MTSC D Store miss has no P source: request_id=%s", plan.request_id
+                    "MTSC pool miss has no transfer source: request_id=%s",
+                    plan.request_id,
                 )
             state.stage = "DONE"
             return False
-        params = plan.kv_transfer_params
+        params = plan.transfer_params
         self.transfer.recv(
             RecvEvent(
                 plan.request_id,
@@ -270,92 +261,90 @@ class MTSCWorker:
                 int(params.get("remote_dp_rank", 0)),
             )
         )
-        state.stage = "PD_PENDING"
-        state.pd_started_at = time.monotonic()
+        state.stage = "TRANSFER_PENDING"
         if not plan.wait_for_completion:
-            self._ignored_pd_recvs.add(plan.request_id)
+            self._ignored_recvs.add(plan.request_id)
         logger.info(
-            "MTSC D PD suffix started: request_id=%s A=%d T=%d blocks=%d",
+            "MTSC transfer suffix started: request_id=%s A=%d T=%d blocks=%d",
             plan.request_id,
-            actual_store_prefix,
-            plan.target_prefix_tokens,
+            actual_pool_prefix,
+            plan.target_tokens,
             sum(len(group) for group in suffix),
         )
         return True
 
-    def _aggregate_sends(self, store_done: set[str], pd_done: set[str]) -> set[str]:
-        self._save_pending.difference_update(store_done)
-        for request_id in store_done:
-            state = self._send.get(request_id)
+    def _aggregate_sends(
+        self, pool_save_done: set[str], kv_transfer_done: set[str]
+    ) -> set[str]:
+        for request_id in pool_save_done:
+            self._on_save_requests.pop(request_id, None)
+            state = self._finished_waits.get(request_id)
             if state is not None:
-                state.store_done = True
-        for request_id in pd_done:
-            state = self._send.get(request_id)
+                state.pool_save_done = True
+        for request_id in kv_transfer_done:
+            state = self._finished_waits.get(request_id)
             if state is not None:
-                state.pd_done = True
+                state.kv_transfer_done = True
         completed = set()
         # Only request_finished creates a release dependency. Intermediate
         # backend results never release blocks of an active request.
-        for request_id, state in list(self._send.items()):
+        for request_id, state in list(self._finished_waits.items()):
             if state.complete:
                 completed.add(request_id)
-                del self._send[request_id]
+                del self._finished_waits[request_id]
         return completed
 
     def get_finished(
         self, finished_req_ids: set[str], metadata: MTSCConnectorMetadata
     ) -> tuple[set[str] | None, set[str] | None]:
-        self._accept_metadata(metadata)
+        self._apply_metadata(metadata)
         pool_results = self.pool.poll()
-        store_errors = self.pool.take_errors()
-        staged_ids = set(self._decode)
+        pool_errors = self.pool.take_errors()
+        staged_ids = set(self._on_transfer)
         staged_blocks = {
             block
-            for state in self._decode.values()
-            for block in self._store_candidate_block_ids(state.plan)
+            for state in self._on_transfer.values()
+            for block in self._pool_candidate_block_ids(state.plan)
         }
-        self._load_errors.update(store_errors - staged_blocks)
+        self._load_errors.update(pool_errors - staged_blocks)
         loads = {result.request_id: result for result in pool_results.loads}
         finished_recv = set()
-        for request_id in loads.keys() - staged_ids:
-            self._plain_store_loads.pop(request_id, None)
-            finished_recv.add(request_id)
+        for request_id in loads:
+            self._on_load_requests.pop(request_id, None)
+            if request_id not in staged_ids:
+                finished_recv.add(request_id)
 
-        for request_id, state in list(self._decode.items()):
+        for request_id, state in list(self._on_transfer.items()):
             if state.stage == "STORE_DONE":
-                actual = state.plan.local_prefix_tokens
+                actual = state.plan.local_tokens
             elif state.stage == "STORE_PENDING" and request_id in loads:
                 actual = loads[request_id].loaded_tokens
-                if (
-                    not state.plan.local_prefix_tokens
-                    <= actual
-                    <= state.plan.store_candidate_tokens
-                ):
+                if not state.plan.local_tokens <= actual <= state.plan.pool_tokens:
                     raise ValueError("Pool returned an invalid loaded prefix")
                 logger.info(
-                    "MTSC D Pool terminal: request_id=%s L=%d H=%d A=%d",
+                    "MTSC pool load terminal: request_id=%s L=%d H=%d A=%d",
                     request_id,
-                    state.plan.local_prefix_tokens,
-                    state.plan.store_candidate_tokens,
+                    state.plan.local_tokens,
+                    state.plan.pool_tokens,
                     actual,
                 )
             else:
                 continue
-            if not self._start_pd(state, actual):
+            if not self._start_transfer(state, actual):
                 if state.plan.wait_for_completion:
                     finished_recv.add(request_id)
-                del self._decode[request_id]
+                del self._on_transfer[request_id]
 
         transfer_results = self.transfer.poll()
         transfer_errors = self.transfer.take_errors()
         self._load_errors.update(transfer_errors)
         for result in transfer_results.recvs:
             request_id = result.request_id
-            if request_id in self._ignored_pd_recvs:
-                self._ignored_pd_recvs.discard(request_id)
-                self._decode.pop(request_id, None)
+            if request_id in self._ignored_recvs:
+                self._ignored_recvs.discard(request_id)
+                self._on_transfer.pop(request_id, None)
                 continue
-            state = self._decode.pop(request_id, None)
+            state = self._on_transfer.pop(request_id, None)
             if state is not None:
                 if result.error is not None:
                     # Preserve fallback even if the backend could not prove

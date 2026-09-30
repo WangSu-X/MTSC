@@ -36,12 +36,12 @@ from mtsc.kv_transfer import (
     kv_slice_plan,
 )
 from mtsc.protocol import (
+    FinishedWait,
+    KVPoolSaveRequest,
+    KVTransferRequest,
+    KVTransferResponse,
+    KVTransferSchema,
     MTSCConnectorMetadata,
-    PDTransferRequest,
-    PDTransferResponse,
-    PDTransferSchema,
-    SendRequirement,
-    StoreRequest,
 )
 from mtsc.worker import MTSCWorker
 
@@ -101,12 +101,8 @@ def _pool():
     pool._registered = True
     pool._task_lock = threading.RLock()
     pool._save_states = {}
-    pool._load_events = {}
     pool._invalid = {}
     pool._loads = {}
-    pool._load_requests = {}
-    pool._load_started_at = {}
-    pool._load_timed_out = set()
     pool._load_pool = ThreadPoolExecutor(max_workers=2)
     pool._save_pool = ThreadPoolExecutor(max_workers=1)
     pool._lookup_server = None
@@ -233,16 +229,45 @@ class PoolBackendTest(unittest.TestCase):
     def test_load_timeout_does_not_complete_until_io_stops(self):
         event = LoadEvent("r", ((10, 11),), (b"a", b"b"), 0, 32)
         self.pool.load(event)
-        self.pool._loads["r"].result(timeout=1)
+        self.pool._loads["r"].future.result(timeout=1)
         future = Future()
-        self.pool._loads["r"] = future
-        self.pool._load_started_at["r"] = 0
+        self.pool._loads["r"].future = future
+        self.pool._loads["r"].started_at = 0
         self.assertEqual(self.pool.poll().loads, [])
         future.set_result(set())
         result = self.pool.poll().loads[0]
         self.assertEqual(result.loaded_tokens, 0)
         self.assertIsNotNone(result.error)
         self.assertEqual(self.pool.take_errors(), {10, 11})
+
+    def test_failed_submission_allows_retry_without_orphaned_load(self):
+        event = LoadEvent("r", ((10, 11),), (b"a", b"b"), 0, 32)
+        with (
+            patch.object(
+                self.pool._load_pool,
+                "submit",
+                side_effect=RuntimeError("submit failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "submit failed"),
+        ):
+            self.pool.load(event)
+        self.assertEqual(self.pool.poll().loads, [])
+        self.pool.load(event)
+        result = _drain(self.pool, "loads")[0]
+        self.assertEqual(result.loaded_tokens, 32)
+        self.assertIsNone(result.error)
+
+    def test_load_future_failure_invalidates_only_requested_blocks(self):
+        future = Future()
+        future.set_exception(RuntimeError("load task failed"))
+        event = LoadEvent("r", ((10, 11, 12),), (b"a", b"b", b"c"), 16, 48)
+        with patch.object(self.pool._load_pool, "submit", return_value=future):
+            self.pool.load(event)
+        result = self.pool.poll().loads[0]
+        self.assertEqual(result.loaded_tokens, 16)
+        self.assertEqual(result.error, "load task failed")
+        self.assertEqual(self.pool.take_errors(), {11, 12})
+        self.assertEqual(self.pool.poll().loads, [])
 
     def test_load_completion_includes_device_conversion_without_blocking_poll(self):
         entered, release = threading.Event(), threading.Event()
@@ -264,8 +289,8 @@ class PoolBackendTest(unittest.TestCase):
 
     def test_delayed_poll_does_not_timeout_already_completed_load(self):
         self.pool.load(LoadEvent("r", ((10, 11),), (b"a", b"b"), 0, 32))
-        self.pool._loads["r"].result(timeout=1)
-        self.pool._load_started_at["r"] = 0
+        self.pool._loads["r"].future.result(timeout=1)
+        self.pool._loads["r"].started_at = 0
         result = self.pool.poll().loads[0]
         self.assertEqual(result.loaded_tokens, 32)
         self.assertIsNone(result.error)
@@ -297,7 +322,7 @@ class KVTopologyTest(unittest.TestCase):
     def test_failed_layout_conversion_still_fences_device_writes(self):
         transfer = _transfer()
         transfer.device_id = 0
-        transfer.topology = _NPUTransferTopology(0, 1, 2, "d", False, 2)
+        transfer.topology = _NPUTransferTopology(0, 1, 2, False, 2)
         transfer.npu_kv_nz = False
         transfer.kv_caches = {
             "layer.0": torch.tensor([[[0, 1], [10, 11]]]),
@@ -380,7 +405,7 @@ class KVTopologyTest(unittest.TestCase):
 
 def _transfer():
     transfer = object.__new__(MooncakeKVTransfer)
-    transfer._closed = transfer._closing = False
+    transfer._closed = False
     transfer._registered = True
     transfer.is_producer = True
     transfer.engine_id = "p"
@@ -391,30 +416,30 @@ def _transfer():
     transfer.timeout = 1
     transfer.protocol = "rdma"
     transfer._tcp_write_locks = {}
-    transfer.topology = _NPUTransferTopology(0, 1, 16, "p", False, 8)
-    transfer.schema = PDTransferSchema(2, "model", "", "float16", "hnd", 16, False)
+    transfer.topology = _NPUTransferTopology(0, 1, 16, False, 8)
+    transfer.schema = KVTransferSchema(2, "model", "", "float16", "hnd", 16, False)
     transfer._source_lock = threading.Lock()
     transfer._source_changed = threading.Condition(transfer._source_lock)
     transfer._result_lock = threading.Lock()
     transfer._receive_lock = threading.Lock()
     transfer._sources = {}
     transfer._prepared = {}
-    transfer._send_events = {}
+    transfer._pending_sends = set()
     transfer._recv_events = {}
     transfer._send_failures = {}
     transfer._invalid = {}
     transfer._retired = set()
     transfer._finished_send = set()
-    transfer._finished_recv = set()
+
     transfer._failed_recv = set()
     transfer._receive_futures = {}
-    transfer._request_decoder = msgspec.msgpack.Decoder(PDTransferRequest)
+    transfer._request_decoder = msgspec.msgpack.Decoder(KVTransferRequest)
     transfer._encoder = msgspec.msgpack.Encoder()
     return transfer
 
 
 def _request(transfer, **kwargs):
-    return PDTransferRequest(
+    return KVTransferRequest(
         "host",
         123,
         1,
@@ -422,7 +447,7 @@ def _request(transfer, **kwargs):
         1,
         0,
         transfer.schema,
-        {"d-r": ("x", [[4]])},
+        {"x": ("d-r", [[4]])},
         [2000],
         [16],
         [16],
@@ -443,7 +468,7 @@ class _Socket:
         self.messages = []
 
     async def send_multipart(self, frames):
-        self.messages.append(msgspec.msgpack.decode(frames[1], type=PDTransferResponse))
+        self.messages.append(msgspec.msgpack.decode(frames[1], type=KVTransferResponse))
 
 
 class TCPCompletionRequirementTest(unittest.TestCase):
@@ -472,6 +497,22 @@ class TCPCompletionRequirementTest(unittest.TestCase):
 
 
 class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
+    def test_duplicate_send_is_rejected_until_terminal_result_is_collected(self):
+        transfer = _transfer()
+        event = SendEvent("p-r", "x", ((1,),))
+        transfer.send(event)
+        source = transfer._sources["x"]
+        source.completed = source.expected = source.terminal = 1
+        with transfer._source_lock:
+            transfer._retire_locked(source)
+        with self.assertRaisesRegex(ValueError, "Uncollected send"):
+            transfer.send(event)
+        self.assertEqual(
+            [result.request_id for result in transfer.poll().sends], ["p-r"]
+        )
+        transfer.send(replace(event, transfer_id="next"))
+        self.assertEqual(transfer._sources["next"].request_id, "p-r")
+
     async def test_tcp_batches_apply_backpressure_for_concurrent_same_peer(self):
         transfer = _transfer()
         transfer.protocol = "tcp"
@@ -523,7 +564,9 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                 )
                 socket = _Socket()
                 await transfer._serve(b"peer", msgspec.msgpack.encode(request), socket)
-                self.assertEqual(socket.messages[0].error, "P/D transfer schema mismatch")
+                self.assertEqual(
+                    socket.messages[0].error_message, "P/D transfer schema mismatch"
+                )
                 self.assertEqual(transfer._sources, {})
 
     async def test_blocks_first_write_copies_k_and_v_with_tp_slicing(self):
@@ -577,7 +620,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                     group_indices=[r.group_index for r in receiver.regions],
                 )
                 ok, covered = await sender._write_one(
-                    "d-r", SimpleNamespace(block_ids=[[2]]), request
+                    "x", SimpleNamespace(block_ids=[[2]]), request
                 )
                 expected = (
                     source[2]
@@ -633,9 +676,9 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(closing.done())
             release.set()
             response = msgspec.msgpack.decode(
-                await asyncio.wait_for(client.recv(), 2), type=PDTransferResponse
+                await asyncio.wait_for(client.recv(), 2), type=KVTransferResponse
             )
-            self.assertEqual(response.completed, ["d-r"])
+            self.assertEqual(response.completed_transfer_ids, ["x"])
             await asyncio.wait_for(closing, 2)
             self.assertFalse(transfer._loop_thread.is_alive())
             self.assertTrue(transfer._loop.is_closed())
@@ -704,17 +747,21 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                 pass
 
             async def send(self, payload):
-                request = msgspec.msgpack.decode(payload, type=PDTransferRequest)
+                request = msgspec.msgpack.decode(payload, type=KVTransferRequest)
                 self_identity = (request.engine_id, request.dp_rank)
                 if self_identity != ("p", 2):
                     raise AssertionError("Missing local replica identity")
+                if request.requests != {"x": ("d-r", [[]])}:
+                    raise AssertionError(
+                        "Transfer wire request must be keyed by transfer_id"
+                    )
 
             async def recv(self):
                 if self.address == "fail":
                     raise RuntimeError("First peer failed")
                 waiting.set()
                 await release.wait()
-                return msgspec.msgpack.encode(PDTransferResponse(0, ["d-r"]))
+                return msgspec.msgpack.encode(KVTransferResponse(0, ["x"]))
 
             def close(self, **kwargs):
                 pass
@@ -726,7 +773,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         transfer._query_workers = query
         transfer.regions = []
         transfer.hostname, transfer.rpc_port = "host", 123
-        transfer._response_decoder = msgspec.msgpack.Decoder(PDTransferResponse)
+        transfer._response_decoder = msgspec.msgpack.Decoder(KVTransferResponse)
         transfer.reformat_npu_blocks = lambda *args: None
         receive = asyncio.create_task(
             transfer._receive("d-r", "x", [[]], "p", "bootstrap", 2)
@@ -771,7 +818,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                     transfer = _transfer()
                     transfer.tp_size, transfer.tp_rank = 4, p_rank
                     transfer.pp_size, transfer.pp_rank = 2, pp_rank
-                    transfer.topology = _NPUTransferTopology(p_rank, 4, 16, "p", mla, 4)
+                    transfer.topology = _NPUTransferTopology(p_rank, 4, 16, mla, 4)
                     transfer.schema = msgspec.structs.replace(
                         transfer.schema, is_mla=mla
                     )
@@ -794,7 +841,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                     request = msgspec.structs.replace(
                         _request(transfer),
                         tp_size=2,
-                        requests={"d-r": ("x", [[4, 5]])},
+                        requests={"x": ("d-r", [[4, 5]])},
                         region_base_addresses=[20000, 21000],
                         block_lengths=[d_page] * 2,
                         kv_block_lengths=[d_page] * 2,
@@ -817,7 +864,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                 )
                 for layer in range(2)
             ]
-            receiver._validate_coverage("d-r", [[4, 5]], responses, 1 if mla else 2)
+            receiver._validate_coverage("x", [[4, 5]], responses, 1 if mla else 2)
             for layer in range(2):
                 data = memory[20000 + layer * 1000]
                 for dest, source in ((4, 1), (5, 2)):
@@ -855,7 +902,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transfer.poll().sends, [])
         late = _Socket()
         await transfer._serve(b"c", payload, late)
-        self.assertEqual(late.messages[0].failed, ["d-r"])
+        self.assertEqual(late.messages[0].failed_transfer_ids, ["x"])
 
     async def test_cancel_unpublished_session_wakes_early_receiver(self):
         transfer = _transfer()
@@ -866,7 +913,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         transfer.cancel("p-r", "x")
         await asyncio.wait_for(task, 1)
-        self.assertEqual(socket.messages[0].failed, ["d-r"])
+        self.assertEqual(socket.messages[0].failed_transfer_ids, ["x"])
         self.assertEqual(transfer.poll().sends, [])
         with self.assertRaises(ValueError):
             transfer.prepare("p-r", "x")
@@ -883,7 +930,9 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         socket = _Socket()
         request = msgspec.structs.replace(_request(transfer), remote_dp_rank=99)
         await transfer._serve(b"a", msgspec.msgpack.encode(request), socket)
-        self.assertEqual(socket.messages[0].error, "P engine/DP identity mismatch")
+        self.assertEqual(
+            socket.messages[0].error_message, "P engine/DP identity mismatch"
+        )
         self.assertEqual(transfer._sources, {})
 
     async def test_source_timeout_retires_attempt_and_reports_error(self):
@@ -901,11 +950,11 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         transfer = _transfer()
         transfer.send(SendEvent("p-r", "x", ((1,),)))
         request = msgspec.structs.replace(
-            _request(transfer), requests={"d-r": ("x", [[]])}
+            _request(transfer), requests={"x": ("d-r", [[]])}
         )
         socket = _Socket()
         await transfer._serve(b"a", msgspec.msgpack.encode(request), socket)
-        self.assertEqual(socket.messages[0].completed, ["d-r"])
+        self.assertEqual(socket.messages[0].completed_transfer_ids, ["x"])
         self.assertIsNone(transfer.poll().sends[0].error)
 
     async def test_recv_result_waits_for_future_terminal_and_invalidates_only_targets(
@@ -932,24 +981,24 @@ class WorkerReleaseTest(unittest.TestCase):
         worker.transfer = SimpleNamespace(
             poll=lambda: TransferPollResult(), take_errors=lambda: set()
         )
-        worker._save_pending = set()
-        worker._send = {}
-        worker._decode = {}
-        worker._plain_store_loads = {}
-        worker._ignored_pd_recvs = set()
+        worker._on_save_requests = {}
+        worker._finished_waits = {}
+        worker._on_transfer = {}
+        worker._on_load_requests = {}
+        worker._ignored_recvs = set()
         worker._load_errors = set()
         return worker
 
     def test_intermediate_save_does_not_release_active_request(self):
         worker = self._worker()
-        worker._save_pending.add("r")
+        worker._on_save_requests["r"] = KVPoolSaveRequest("r", ([1],), [], 0, 16)
         worker.pool.poll = lambda: PoolPollResult(saves=[SaveResult("r")])
         self.assertEqual(
             worker.get_finished(set(), MTSCConnectorMetadata()), (None, None)
         )
         worker.pool.poll = lambda: PoolPollResult()
         metadata = MTSCConnectorMetadata(
-            send_requirements={"r": SendRequirement(store=True)}
+            finished_waits={"r": FinishedWait(store_save=True)}
         )
         self.assertEqual(worker.get_finished({"r"}, metadata), ({"r"}, None))
 
@@ -957,8 +1006,8 @@ class WorkerReleaseTest(unittest.TestCase):
         worker = self._worker()
         worker.pool.save = lambda event: None
         metadata = MTSCConnectorMetadata(
-            store_requests=[StoreRequest("r", 16, ([1],), [b"a"], save=True)],
-            send_requirements={"r": SendRequirement(store=True)},
+            pool_saves=[KVPoolSaveRequest("r", ([1],), [b"a"], 0, 16)],
+            finished_waits={"r": FinishedWait(store_save=True)},
         )
         ready = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
         with patch("mtsc.worker.new_device_event", return_value=ready):

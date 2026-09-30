@@ -1,9 +1,4 @@
-"""MTSC-owned scheduler/worker and P/D wire protocols.
-
-The types in this module deliberately do not depend on either vLLM Mooncake
-connector.  MTSC owns their lifecycle and only the data plane talks to the
-Mooncake Python libraries.
-"""
+"""MTSC-owned scheduler/worker metadata and transfer wire protocols."""
 
 from __future__ import annotations
 
@@ -16,80 +11,94 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 from vllm.v1.core.kv_cache_utils import BlockHash
 
 
-@dataclass
-class StoreLoadSpec:
+@dataclass(frozen=True)
+class KVPoolLoadSpec:
+    """Pool lookup decision awaiting local block allocation."""
+
     local_tokens: int
-    store_tokens: int
-    enabled: bool = False
+    pool_tokens: int
 
 
 @dataclass
-class StoreRequest:
+class KVPoolLoadRequest:
+    """Load [start_token, end_token) from the pool into allocated blocks."""
+
     request_id: str
-    token_count: int
     block_ids: tuple[list[int], ...]
     block_hashes: list[BlockHash]
-    load: StoreLoadSpec | None = None
-    save: bool = False
-    save_from: int = 0
-    token_ids: list[int] | None = None
+    start_token: int
+    end_token: int
+
+
+@dataclass
+class KVPoolSaveRequest:
+    """Save complete cache chunks in [start_token, end_token) to the pool."""
+
+    request_id: str
+    block_ids: tuple[list[int], ...]
+    block_hashes: list[BlockHash]
+    start_token: int
+    end_token: int
     prompt_tokens: int | None = None
 
 
 @dataclass(frozen=True)
-class DTwoStageLoadPlan:
-    """One Decode request's immutable, once-allocated load plan."""
+class KVTransferPlan:
+    """Immutable plan for pool loading followed by direct transfer."""
 
     request_id: str
     transfer_id: str
-    local_prefix_tokens: int
-    store_candidate_tokens: int
-    target_prefix_tokens: int
+    local_tokens: int
+    pool_tokens: int
+    target_tokens: int
     all_block_ids: tuple[list[int], ...]
     external_block_ids: tuple[list[int], ...]
     group_block_sizes: tuple[int, ...]
     blocks_per_sliding_window: tuple[int, ...]
-    pd_enabled: bool
+    transfer_enabled: bool
     wait_for_completion: bool
-    kv_transfer_params: dict[str, Any]
+    transfer_params: dict[str, Any]
 
 
 @dataclass(frozen=True)
-class PDSendUpdate:
-    """P-side state delta. Empty blocks register a placeholder."""
+class KVTransferSourceState:
+    """Producer state delta; empty blocks register a placeholder."""
 
     request_id: str
     transfer_id: str
-    block_ids: tuple[list[int], ...] = ()
-    source_ready: bool = False
-    abort: bool = False
+    source_block_ids: tuple[list[int], ...] = ()
+    ready: bool = False
+    cancelled: bool = False
 
 
 @dataclass(frozen=True)
-class SendRequirement:
-    store: bool = False
-    pd: bool = False
+class FinishedWait:
+    """Operations that must finish before a completed request releases blocks."""
+
+    store_save: bool = False
+    kv_transfer: bool = False
 
 
 @dataclass
 class MTSCConnectorMetadata(KVConnectorMetadata):
-    """A per-step delta wholly owned by MTSC."""
+    """Per-step execution plan sent from Scheduler to Worker."""
 
-    store_requests: list[StoreRequest] = field(default_factory=list)
-    decode_plans: list[DTwoStageLoadPlan] = field(default_factory=list)
-    pd_send_updates: list[PDSendUpdate] = field(default_factory=list)
-    send_requirements: dict[str, SendRequirement] = field(default_factory=dict)
+    pool_loads: list[KVPoolLoadRequest] = field(default_factory=list)
+    pool_saves: list[KVPoolSaveRequest] = field(default_factory=list)
+    transfer_plans: list[KVTransferPlan] = field(default_factory=list)
+    transfer_states: list[KVTransferSourceState] = field(default_factory=list)
+    finished_waits: dict[str, FinishedWait] = field(default_factory=dict)
     finished_request_ids: set[str] = field(default_factory=set)
     preempted_request_ids: set[str] = field(default_factory=set)
 
 
-class PDResponseStatus(IntEnum):
-    FINISH = 0
-    CONTINUE = 1
-    ERROR = 2
+class KVTransferStatus(IntEnum):
+    COMPLETE = 0
+    IN_PROGRESS = 1
+    FAILED = 2
 
 
-class PDTransferSchema(msgspec.Struct, frozen=True):
+class KVTransferSchema(msgspec.Struct, frozen=True):
     """Layout invariants that must match before P writes into D memory."""
 
     topology_version: int
@@ -103,7 +112,7 @@ class PDTransferSchema(msgspec.Struct, frozen=True):
     dcp_size: int = 1
 
 
-class PDTransferRequest(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
+class KVTransferRequest(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
     """D -> P control message; P writes bytes into the listed D regions."""
 
     hostname: str
@@ -112,7 +121,8 @@ class PDTransferRequest(msgspec.Struct, omit_defaults=True):  # type: ignore[cal
     tp_rank: int
     pp_size: int
     pp_rank: int
-    schema: PDTransferSchema
+    schema: KVTransferSchema
+    # {transfer_id: (consumer_request_id, destination_block_groups)}
     requests: dict[str, tuple[str, list[list[int]]]]
     region_base_addresses: list[int]
     block_lengths: list[int]
@@ -128,9 +138,10 @@ class PDTransferRequest(msgspec.Struct, omit_defaults=True):  # type: ignore[cal
     destination_num_blocks: int = 0
 
 
-class PDTransferResponse(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
-    status: PDResponseStatus
-    completed: list[str] | None = None
-    failed: list[str] | None = None
-    error: str | None = None
+class KVTransferResponse(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
+    status: KVTransferStatus
+    completed_transfer_ids: list[str] | None = None
+    failed_transfer_ids: list[str] | None = None
+    error_message: str | None = None
+    # Destination region indices covered by each transfer_id.
     covered_regions: dict[str, list[int]] | None = None

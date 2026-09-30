@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import threading
 import time
@@ -40,10 +41,10 @@ from vllm.utils.network_utils import get_ip, make_zmq_path
 from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec, SlidingWindowMLASpec
 
 from .protocol import (
-    PDResponseStatus,
-    PDTransferRequest,
-    PDTransferResponse,
-    PDTransferSchema,
+    KVTransferRequest,
+    KVTransferResponse,
+    KVTransferSchema,
+    KVTransferStatus,
 )
 from .utils import (
     BlockIds,
@@ -64,7 +65,9 @@ def _require_tcp_write_ack(protocol: str) -> None:
     try:
         installed = Version(version("mooncake-transfer-engine"))
     except (PackageNotFoundError, InvalidVersion) as exc:
-        raise RuntimeError(f"MTSC TCP requires {requirement} with receiver ACK") from exc
+        raise RuntimeError(
+            f"MTSC TCP requires {requirement} with receiver ACK"
+        ) from exc
     if installed < Version("0.3.13.post1"):
         raise RuntimeError(
             f"MTSC TCP requires {requirement} on both P and D; found {installed}. "
@@ -308,11 +311,11 @@ class BootstrapServer:
 
     def __init__(self, port: int) -> None:
         self.workers: dict[int, dict[str, Any]] = {}
-        self.app = FastAPI()
-        self.app.post("/register")(self.register)
-        self.app.get("/query")(self.query)
+        app = FastAPI()
+        app.post("/register")(self.register)
+        app.get("/query")(self.query)
         self.server = uvicorn.Server(
-            uvicorn.Config(self.app, host="0.0.0.0", port=port, log_level="warning")
+            uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning")
         )
         self.thread = threading.Thread(
             target=self.server.run, name="mtsc-bootstrap", daemon=True
@@ -381,14 +384,8 @@ class _NPUTransferTopology:
     tp_rank: int
     tp_size: int
     block_size: int
-    engine_id: str
     is_mla: bool
     total_num_kv_heads: int
-    virtually_split_kv_in_blocks: bool = False
-
-    @property
-    def local_replicates_kv_cache(self) -> bool:
-        return self.is_mla or self.tp_size > self.total_num_kv_heads
 
     def handshake_target_ranks(self, remote_tp_size: int) -> list[int]:
         if self.tp_size >= remote_tp_size:
@@ -462,21 +459,22 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         assert config.kv_transfer_config is not None
         transfer = config.kv_transfer_config
         assert transfer.engine_id is not None
-        self.config = config
         self.num_blocks = config.cache_config.num_gpu_blocks
         self.engine_id = transfer.engine_id
         self.is_producer = transfer.kv_role == "kv_producer"
-        self.is_consumer = transfer.kv_role == "kv_consumer"
-        self.extra = transfer.kv_connector_extra_config
+        extra = transfer.kv_connector_extra_config
         self.timeout = float(
-            self.extra.get(
+            extra.get(
                 "mtsc_pd_timeout_seconds", envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
             )
         )
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise ValueError("mtsc_pd_timeout_seconds must be finite and positive")
+        max_workers = max(1, int(extra.get("num_workers", 10)))
         self.device_id = torch.accelerator.current_device_index()
         current_platform.set_device(self.device_id)
         default_protocol = "ascend" if is_npu_platform() else "rdma"
-        protocol = self.extra.get("mooncake_protocol", default_protocol)
+        protocol = extra.get("mooncake_protocol", default_protocol)
         _require_tcp_write_ack(protocol)
         self.protocol = protocol
         self._tcp_write_locks: dict[str, asyncio.Lock] = {}
@@ -486,7 +484,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             self.hostname,
             "P2PHANDSHAKE",
             protocol,
-            self.extra.get("device_name", ""),
+            extra.get("device_name", ""),
         )
         if ret != 0:
             raise RuntimeError(f"Mooncake TransferEngine initialization failed: {ret}")
@@ -506,7 +504,6 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             "tp_rank": self.tp_rank,
             "tp_size": self.tp_size,
             "block_size": config.cache_config.block_size,
-            "engine_id": self.engine_id,
             "is_mla": model.use_mla,
             "total_num_kv_heads": model.get_total_num_kv_heads(),
         }
@@ -515,6 +512,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         else:
             self.topology = TransferTopology(
                 **topology_args,
+                engine_id=self.engine_id,
                 is_mamba=kv_cache_config.has_mamba_layers,
                 attn_backends=get_current_attn_backends(config),
             )
@@ -523,10 +521,11 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             cache_layout = "npu-nz" if self.npu_kv_nz else "npu-normal"
         else:
             cache_layout = "mla" if model.use_mla else "hnd"
-        self.schema = PDTransferSchema(
-            # Reject legacy MTSC peers before exposing writable memory. Their
-            # TCP transport may fall back to unacknowledged protocol v1.
-            topology_version=3 if protocol == "tcp" else 2,
+        self.schema = KVTransferSchema(
+            # Versions 4/5 key requests, terminal results and coverage by
+            # transfer_id. Keep TCP distinct from the other transports and
+            # reject earlier peers before destination writes.
+            topology_version=5 if protocol == "tcp" else 4,
             pcp_size=getattr(parallel, "prefill_context_parallel_size", 1),
             dcp_size=getattr(parallel, "decode_context_parallel_size", 1),
             model_id=str(model.model),
@@ -555,15 +554,14 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         self._sources: dict[str, _Session] = {}
         self._source_lock = threading.Lock()
         self._finished_send: set[str] = set()
-        self._finished_recv: set[str] = set()
         self._failed_recv: set[str] = set()
         self._result_lock = threading.Lock()
         self._remote_workers: dict[tuple[str, str, int], dict[int, dict[int, str]]] = {}
         self._receive_futures: dict[str, Future[None]] = {}
         self._receive_lock = threading.Lock()
         self._encoder = msgspec.msgpack.Encoder()
-        self._request_decoder = msgspec.msgpack.Decoder(PDTransferRequest)
-        self._response_decoder = msgspec.msgpack.Decoder(PDTransferResponse)
+        self._request_decoder = msgspec.msgpack.Decoder(KVTransferRequest)
+        self._response_decoder = msgspec.msgpack.Decoder(KVTransferResponse)
         self._ctx = zmq.asyncio.Context()
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(
@@ -572,21 +570,22 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         self._loop_thread.start()
         self._listener_future = None
         self._serve_tasks: set[asyncio.Task[None]] = set()
-        self._closing = False
         self._send_pool = ThreadPoolExecutor(
-            max_workers=max(1, int(self.extra.get("num_workers", 10))),
+            max_workers=max_workers,
             thread_name_prefix="mtsc-te-write",
             initializer=lambda: current_platform.set_device(self.device_id),
         )
         self._bootstrap = None
-        if self.is_producer and _launch_bootstrap(config):
-            _, port = _bootstrap_address(config)
-            self._bootstrap = BootstrapServer(port)
-            self._bootstrap.start()
+        if self.is_producer:
+            host, port = _bootstrap_address(config)
+            self._registration_url = make_zmq_path("http", host, port) + "/register"
+            if _launch_bootstrap(config):
+                self._bootstrap = BootstrapServer(port)
+                self._bootstrap.start()
         self._source_changed = threading.Condition(self._source_lock)
         self._retired: set[str] = set()
         self._prepared: dict[str, str] = {}
-        self._send_events: dict[str, SendEvent] = {}
+        self._pending_sends: set[str] = set()
         self._recv_events: dict[str, RecvEvent] = {}
         self._send_failures: dict[str, str] = {}
         self._invalid: dict[str, set[int]] = {}
@@ -594,7 +593,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         self._closed = False
 
     def _check_open(self) -> None:
-        if self._closed or self._closing:
+        if self._closed:
             raise RuntimeError("KV transfer is closed")
 
     def register(self, kv_caches) -> None:
@@ -727,7 +726,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         self._check_open()
         if not self._registered:
             raise RuntimeError("Register KV memory before send")
-        if event.request_id in self._send_events:
+        if event.request_id in self._pending_sends:
             raise ValueError("Uncollected send for request")
         self.prepare(event.request_id, event.transfer_id)
         with self._source_lock:
@@ -735,7 +734,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             source.block_ids = event.block_ids
             source.published = True
             source.expires_at = time.monotonic() + self.timeout
-            self._send_events[event.request_id] = event
+            self._pending_sends.add(event.request_id)
             source.ready.set()
             if source.expected > 0 and source.terminal >= source.expected:
                 self._retire_locked(source)
@@ -785,7 +784,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         failed = []
         coverage = {}
         try:
-            if self._closing:
+            if self._closed:
                 raise RuntimeError("P transfer is closing")
             request = self._request_decoder.decode(payload)
             if request.schema != self.schema:
@@ -818,12 +817,12 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 request.tp_rank,
                 request.pp_rank,
             )
-            for decode_id, (transfer_id, _) in request.requests.items():
+            for transfer_id, (request_id, _) in request.requests.items():
                 descriptor = (
-                    decode_id,
+                    request_id,
                     request.hostname,
                     request.rpc_port,
-                    tuple(tuple(ids) for ids in request.requests[decode_id][1]),
+                    tuple(tuple(ids) for ids in request.requests[transfer_id][1]),
                     tuple(request.region_base_addresses),
                     tuple(request.block_lengths),
                     tuple(request.kv_block_lengths),
@@ -862,32 +861,34 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                         else:
                             owner = False
                 if source is None:
-                    failed.append(decode_id)
+                    failed.append(transfer_id)
                     continue
                 if owner:
-                    ok, covered = await self._write_target(source, request, decode_id)
+                    ok, covered = await self._write_target(source, request, transfer_id)
                     previous.set_result((ok, covered))
                 else:
                     # A duplicate pull joins the original fence. It must never
                     # write again or increment source completion twice.
                     ok, covered = await asyncio.shield(previous)
                 if ok:
-                    completed.append(decode_id)
-                    coverage[decode_id] = sorted(covered)
+                    completed.append(transfer_id)
+                    coverage[transfer_id] = sorted(covered)
                 else:
-                    failed.append(decode_id)
-            response = PDTransferResponse(
-                PDResponseStatus.FINISH,
+                    failed.append(transfer_id)
+            response = KVTransferResponse(
+                KVTransferStatus.COMPLETE,
                 completed or None,
                 failed or None,
                 "transfer failed" if failed else None,
                 coverage or None,
             )
         except Exception as exc:  # noqa: BLE001 - control response boundary
-            response = PDTransferResponse(PDResponseStatus.ERROR, error=str(exc))
+            response = KVTransferResponse(
+                KVTransferStatus.FAILED, error_message=str(exc)
+            )
         await socket.send_multipart((identity, self._encoder.encode(response)))
 
-    async def _write_target(self, source, request, decode_id):
+    async def _write_target(self, source, request, transfer_id):
         ready = await asyncio.to_thread(source.ready.wait, self.timeout)
         with self._source_lock:
             active = (
@@ -898,7 +899,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         ok, covered = False, set()
         try:
             if active:
-                ok, covered = await self._write_one(decode_id, source, request)
+                ok, covered = await self._write_one(transfer_id, source, request)
         except Exception as exc:  # noqa: BLE001 - native WRITE result boundary
             logger.warning(
                 "MTSC Transfer WRITE failed: request_id=%s transfer_id=%s error=%s",
@@ -947,7 +948,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                         self._send_failures.pop(request_id, None),
                     )
                 )
-                self._send_events.pop(request_id, None)
+                self._pending_sends.discard(request_id)
                 self._prepared.pop(request_id, None)
             self._finished_send.clear()
             for request_id in terminal:
@@ -965,7 +966,6 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                         "Transfer receive failed" if failed else None,
                     )
                 )
-                self._finished_recv.discard(request_id)
                 self._failed_recv.discard(request_id)
                 self._retired.add(event.transfer_id)
         with self._receive_lock:
@@ -991,7 +991,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 self._retire_locked(source, report=False)
             self._retired.add(transfer_id)
             self._prepared.pop(request_id, None)
-            self._send_events.pop(request_id, None)
+            self._pending_sends.discard(request_id)
         with self._result_lock:
             self._finished_send.discard(request_id)
             self._send_failures.pop(request_id, None)
@@ -1015,7 +1015,6 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         if self._closed:
             return
         self._closed = True
-        self._closing = True
         with self._source_lock:
             for source in self._sources.values():
                 source.abort = True
@@ -1077,18 +1076,16 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 self._registered_storage = []
         self._sources.clear()
         self._prepared.clear()
-        self._send_events.clear()
+        self._pending_sends.clear()
         self._recv_events.clear()
         self._invalid.clear()
         self._retired.clear()
         self._finished_send.clear()
-        self._finished_recv.clear()
         self._failed_recv.clear()
         self._send_failures.clear()
         self.kv_caches.clear()
 
     async def _register_worker(self, side_port: int) -> None:
-        host, port = _bootstrap_address(self.config)
         payload = WorkerRegistration(
             engine_id=self.engine_id,
             dp_rank=self.dp_rank,
@@ -1098,18 +1095,19 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             pp_size=self.pp_size,
             address=make_zmq_path("tcp", self.hostname, side_port),
         )
-        url = make_zmq_path("http", host, port) + "/register"
         # Bootstrap is an internal control-plane hop. Never route it through
         # process-wide HTTP(S)_PROXY settings.
         async with httpx.AsyncClient(trust_env=False) as client:
             for _ in range(120):
                 try:
-                    response = await client.post(url, json=payload.model_dump())
+                    response = await client.post(
+                        self._registration_url, json=payload.model_dump()
+                    )
                     response.raise_for_status()
                     return
                 except httpx.ConnectError:
                     await asyncio.sleep(0.25)
-        raise RuntimeError(f"MTSC bootstrap unavailable: {url}")
+        raise RuntimeError(f"MTSC bootstrap unavailable: {self._registration_url}")
 
     async def _listen(self, ready: threading.Event) -> None:
         socket = self._ctx.socket(zmq.ROUTER)
@@ -1131,7 +1129,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             socket.close(linger=0)
 
     def _aligned_regions(
-        self, request: PDTransferRequest
+        self, request: KVTransferRequest
     ) -> list[tuple[TransferRegion, TransferRegion, int]]:
         remote = [
             TransferRegion(name, index, group, base, block, kv)
@@ -1209,9 +1207,9 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             raise ValueError("P/D KV page lengths do not match their TP ratio")
 
     async def _write_one(
-        self, decode_id: str, source: _Session, request: PDTransferRequest
+        self, transfer_id: str, source: _Session, request: KVTransferRequest
     ) -> tuple[bool, set[int]]:
-        _, destination_groups = request.requests[decode_id]
+        _, destination_groups = request.requests[transfer_id]
         if not any(destination_groups):
             return True, set()
         if len(source.block_ids) != len(destination_groups):
@@ -1286,7 +1284,9 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         session = f"{request.hostname}:{request.rpc_port}"
         ret = await self._write_buffers(session, src, dst, sizes)
         if ret != 0:
-            logger.warning("MTSC TE WRITE failed: request_id=%s ret=%s", decode_id, ret)
+            logger.warning(
+                "MTSC TE WRITE failed: transfer_id=%s ret=%s", transfer_id, ret
+            )
         return ret == 0, covered if ret == 0 else set()
 
     async def _write_buffers(self, session, src, dst, sizes) -> int:
@@ -1349,15 +1349,15 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
 
     def _validate_coverage(
         self,
-        request_id: str,
+        transfer_id: str,
         block_ids: list[list[int]],
-        responses: list[PDTransferResponse],
+        responses: list[KVTransferResponse],
         expected: int,
     ) -> None:
         """Require every data-carrying D region to have exactly one TP fan-in."""
         coverage: Counter[int] = Counter()
         for response in responses:
-            coverage.update((response.covered_regions or {}).get(request_id, []))
+            coverage.update((response.covered_regions or {}).get(transfer_id, []))
         required = {
             index
             for index, region in enumerate(self.regions)
@@ -1398,7 +1398,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 addresses.extend(pp_map[rank] for rank in pp_ranks)
             if not addresses:
                 raise RuntimeError("No matching P workers in bootstrap response")
-            request = PDTransferRequest(
+            request = KVTransferRequest(
                 hostname=self.hostname,
                 rpc_port=self.rpc_port,
                 tp_size=self.tp_size,
@@ -1406,7 +1406,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 pp_size=self.pp_size,
                 pp_rank=self.pp_rank,
                 schema=self.schema,
-                requests={request_id: (transfer_id, block_ids)},
+                requests={transfer_id: (request_id, block_ids)},
                 region_base_addresses=[region.base_address for region in self.regions],
                 block_lengths=[region.block_length for region in self.regions],
                 kv_block_lengths=[region.kv_block_length for region in self.regions],
@@ -1421,7 +1421,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             )
             payload = self._encoder.encode(request)
 
-            async def call(address: str) -> PDTransferResponse:
+            async def call(address: str) -> KVTransferResponse:
                 socket = self._ctx.socket(zmq.DEALER)
                 socket.setsockopt(zmq.LINGER, 0)
                 socket.connect(address)
@@ -1446,9 +1446,9 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 raise RuntimeError(f"P peer request failed: {errors[0]}")
             responses = outcomes
             failed = any(
-                response.status != PDResponseStatus.FINISH
-                or request_id not in (response.completed or [])
-                or request_id in (response.failed or [])
+                response.status != KVTransferStatus.COMPLETE
+                or transfer_id not in (response.completed_transfer_ids or [])
+                or transfer_id in (response.failed_transfer_ids or [])
                 for response in responses
             )
             if not failed and any(block_ids):
@@ -1459,7 +1459,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                     self.tp_size, self.topology.total_num_kv_heads, self.schema.is_mla
                 )
                 expected = max(1, p_shards // d_shards)
-                self._validate_coverage(request_id, block_ids, responses, expected)
+                self._validate_coverage(transfer_id, block_ids, responses, expected)
             if not failed:
                 self.reformat_npu_blocks(block_ids, len(workers))
         except Exception as exc:  # noqa: BLE001 - async transport boundary
@@ -1467,8 +1467,9 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             logger.warning(
                 "MTSC D pull failed: request_id=%s error=%s", request_id, exc
             )
-        with self._result_lock:
-            (self._failed_recv if failed else self._finished_recv).add(request_id)
+        if failed:
+            with self._result_lock:
+                self._failed_recv.add(request_id)
 
     def _submit_receive(
         self,
@@ -1515,5 +1516,4 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                     exc,
                 )
         with self._result_lock:
-            self._finished_recv.difference_update(request_ids)
             self._failed_recv.difference_update(request_ids)

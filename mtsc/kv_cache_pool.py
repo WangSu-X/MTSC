@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import inspect
 import json
+import math
 import os
 import socket
 import threading
@@ -45,7 +46,6 @@ from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import BlockHash, resolve_kv_cache_block_sizes
 
-from .protocol import StoreLoadSpec, StoreRequest
 from .utils import (
     BlockIds,
     KVLayoutAdapter,
@@ -476,6 +476,8 @@ def store_topology_namespace(
     extra = vllm_config.kv_transfer_config.kv_connector_extra_config
     user_prefix = str(extra.get("cache_prefix", ""))
     enabled = extra.get("mtsc_store_topology_namespace", True)
+    if enabled is None:
+        enabled = True
     if isinstance(enabled, str):
         enabled = enabled.strip().lower() not in {"0", "false", "no", "off"}
     if not enabled:
@@ -511,6 +513,7 @@ class StoreConfig:
 
 
 def lookup_rpc_path(vllm_config: VllmConfig) -> str:
+    """Use lookup_rpc_port as an IPC path identifier, not a TCP port."""
     assert vllm_config.kv_transfer_config is not None
     extra = vllm_config.kv_transfer_config.kv_connector_extra_config
     port = extra.get("lookup_rpc_port", 0)
@@ -525,13 +528,20 @@ class StoreLookupClient:
     """Scheduler-side async lookup client with per-request futures."""
 
     def __init__(self, vllm_config: VllmConfig) -> None:
-        self._ctx = zmq.Context()  # type: ignore[attr-defined]
         assert vllm_config.kv_transfer_config is not None
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config
         self._path = lookup_rpc_path(vllm_config)
-        self._timeout_ms = max(
-            1, int(float(extra.get("mtsc_store_lookup_timeout_seconds", 10.0)) * 1000)
-        )
+        timeout = float(extra.get("mtsc_store_lookup_timeout_seconds", 10.0))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError(
+                "mtsc_store_lookup_timeout_seconds must be finite and positive"
+            )
+        if timeout > (2**31 - 1) / 1000:
+            raise ValueError(
+                "mtsc_store_lookup_timeout_seconds exceeds ZMQ's millisecond limit"
+            )
+        self._timeout_ms = max(1, int(timeout * 1000))
+        self._ctx = zmq.Context()  # type: ignore[attr-defined]
         self._socket = self._make_socket()
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="mtsc-lookup"
@@ -706,6 +716,16 @@ class _LoadOutcome:
     invalid: set[int]
 
 
+@dataclass(slots=True)
+class _LoadState:
+    """One submitted load: immutable event, I/O fence and timeout tracking."""
+
+    event: LoadEvent
+    future: Future[_LoadOutcome]
+    started_at: float
+    timed_out: bool = False
+
+
 class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
     """Own Mooncake memory registration, lookup and fenced load/save tasks."""
 
@@ -714,7 +734,6 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         self._registered = False
         self._task_lock = threading.RLock()
         self._save_states: dict[str, _SaveState] = {}
-        self._load_events: dict[str, LoadEvent] = {}
         self._invalid: dict[str, set[int]] = {}
         try:
             from mooncake.store import MooncakeDistributedStore, ReplicateConfig
@@ -725,22 +744,27 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         model = config.model_config
         parallel = config.parallel_config
         extra = config.kv_transfer_config.kv_connector_extra_config
-        self.kv_role = config.kv_transfer_config.kv_role
+        recv_workers = max(1, int(extra.get("mtsc_store_load_workers", 2)))
+        self.load_timeout = float(extra.get("mtsc_store_get_timeout_seconds", 180.0))
+        if not math.isfinite(self.load_timeout) or self.load_timeout <= 0:
+            raise ValueError(
+                "mtsc_store_get_timeout_seconds must be finite and positive"
+            )
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.pp_size = parallel.pipeline_parallel_size
-        self.pp_rank = (parallel.rank // self.tp_size) % self.pp_size
+        pp_size = parallel.pipeline_parallel_size
+        pp_rank = (parallel.rank // self.tp_size) % pp_size
         pcp = get_pcp_group()
         dcp = get_dcp_group()
-        self.pcp_size, self.pcp_rank = (
+        pcp_size, pcp_rank = (
             pcp.world_size,
             pcp.rank_in_group if pcp.world_size > 1 else 0,
         )
-        self.dcp_size, self.dcp_rank = (
+        dcp_size, dcp_rank = (
             dcp.world_size,
             dcp.rank_in_group if dcp.world_size > 1 else 0,
         )
-        self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
+        block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, config
         )
         if config.cache_config.num_gpu_blocks is None:
@@ -752,18 +776,18 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             use_mla=model.use_mla,
             total_num_kv_heads=model.get_total_num_kv_heads(),
             tp_size=self.tp_size,
-            dcp_size=self.dcp_size,
+            dcp_size=dcp_size,
             tp_rank=self.tp_rank,
         )
 
         groups = list(kv_cache_config.kv_cache_groups)
-        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
+        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != block_size:
             group = groups[0]
             groups = [
                 dataclasses.replace(
                     group,
                     kv_cache_spec=dataclasses.replace(
-                        group.kv_cache_spec, block_size=self.block_size
+                        group.kv_cache_spec, block_size=block_size
                     ),
                 )
             ]
@@ -775,7 +799,7 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             else False
         )
         coordinator_kwargs: dict[str, Any] = {
-            "scheduler_block_size": self.block_size,
+            "scheduler_block_size": block_size,
             "hash_block_size": self.hash_block_size,
             "use_eagle": use_eagle,
         }
@@ -791,18 +815,18 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             config,
             groups,
             tp_size=self.tp_size,
-            pp_size=self.pp_size,
-            pcp_size=self.pcp_size,
-            dcp_size=self.dcp_size,
-            block_size=self.block_size,
+            pp_size=pp_size,
+            pcp_size=pcp_size,
+            dcp_size=dcp_size,
+            block_size=block_size,
             hash_block_size=self.hash_block_size,
         )
         metadata = KeyMetadata(
             model_name=model.model.rstrip("/").split("/")[-1],
             tp_rank=key_tp_rank,
-            pcp_rank=self.pcp_rank,
-            dcp_rank=self.dcp_rank,
-            pp_rank=self.pp_rank,
+            pcp_rank=pcp_rank,
+            dcp_rank=dcp_rank,
+            pp_rank=pp_rank,
         )
         self.databases = [
             ChunkedTokenDatabase(
@@ -812,7 +836,9 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             )
             for i, group in enumerate(groups)
         ]
-        self._init_lookup_prefixes(num_kv_heads)
+        self._init_lookup_prefixes(
+            num_kv_heads, pp_size=pp_size, pcp_size=pcp_size, dcp_size=dcp_size
+        )
 
         cfg = StoreConfig.load()
         self.store = MooncakeDistributedStore()
@@ -833,10 +859,6 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         if preferred is not None:
             self.replicate_config.preferred_segment = preferred
 
-        recv_workers = max(1, int(extra.get("mtsc_store_load_workers", 2)))
-        self.load_timeout = float(extra.get("mtsc_store_get_timeout_seconds", 180.0))
-        if self.load_timeout <= 0:
-            raise ValueError("mtsc_store_get_timeout_seconds must be positive")
         # PUTs use one ordered lane; GETs remain parallel.
         save_workers = 1
         self._load_pool = ThreadPoolExecutor(
@@ -845,10 +867,7 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         self._save_pool = ThreadPoolExecutor(
             max_workers=save_workers, thread_name_prefix="mtsc-store-put"
         )
-        self._loads: dict[str, Future[_LoadOutcome]] = {}
-        self._load_requests: dict[str, StoreRequest] = {}
-        self._load_started_at: dict[str, float] = {}
-        self._load_timed_out: set[str] = set()
+        self._loads: dict[str, _LoadState] = {}
         self._lookup_server = (
             StoreLookupServer(self, config) if parallel.rank == 0 else None
         )
@@ -856,7 +875,7 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         self.kv_caches = {}
         self.npu_kv_nz = npu_kv_nz_enabled(config)
         self.topology = SimpleNamespace(
-            block_size=self.block_size,
+            block_size=block_size,
             is_mla=config.model_config.use_mla,
             total_num_kv_heads=config.model_config.get_total_num_kv_heads(),
         )
@@ -986,35 +1005,20 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
     def load(self, event: LoadEvent) -> None:
         self._validate(event, event.start_load, event.end_load)
         with self._task_lock:
-            if (
-                event.request_id in self._load_events
-                or event.request_id in self._invalid
-            ):
+            if event.request_id in self._loads or event.request_id in self._invalid:
                 raise ValueError(f"Uncollected load for {event.request_id}")
-            request = StoreRequest(
-                event.request_id,
-                event.end_load,
-                event.block_ids,
-                event.block_hashes,
-                load=StoreLoadSpec(event.start_load, event.end_load, enabled=True),
-            )
-            self._load_events[event.request_id] = event
-            self._load_requests[event.request_id] = request
-            self._load_started_at[event.request_id] = time.monotonic()
-            self._loads[event.request_id] = self._load_pool.submit(
-                self._load_work,
-                event,
-                request,
-            )
+            started_at = time.monotonic()
+            future = self._load_pool.submit(self._load_work, event)
+            self._loads[event.request_id] = _LoadState(event, future, started_at)
 
-    def _load_work(self, event: LoadEvent, request: StoreRequest) -> _LoadOutcome:
+    def _load_work(self, event: LoadEvent) -> _LoadOutcome:
         error = None
         try:
-            failed = self._load(request)
+            failed = self._load(event)
             if failed:
                 error = "Mooncake load missed or failed"
         except Exception as exc:  # noqa: BLE001 - I/O result boundary
-            failed = self._request_load_blocks(request)
+            failed = self._request_load_blocks(event)
             error = str(exc)
         actual = self._loaded_prefix(event, failed)
         try:
@@ -1082,18 +1086,6 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                 state.pending.append(event)
             self._advance_save(state)
 
-    def _run_save(self, event: SaveEvent) -> None:
-        request = StoreRequest(
-            event.request_id,
-            event.end_save,
-            event.block_ids,
-            event.block_hashes,
-            save=True,
-            save_from=event.start_save,
-            prompt_tokens=event.prompt_tokens,
-        )
-        self._save(request, event.ready_event)
-
     def _advance_save(self, state: _SaveState) -> None:
         if state.running is not None:
             if not state.running.done():
@@ -1105,7 +1097,7 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             state.running = None
         if state.pending:
             event = state.pending.pop(0)
-            state.running = self._save_pool.submit(self._run_save, event)
+            state.running = self._save_pool.submit(self._save, event)
 
     def _loaded_prefix(self, event: LoadEvent, failed: set[int]) -> int:
         actual = event.end_load
@@ -1131,40 +1123,30 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
     def poll(self) -> PoolPollResult:
         result = PoolPollResult()
         with self._task_lock:
-            for request_id, event in list(self._load_events.items()):
-                future = self._loads[request_id]
-                if (
-                    not future.done()
-                    and time.monotonic() - self._load_started_at[request_id]
-                    >= self.load_timeout
-                ):
-                    self._load_timed_out.add(request_id)
+            for request_id, state in list(self._loads.items()):
+                event, future = state.event, state.future
                 if not future.done():
+                    if time.monotonic() - state.started_at >= self.load_timeout:
+                        state.timed_out = True
                     continue
                 try:
                     outcome = future.result()
                 except Exception as exc:  # noqa: BLE001 - background future boundary
                     outcome = _LoadOutcome(
-                        event.start_load,
-                        str(exc),
-                        self._request_load_blocks(self._load_requests[request_id]),
+                        event.start_load, str(exc), self._request_load_blocks(event)
                     )
-                if request_id in self._load_timed_out:
+                if state.timed_out:
                     outcome = _LoadOutcome(
                         event.start_load,
                         "Mooncake load timed out (I/O fenced)",
-                        self._request_load_blocks(self._load_requests[request_id]),
+                        self._request_load_blocks(event),
                     )
                 if outcome.invalid:
                     self._invalid[request_id] = outcome.invalid
                 result.loads.append(
                     LoadResult(request_id, outcome.loaded_tokens, outcome.error)
                 )
-                del self._load_events[request_id]
-                self._loads.pop(request_id)
-                self._load_requests.pop(request_id)
-                self._load_started_at.pop(request_id)
-                self._load_timed_out.discard(request_id)
+                del self._loads[request_id]
             for request_id, state in list(self._save_states.items()):
                 self._advance_save(state)
                 if state.running is None and not state.pending:
@@ -1195,7 +1177,6 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                         # Failed persistence does not invalidate source KV.
                         logger.debug("MTSC PUT failed during preemption: %s", exc)
             self._fence_loads({request_id})
-            self._load_events.pop(request_id, None)
             self._invalid.pop(request_id, None)
 
     def wait_for_all_saves(self) -> None:
@@ -1227,28 +1208,26 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         if store is not None:
             store.close()
         self._save_states.clear()
-        self._load_events.clear()
         self._loads.clear()
-        self._load_requests.clear()
-        self._load_started_at.clear()
-        self._load_timed_out.clear()
         self._invalid.clear()
         self.kv_caches.clear()
 
-    def _init_lookup_prefixes(self, num_kv_heads: int) -> None:
-        if self.dcp_size > 1:
+    def _init_lookup_prefixes(
+        self, num_kv_heads: int, *, pp_size: int, pcp_size: int, dcp_size: int
+    ) -> None:
+        if dcp_size > 1:
             ranks = tuple(
-                (tp, pcp, tp % self.dcp_size, pp)
-                for pcp in range(self.pcp_size)
+                (tp, pcp, tp % dcp_size, pp)
+                for pcp in range(pcp_size)
                 for tp in range(self.tp_size)
-                for pp in range(self.pp_size)
+                for pp in range(pp_size)
             )
         else:
             ranks = tuple(
                 (tp, pcp, 0, pp)
-                for pcp in range(self.pcp_size)
+                for pcp in range(pcp_size)
                 for tp in range(min(self.tp_size, num_kv_heads))
-                for pp in range(self.pp_size)
+                for pp in range(pp_size)
             )
         self._lookup_prefixes = tuple(
             tuple(
@@ -1327,21 +1306,17 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                 continue
             yield start, end, self._database_key(database, value)
 
-    def _request_load_blocks(self, request: StoreRequest) -> set[int]:
-        assert request.load is not None
+    def _request_load_blocks(self, event: LoadEvent) -> set[int]:
         result: set[int] = set()
-        for group, database in zip(request.block_ids, self.databases, strict=True):
-            start = cdiv(request.load.local_tokens, database.block_size)
-            end = min(cdiv(request.load.store_tokens, database.block_size), len(group))
+        for group, database in zip(event.block_ids, self.databases, strict=True):
+            start = cdiv(event.start_load, database.block_size)
+            end = min(cdiv(event.end_load, database.block_size), len(group))
             result.update(block for block in group[start:end] if block >= 0)
         return result
 
-    def _load(self, request: StoreRequest) -> set[int]:
-        assert request.load is not None
+    def _load(self, event: LoadEvent) -> set[int]:
         failed: set[int] = set()
-        masks = self.coordinator.load_mask(
-            request.block_hashes, request.load.store_tokens
-        )
+        masks = self.coordinator.load_mask(event.block_hashes, event.end_load)
         keys: list[str] = []
         addresses: list[list[int]] = []
         sizes: list[list[int]] = []
@@ -1349,15 +1324,15 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         for group_index, database in enumerate(self.databases):
             for start, end, key in self._process_tokens(
                 database,
-                request.load.store_tokens,
-                request.block_hashes,
-                request.load.local_tokens,
+                event.end_load,
+                event.block_hashes,
+                event.start_load,
             ):
                 chunk = start // database.block_size
                 if chunk >= len(masks[group_index]) or not masks[group_index][chunk]:
                     continue
                 address, size, block_id = database.prepare_value(
-                    start, end, request.block_ids[group_index]
+                    start, end, event.block_ids[group_index]
                 )
                 keys.append(key)
                 addresses.append(address)
@@ -1375,21 +1350,21 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                 failed.update(block_ids)
                 logger.warning(
                     "MTSC Store GET failed: request_id=%s error=%s",
-                    request.request_id,
+                    event.request_id,
                     exc,
                 )
         return failed
 
-    def _save(self, request: StoreRequest, event: KVReadyEvent | None) -> None:
+    def _save(self, event: SaveEvent) -> None:
         token_count = (
-            request.token_count
+            event.end_save
             // self.coordinator.lcm_block_size
             * self.coordinator.lcm_block_size
         )
-        save_from = request.save_from
+        save_from = event.start_save
         if token_count <= save_from:
             return
-        masks = self._store_masks(token_count, save_from, request.prompt_tokens)
+        masks = self._store_masks(token_count, save_from, event.prompt_tokens)
         keys: list[str] = []
         addresses: list[list[int]] = []
         sizes: list[list[int]] = []
@@ -1398,14 +1373,14 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             for start, end, key in self._process_tokens(
                 database,
                 token_count,
-                request.block_hashes,
+                event.block_hashes,
                 save_from,
                 chunk_mask=masks[group_index],
                 put_step=self.put_step,
                 put_step_rank=phase,
             ):
                 address, size, _ = database.prepare_value(
-                    start, end, request.block_ids[group_index]
+                    start, end, event.block_ids[group_index]
                 )
                 keys.append(key)
                 addresses.append(address)
@@ -1416,8 +1391,8 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         missing = [index for index, status in enumerate(exists) if status != 1]
         if not missing:
             return
-        if event is not None:
-            event.synchronize()
+        if event.ready_event is not None:
+            event.ready_event.synchronize()
         result = self.store.batch_put_from_multi_buffers(
             [keys[i] for i in missing],
             [addresses[i] for i in missing],
@@ -1426,17 +1401,17 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         )
         if any(status < 0 for status in result):
             logger.warning(
-                "MTSC Store PUT partially failed: request_id=%s", request.request_id
+                "MTSC Store PUT partially failed: request_id=%s", event.request_id
             )
             raise RuntimeError("Mooncake Store PUT partially failed")
 
     def _fence_loads(self, request_ids: set[str]) -> None:
         """Fence Store writes before a preempted request's blocks are reused."""
         for request_id in request_ids:
-            future = self._loads.pop(request_id, None)
-            if future is not None and not future.cancel():
+            state = self._loads.pop(request_id, None)
+            if state is not None and not state.future.cancel():
                 try:
-                    future.result()
+                    state.future.result()
                 except Exception as exc:  # noqa: BLE001 - I/O fence
                     logger.warning(
                         "MTSC Store GET failed while fencing preemption: "
@@ -1444,6 +1419,3 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                         request_id,
                         exc,
                     )
-            self._load_requests.pop(request_id, None)
-            self._load_started_at.pop(request_id, None)
-            self._load_timed_out.discard(request_id)

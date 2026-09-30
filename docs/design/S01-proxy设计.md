@@ -382,7 +382,7 @@ P 请求的目的是生成 prompt KV，不向客户端返回正常生成结果�
 - 仅在原请求已包含 `max_completion_tokens` 时，才将它覆盖为 `1`；
 - 完整替换原有 `kv_transfer_params`，避免客户端注入与本次路由冲突的关联信息。
 
-P 不需要 D hostname、TE port 或 destination block IDs。这些内存元数据稍后由 D Connector 通过 MTSC `PDTransferRequest` 发送给 P listener。
+P 不需要 D hostname、TE port 或 destination block IDs。这些内存元数据稍后由 D Connector 通过 MTSC `KVTransferRequest` 发送给 P listener。
 
 上述 JSON 以 `/v1/completions` 为例；`/v1/chat/completions` 使用原请求的 `messages` 字段，不会生成名为 `prompt_or_messages` 的实际 wire field。
 

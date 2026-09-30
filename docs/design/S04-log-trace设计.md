@@ -280,8 +280,8 @@ MTSC 不增加 `attempt_id`。Proxy 不重试；客户端重试会产生新的 `
 
 ```json
 {
-  "local_prefix_tokens": 64,
-  "store_candidate_tokens": 256,
+  "local_tokens": 64,
+  "pool_tokens": 256,
   "actual_store_tokens": 240,
   "target_external_tokens": 512
 }
@@ -290,8 +290,8 @@ MTSC 不增加 `attempt_id`。Proxy 不重试；客户端重试会产生新的 `
 对应简写关系：
 
 ```text
-L = local_prefix_tokens
-H = store_candidate_tokens
+L = local_tokens
+H = pool_tokens
 A = actual_store_tokens
 T = target_external_tokens
 ```

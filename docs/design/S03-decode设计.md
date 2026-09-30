@@ -81,7 +81,7 @@ PD 路径允许 P/D TP size 互为整数倍，并根据 TP fan-in/fan-out、PP l
 
 #### 2.1.5 零长度握手
 
-当 Store 已覆盖到 `T` 时，D 仍向 P 发送 block list 为空的 `PDTransferRequest` 并等待 ACK。这使 P 能够终止对应 source session 并释放延迟 blocks，也让部分命中和全命中共用同一终态协议。
+当 Store 已覆盖到 `T` 时，D 仍向 P 发送 block list 为空的 `KVTransferRequest` 并等待 ACK。这使 P 能够终止对应 source session 并释放延迟 blocks，也让部分命中和全命中共用同一终态协议。
 
 #### 2.1.6 Late-write Fence
 
@@ -102,20 +102,20 @@ flowchart LR
         W --> PD[MooncakeKVTransfer]
         LC --> LS[StoreLookupServer]
         LS --> SI
-        W --> SM[_DLoadState]
+        W --> SM[_TransferState]
     end
 
     SI <-->|lookup and GET| MS[Mooncake Store]
     PD -->|exact engine and DP query| B[P Bootstrap]
     B -->|P TP and PP listeners| PD
-    PD -->|PDTransferRequest with D regions| P[P MooncakeKVTransfer]
+    PD -->|KVTransferRequest with D regions| P[P MooncakeKVTransfer]
     P -->|TE WRITE KV| PD
-    P -->|PDTransferResponse| PD
+    P -->|KVTransferResponse| PD
 ```
 
 该架构的主链路是：
 
-1. **计划阶段**：`MTSCScheduler` 从本地 prefix `L` 出发查询 Store，计算 `H/T`，一次性绑定 `[L,T)` blocks 并构造 `DTwoStageLoadPlan`。
+1. **计划阶段**：`MTSCScheduler` 从本地 prefix `L` 出发查询 Store，计算 `H/T`，一次性绑定 `[L,T)` blocks 并构造 `KVTransferPlan`。
 2. **Store 阶段**：`MTSCWorker` 通过 `MooncakeKVCachePool` 加载 `[L,H)`，根据 per-block 结果固化 `A`。
 3. **PD 阶段**：`MooncakeKVTransfer` 精确查询 Proxy 选定的 P engine/DP，将 `[A,T)` destination metadata 发给所有必需 P workers，然后等待 TE WRITE terminal responses。
 4. **完成阶段**：Worker 聚合 Store/PD 结果与 invalid blocks，只在整个两阶段 load 终止时返回 `finished_recving`。
@@ -126,13 +126,13 @@ flowchart LR
 |---|---|---|
 | `MTSCConnector` | 作为 vLLM 入口，转发 scheduler/worker hooks 并暴露 load errors | 不自身推进两阶段状态 |
 | `MTSCScheduler` | 查询 Store，计算 `L/H/T`，绑定全部 blocks，构造不可变 load plan | 不根据 GET 结果推断 `A` |
-| `DTwoStageLoadPlan` | 保存两阶段计划、block 映射、group size 和 P 连接参数 | 不保存可变运行状态 |
-| `MTSCWorker` | 消费 plan，严格串行 Store/PD，维护 `_DLoadState`，收集 invalid blocks | 不直接修改 vLLM request status |
+| `KVTransferPlan` | 保存两阶段计划、block 映射、group size 和 P 连接参数 | 不保存可变运行状态 |
+| `MTSCWorker` | 消费 plan，严格串行 Store/PD，维护 `_TransferState`，收集 invalid blocks | 不直接修改 vLLM request status |
 | `StoreLookupClient/Server` | 返回所有必需 Store shards 都存在的最长连续前缀 `H` | 不代表 GET 必然成功 |
 | `MooncakeKVCachePool` | topology-aware namespace、异步 GET/PUT、timeout fence 和 block 级错误 | 不转换不同 Store topology |
 | `MooncakeKVTransfer` | P worker 发现、TP/PP mapping、request/response、region coverage 校验 | 不在 `A` 固化前发送 suffix |
-| `_DLoadState` | 保存当前 stage、PD 启动时间和 suffix blocks | 不跨 request 共享状态 |
-| `PDTransferSchema/Request/Response` | 定义 P/D layout 不变式、D destination metadata 和 P terminal result | 不承载 KV bytes |
+| `_TransferState` | 保存当前 stage、PD 启动时间和 suffix blocks | 不跨 request 共享状态 |
+| `KVTransferSchema/Request/Response` | 定义 P/D layout 不变式、D destination metadata 和 P terminal result | 不承载 KV bytes |
 
 ### 2.4 类图
 
@@ -152,57 +152,56 @@ classDiagram
     }
     class MTSCScheduler {
         +lookup_client: StoreLookupClient
-        -_decisions: dict
-        -_pending_store: StoreRequest[]
-        -_pending_decode: dict
-        -_tracked: dict
+        -_transfer_decisions: dict
+        -_batch_pool_loads: KVPoolLoadRequest[]
+        -_batch_pool_saves: KVPoolSaveRequest[]
+        -_batch_transfers: KVTransferPlan[]
+        -_tracked_requests: dict
         +get_num_new_matched_tokens(request, computed)
         +update_state_after_alloc(request, blocks, external)
         +build_connector_meta(output) MTSCConnectorMetadata
         +request_finished(request, blocks)
     }
-    class DTwoStageLoadPlan {
+    class KVTransferPlan {
         +request_id: str
         +transfer_id: str
-        +local_prefix_tokens: int
-        +store_candidate_tokens: int
-        +target_prefix_tokens: int
+        +local_tokens: int
+        +pool_tokens: int
+        +target_tokens: int
         +all_block_ids: tuple
         +external_block_ids: tuple
-        +pd_enabled: bool
+        +transfer_enabled: bool
         +wait_for_completion: bool
-        +kv_transfer_params: dict
+        +transfer_params: dict
     }
     class MTSCWorker {
         +pool: KVCachePool
         +transfer: KVTransfer
-        -_decode: dict
-        -_send: dict
+        -_on_transfer: dict
+        -_finished_waits: dict
         -_load_errors: set
         +register_kv_caches(caches)
         +handle_preemptions(metadata)
         +get_finished(finished_ids, metadata)
         +get_block_ids_with_load_errors() set
         -_suffix_blocks(plan, actual) list
-        -_start_pd(state, actual) bool
+        -_start_transfer(state, actual) bool
         +close()
     }
-    class _LookupDecision {
+    class TransferSpec {
         +local_tokens: int
-        +store_tokens: int
+        +pool_tokens: int
         +target_tokens: int
     }
-    class _DLoadState {
-        +plan: DTwoStageLoadPlan
+    class _TransferState {
+        +plan: KVTransferPlan
         +stage: str
-        +created_at: float
-        +pd_started_at: float
         +suffix_block_ids: list
     }
-    class _SendState {
-        +required: SendRequirement
-        +store_done: bool
-        +pd_done: bool
+    class _FinishedWaitState {
+        +requirements: FinishedWait
+        +pool_save_done: bool
+        +kv_transfer_done: bool
         +complete: bool
     }
     class StoreLookupClient {
@@ -221,7 +220,7 @@ classDiagram
         +close()
     }
     class MooncakeKVTransfer {
-        +schema: PDTransferSchema
+        +schema: KVTransferSchema
         +regions: TransferRegion[]
         +recv(event)
         +preempt(request_id)
@@ -232,24 +231,26 @@ classDiagram
         +close()
     }
     class MTSCConnectorMetadata {
-        +store_requests: StoreRequest[]
-        +decode_plans: DTwoStageLoadPlan[]
-        +pd_send_updates: PDSendUpdate[]
-        +send_requirements: dict
+        +pool_loads: KVPoolLoadRequest[]
+        +pool_saves: KVPoolSaveRequest[]
+        +transfer_plans: KVTransferPlan[]
+        +transfer_states: KVTransferSourceState[]
+        +finished_waits: dict
         +finished_request_ids: set
         +preempted_request_ids: set
     }
-    class StoreRequest
-    class PDSendUpdate
-    class SendRequirement
-    class PDTransferSchema
+    class KVPoolLoadRequest
+    class KVPoolSaveRequest
+    class KVTransferSourceState
+    class FinishedWait
+    class KVTransferSchema
     class TransferRegion
 
     MTSCConnector *-- MTSCScheduler : scheduler role
     MTSCConnector *-- MTSCWorker : worker role
     MTSCScheduler *-- StoreLookupClient
-    MTSCScheduler o-- _LookupDecision
-    MTSCScheduler ..> DTwoStageLoadPlan : builds
+    MTSCScheduler o-- TransferSpec
+    MTSCScheduler ..> KVTransferPlan : builds
     MTSCScheduler ..> MTSCConnectorMetadata : builds
     class KVCachePool {
         <<abstract>>
@@ -261,33 +262,34 @@ classDiagram
     MTSCWorker *-- KVTransfer
     KVCachePool <|-- MooncakeKVCachePool
     KVTransfer <|-- MooncakeKVTransfer
-    MTSCWorker o-- _DLoadState
-    MTSCWorker o-- _SendState
+    MTSCWorker o-- _TransferState
+    MTSCWorker o-- _FinishedWaitState
     MTSCWorker ..> MTSCConnectorMetadata : consumes
-    _DLoadState *-- DTwoStageLoadPlan
-    _SendState *-- SendRequirement
-    MTSCConnectorMetadata o-- StoreRequest
-    MTSCConnectorMetadata o-- DTwoStageLoadPlan
-    MTSCConnectorMetadata o-- PDSendUpdate
-    MooncakeKVTransfer *-- PDTransferSchema
+    _TransferState *-- KVTransferPlan
+    _FinishedWaitState *-- FinishedWait
+    MTSCConnectorMetadata o-- KVPoolLoadRequest
+    MTSCConnectorMetadata o-- KVPoolSaveRequest
+    MTSCConnectorMetadata o-- KVTransferPlan
+    MTSCConnectorMetadata o-- KVTransferSourceState
+    MooncakeKVTransfer *-- KVTransferSchema
     MooncakeKVTransfer o-- TransferRegion
 ```
 
-`MTSCConnector` 仍是 vLLM 看到的唯一 Connector 类。当前代码没有独立的 `DRequestState`、`DTwoStageLoadCoordinator`、`PDPullCoordinator`、`IntegrityTracker` 或 `DCompletionAggregator` 类。不可变计划由 `DTwoStageLoadPlan` 表示；worker 运行态由 `_DLoadState` 表示；`MTSCWorker.get_finished()` 直接推进 `STORE_PENDING -> STORE_DONE -> PD_PENDING -> terminal`，并组合 `MooncakeKVCachePool.poll()`、`MooncakeKVTransfer.poll()` 和 `_load_errors` 得到 vLLM completion。
+`MTSCConnector` 仍是 vLLM 看到的唯一 Connector 类。当前代码没有独立的 `DRequestState`、`DTwoStageLoadCoordinator`、`PDPullCoordinator`、`IntegrityTracker` 或 `DCompletionAggregator` 类。不可变计划由 `KVTransferPlan` 表示；worker 运行态由 `_TransferState` 表示；`MTSCWorker.get_finished()` 直接推进 `STORE_PENDING -> STORE_DONE -> TRANSFER_PENDING -> terminal`，并组合 `MooncakeKVCachePool.poll()`、`MooncakeKVTransfer.poll()` 和 `_load_errors` 得到 vLLM completion。
 
 ### 2.5 核心方法
 
 | 方法 | D 侧核心行为 |
 |---|---|
 | `get_num_new_matched_tokens()` | 确定 `L/H/T`；lookup 完成后返回 `T-L`，使 vLLM 一次性分配全部 external blocks |
-| `update_state_after_alloc()` | 将 `[L,T)` 的 blocks、Store 候选区间和 P 参数固化为 `DTwoStageLoadPlan` |
+| `update_state_after_alloc()` | 将 `[L,T)` 的 blocks、Store 候选区间和 P 参数固化为 `KVTransferPlan` |
 | `build_connector_meta()` | 将当前 step 的 Store request、decode plan、save 与 cleanup deltas 下发给 worker |
 | `MooncakeKVCachePool._loaded_prefix()` | 从 GET 的 block 结果计算实际连续终点，以 `LoadResult.loaded_tokens` 返回 `A` |
 | `MTSCWorker._suffix_blocks()` | 将 token 边界 `[A,T)` 投影为每个 KV group 的 destination block list |
-| `MTSCWorker._start_pd()` | 在 Store 终止后启动 `MooncakeKVTransfer.recv()`；无有效 P 时将 suffix 标记为 load error |
+| `MTSCWorker._start_transfer()` | 在 Store 终止后启动 `MooncakeKVTransfer.recv()`；无有效 P 时将 suffix 标记为 load error |
 | `MooncakeKVTransfer.recv()` / `_receive()` | 精确查询 P workers，建立 TP/PP request set，发送 metadata 并聚合 responses |
 | `MooncakeKVTransfer._validate_coverage()` | 校验所有必需 region 的 fan-in coverage，拒绝缺失、重复或越界写入 |
-| `MTSCWorker.get_finished()` | 推进 `STORE_PENDING/STORE_DONE -> PD_PENDING -> terminal`；终态后移除 `_DLoadState`，返回 `finished_recving` 与 invalid blocks |
+| `MTSCWorker.get_finished()` | 推进 `STORE_PENDING/STORE_DONE -> TRANSFER_PENDING -> terminal`；终态后移除 `_TransferState`，返回 `finished_recving` 与 invalid blocks |
 
 ### 2.6 E2E 时序图
 
@@ -304,7 +306,7 @@ sequenceDiagram
     X->>S: D request plus P identity and transfer_id
     S->>S: derive L and T, lookup Store H
     S->>S: allocate destination blocks for L to T once
-    S->>W: DTwoStageLoadPlan
+    S->>W: KVTransferPlan
     alt H greater than L
         W->>ST: GET L to H
         ST-->>W: per-block terminal results
@@ -314,7 +316,7 @@ sequenceDiagram
     end
     W->>B: query exact P engine and DP
     B-->>W: required TP and PP listeners
-    W->>P: PDTransferRequest for A to T
+    W->>P: KVTransferRequest for A to T
     P->>P: wait for matching source ready
     P->>TE: TE WRITE into D regions
     TE-->>W: KV bytes written
@@ -361,7 +363,7 @@ D 侧在首次 remote-prefill allocation 中完成：
 
 - 保存 `[L,T)` 的全部 destination block IDs；
 - 保存 Store lookup 得到的 `H` 和对应 block hashes；
-- scheduler 建立不可变 `DTwoStageLoadPlan`；worker 接收 metadata 后建立 `_DLoadState`，初始状态为 `STORE_PENDING`；
+- scheduler 建立不可变 `KVTransferPlan`；worker 接收 metadata 后建立 `_TransferState`，初始状态为 `STORE_PENDING`；
 - 将 Store 计划区间设为 `[L,H)`；
 - 将 PD 候选区间设为 `[L,T)`，但此时不得固化或发送最终 suffix；
 - 将 request 标记为 metadata 待发布。
@@ -389,7 +391,7 @@ metadata 只描述计划和物理绑定，不声称 Store 已实际成功。work
 
 调用粒度：每次 worker output 回到 scheduler 时调用。
 
-当前 `MTSCScheduler.update_connector_output()` 主要消费 `finished_sending`，清理为 D async save 延迟释放的 `_tracked/_save_issued` 状态。Invalid destination blocks 通过 worker 侧 `get_block_ids_with_load_errors()` 独立返回；Connector stats 和 KV events 当前尚未接入运行路径。
+当前 `MTSCScheduler.update_connector_output()` 主要消费 `finished_sending`，清理为 D async save 延迟释放的 `_tracked_requests/_saving_requests` 状态。Invalid destination blocks 通过 worker 侧 `get_block_ids_with_load_errors()` 独立返回；Connector stats 和 KV events 当前尚未接入运行路径。
 
 `WAITING_FOR_REMOTE_KVS` 的解除不由该 hook 直接修改 request status。vLLM scheduler core 在处理完 connector output 后读取 `finished_recving`，再允许 request 在后续 step 继续运行。
 
@@ -416,7 +418,7 @@ D request 正常进入 Decode 后，两阶段 load 已经终止，因此该 hook
 - 向 PD Transfer Engine 注册同一批 D destination buffers；
 - 启动 Store load/save 后台线程；
 - 启动 PD receiver event loop；
-- 初始化 `MooncakeKVCachePool`、`MooncakeKVTransfer` 及 `MTSCWorker` 内部的 `_DLoadState/_SendState` collection。
+- 初始化 `MooncakeKVCachePool`、`MooncakeKVTransfer` 及 `MTSCWorker` 内部的 `_TransferState/_FinishedWaitState` collection。
 
 Store 与 PD 使用各自底层对象，但 buffer 注册、preemption fence、shutdown 和 block lifetime 由 `MTSCWorker` 统一编排。
 
@@ -424,7 +426,7 @@ Store 与 PD 使用各自底层对象，但 buffer 注册、preemption fence、s
 
 MVP 中保持 no-op。
 
-原生 Mooncake PD Connector 在该 hook 发布 PD request；MTSC 为保证 Store GET 与 P WRITE 严格串行，将两阶段 load 统一放到 `get_finished()` 发布和推进。这样只有在 Store completion 已确定实际边界 `A` 后，才会产生最终 MTSC `PDTransferRequest`。
+原生 Mooncake PD Connector 在该 hook 发布 PD request；MTSC 为保证 Store GET 与 P WRITE 严格串行，将两阶段 load 统一放到 `get_finished()` 发布和推进。这样只有在 Store completion 已确定实际边界 `A` 后，才会产生最终 MTSC `KVTransferRequest`。
 
 未来支持 layerwise load 时，可以重新划分发布点，但不能破坏同一 destination block 的单写者时序。
 
@@ -446,14 +448,14 @@ MVP 不在 forward 尾部同步等待 Store PUT，该 hook 为 no-op。D blocks 
 
 每次调用按以下顺序执行：
 
-1. 接收当前 metadata 中尚未发布的 `DTwoStageLoadPlan`；
+1. 接收当前 metadata 中尚未发布的 `KVTransferPlan`；
 2. 对 `[L,H)` 非空的请求，将 Store GET 加入 recv queue；
 3. 对 Store 区间为空的请求，直接令 `A=L`；
 4. 轮询 Store GET completion 和 failed block IDs；
 5. 对 Store 已终止的请求计算本 worker 的实际连续边界 `A`；
 6. 固化 `A`，构造 `[A,T)` 的 PD destination block IDs；
-7. 查询或复用 P bootstrap worker map，发送 `PDTransferRequest`；
-8. 轮询所有必需 P worker 的 `CONTINUE/FINISH/ERROR` 响应；
+7. 查询或复用 P bootstrap worker map，发送 `KVTransferRequest`；
+8. 轮询所有必需 P worker 的 `IN_PROGRESS/COMPLETE/FAILED` 响应；
 9. 验证 local、Store、PD 对 `[0,T)` 的覆盖；
 10. 轮询 D async-save completion；
 11. 返回 `(finished_sending, finished_recving)` 以及 invalid block IDs。
@@ -466,33 +468,25 @@ MVP 不在 forward 尾部同步等待 Store PUT，该 hook 为 no-op。D blocks 
 
 ```text
 MTSCConnectorMetadata(
-  store_requests=[
-    StoreRequest(
-      request_id=...,
-      token_count=H,
-      block_ids=all_block_ids,
-      block_hashes=...,
-      load=StoreLoadSpec(local_tokens=L, store_tokens=H, enabled=True),
+  pool_loads=[
+    KVPoolLoadRequest(
+      request_id=..., block_ids=all_block_ids, block_hashes=...,
+      start_token=L, end_token=H,
     )
   ],
-  decode_plans=[
-    DTwoStageLoadPlan(
-      request_id=...,
-      transfer_id=...,
-      local_prefix_tokens=L,
-      store_candidate_tokens=H,
-      target_prefix_tokens=T,
-      all_block_ids=...,
-      external_block_ids=...,
-      group_block_sizes=...,
-      blocks_per_sliding_window=...,
-      pd_enabled=True,
-      wait_for_completion=True,
-      kv_transfer_params={...},
+  pool_saves=[...],
+  transfer_plans=[
+    KVTransferPlan(
+      request_id=..., transfer_id=...,
+      local_tokens=L, pool_tokens=H, target_tokens=T,
+      all_block_ids=..., external_block_ids=...,
+      group_block_sizes=..., blocks_per_sliding_window=...,
+      transfer_enabled=True, wait_for_completion=True,
+      transfer_params={...},
     )
   ],
-  pd_send_updates=[],
-  send_requirements={...},
+  transfer_states=[],
+  finished_waits={...},
   finished_request_ids={...},
   preempted_request_ids={...},
 )
@@ -501,12 +495,12 @@ MTSCConnectorMetadata(
 字段规则：
 
 - `all_block_ids/external_block_ids` 共同描述完整 `[L,T)` 的物理绑定，不是只覆盖 Store 候选区间；
-- `store_candidate_tokens` 表示 `H`，不是实际完成边界 `A`；metadata 中不伪造 `A`；
-- P engine/bootstrap/DP 信息保存在 `kv_transfer_params`；`remote_bootstrap_addr` 只用于发现 P listener，不是 TE endpoint；
-- Store topology signature 体现在 `MooncakeKVCachePool` 生成的 cache namespace/key 中，不是 `DTwoStageLoadPlan` 字段；PD topology version 体现在后续 `PDTransferSchema`中；
-- D 侧不生成 `pd_send_updates`；PD receive 由 worker 在 Store 终止并固化 `A` 后启动；
-- scheduler 构建 metadata 后清空 `_pending_decode`；worker 以 `_decode` 中是否已存在 request ID 避免重复建立状态，当前没有单独的 sequence 字段；
-- 同一 schedule step 可携带多个 plans，各 request 通过独立 `_DLoadState` 推进。
+- `pool_tokens` 表示 `H`，不是实际完成边界 `A`；metadata 中不伪造 `A`；
+- P engine/bootstrap/DP 信息保存在计划的 `transfer_params`；`remote_bootstrap_addr` 只用于发现 P listener，不是 TE endpoint；
+- Store topology signature 体现在 `MooncakeKVCachePool` 生成的 cache namespace/key 中，不是 `KVTransferPlan` 字段；PD topology version 体现在后续 `KVTransferSchema`中；
+- D 侧不生成 `transfer_states`；PD receive 由 worker 在 Store 终止并固化 `A` 后启动；
+- scheduler 构建 metadata 后清空 `_batch_transfers`；worker 以 `_on_transfer` 中是否已存在 request ID 避免重复建立状态，当前没有单独的 sequence 字段；
+- 同一 schedule step 可携带多个 plans，各 request 通过独立 `_TransferState` 推进。
 
 ### 3.4 Transfer Topology 设计
 
@@ -548,7 +542,7 @@ classDiagram
         +tp_size: int
         +pp_rank: int
         +pp_size: int
-        +schema: PDTransferSchema
+        +schema: KVTransferSchema
         +regions: TransferRegion[]
         -_query_workers(address, engine_id, dp_rank)
         -_aligned_regions(request)
@@ -581,7 +575,6 @@ classDiagram
         +tp_size: int
         +block_size: int
         +is_mla: bool
-        +local_replicates_kv_cache: bool
         +handshake_target_ranks(remote_tp_size)
     }
     class TransferRegion {
@@ -592,7 +585,7 @@ classDiagram
         +block_length: int
         +kv_block_length: int
     }
-    class PDTransferSchema {
+    class KVTransferSchema {
         +topology_version: int
         +model_id: str
         +model_revision: str
@@ -601,31 +594,31 @@ classDiagram
         +block_size: int
         +is_mla: bool
     }
-    class PDTransferRequest {
+    class KVTransferRequest {
         +hostname: str
         +rpc_port: int
         +tp_size: int
         +tp_rank: int
         +pp_size: int
         +pp_rank: int
-        +schema: PDTransferSchema
+        +schema: KVTransferSchema
         +requests: dict
         +region_base_addresses: list
         +block_lengths: list
         +kv_block_lengths: list
     }
-    class PDTransferResponse {
-        +status: PDResponseStatus
-        +completed: list
-        +failed: list
-        +error: str
+    class KVTransferResponse {
+        +status: KVTransferStatus
+        +completed_transfer_ids: list
+        +failed_transfer_ids: list
+        +error_message: str
         +covered_regions: dict
     }
-    class PDResponseStatus {
+    class KVTransferStatus {
         <<enumeration>>
-        FINISH
-        CONTINUE
-        ERROR
+        COMPLETE
+        IN_PROGRESS
+        FAILED
     }
     class MooncakeKVCachePool {
         +tp_size: int
@@ -637,16 +630,16 @@ classDiagram
         -_lookup_prefixes: tuple
     }
 
-    MooncakeKVTransfer *-- PDTransferSchema
+    MooncakeKVTransfer *-- KVTransferSchema
     MooncakeKVTransfer o-- TransferRegion
     MooncakeKVTransfer --> TransferTopology : CUDA path
     MooncakeKVTransfer --> _NPUTransferTopology : Ascend path
     MooncakeKVTransfer ..> BootstrapServer : exact DP query
     BootstrapServer o-- WorkerRegistration
-    MooncakeKVTransfer ..> PDTransferRequest : D sends
-    MooncakeKVTransfer ..> PDTransferResponse : P replies
-    PDTransferRequest *-- PDTransferSchema
-    PDTransferResponse --> PDResponseStatus
+    MooncakeKVTransfer ..> KVTransferRequest : D sends
+    MooncakeKVTransfer ..> KVTransferResponse : P replies
+    KVTransferRequest *-- KVTransferSchema
+    KVTransferResponse --> KVTransferStatus
 ```
 
 代码中没有独立的 `TransferTopologyManager`、`PDTransferTopology`、`StoreTopologyPolicy` 或 `RegionPlan` 类。PD 拓扑入口就是 `MooncakeKVTransfer`：CUDA 路径复用 vLLM `TransferTopology`，Ascend 路径使用 MTSC `_NPUTransferTopology`；region 对齐、slice 长度校验和 coverage 校验分别由其私有方法完成。
@@ -696,7 +689,7 @@ p_tp_size = number of tp_rank entries
 p_pp_ranks[p_tp_rank] = registered pp_rank entries
 ```
 
-MVP 延续 Mooncake 的地址发现模式：bootstrap 不转发 transfer metadata 和 KV bytes。具体 KV region metadata 由 D 在 MTSC `PDTransferRequest` 中发给目标 P listener，P 使用本地注册信息做最终 region validation。
+MVP 延续 Mooncake 的地址发现模式：bootstrap 不转发 transfer metadata 和 KV bytes。具体 KV region metadata 由 D 在 MTSC `KVTransferRequest` 中发给目标 P listener，P 使用本地注册信息做最终 region validation。
 
 bootstrap entry 必须满足：
 
@@ -969,7 +962,7 @@ flowchart TD
     J --> K{MLA?}
     K -->|no| L[Plan KV-head source and destination slices]
     K -->|yes| M[Plan replicated full-page transfer and sender dedup]
-    L --> N[Send rank-local PDTransferRequest]
+    L --> N[Send rank-local KVTransferRequest]
     M --> N
     N --> O[Collect all required target responses]
     O --> P{All D layers and groups covered?}
@@ -1068,7 +1061,7 @@ get_finished()
   -> start PD suffix [A,T)
 ```
 
-Store GET 的完成不会直接放入 `finished_recving`。它只触发内部状态从 `STORE_LOADING` 进入 `PD_PENDING`。
+Store GET 的完成不会直接放入 `finished_recving`。它只触发内部状态从 `STORE_LOADING` 进入 `TRANSFER_PENDING`。
 
 如果某个 worker/rank 的 Store GET 在候选区间中途失败，该 worker 以首个失败 logical block 为 `A`，让 P 重写 `[A,T)`。已经成功写入但位于 `A` 之后的 Store blocks 可以被 P 覆盖，因为两阶段严格串行，不存在并发写同一 destination block。
 
@@ -1083,10 +1076,12 @@ remote_engine_id + remote_bootstrap_addr
   -> query P bootstrap
   -> obtain P TP/PP listener addresses
   -> build rank-local suffix destination blocks [A,T)
-  -> send PDTransferRequest to P listeners
+  -> send KVTransferRequest to P listeners
 ```
 
-MTSC `PDTransferRequest` 包含：
+MTSC `KVTransferRequest` 包含：
+
+请求映射、`completed_transfer_ids`、`failed_transfer_ids` 和 `covered_regions` 均使用 `transfer_id`；Worker 的终态结果仍通过 `request_id` 关联 vLLM request。RPC schema 版本为 4（TCP 为 5），P/D 必须同步升级。
 
 ```json
 {
@@ -1097,7 +1092,7 @@ MTSC `PDTransferRequest` 包含：
   "pp_size": 1,
   "pp_rank": 0,
   "schema": {
-    "topology_version": 1,
+    "topology_version": 4,
     "model_id": "<model-id>",
     "model_revision": "<revision>",
     "cache_dtype": "<dtype>",
@@ -1106,8 +1101,8 @@ MTSC `PDTransferRequest` 包含：
     "is_mla": false
   },
   "requests": {
-    "<d-request-id>": [
-      "xfer-<request-id>",
+    "xfer-<request-id>": [
+      "<d-request-id>",
       [[25, 26, 27, 28]]
     ]
   },
@@ -1135,7 +1130,7 @@ P batch_transfer_sync_write(
 )
 ```
 
-P 通过原 ZMQ channel 返回 MTSC `PDTransferResponse`，其中包含本次实际写入的 D region indices。D 只有在所有必需 P TP/PP worker 都返回终态成功、且每个需要数据的 D region 的 TP fan-in coverage 恰好满足预期后，才把 PD coverage 标记为完成。P source 的释放计数同时包含 TP fan-out 和异构 PP fan-out，不能在部分 D PP worker 尚未到达时提前释放。
+P 通过原 ZMQ channel 返回 MTSC `KVTransferResponse`，其中包含本次实际写入的 D region indices。D 只有在所有必需 P TP/PP worker 都返回终态成功、且每个需要数据的 D region 的 TP fan-in coverage 恰好满足预期后，才把 PD coverage 标记为完成。P source 的释放计数同时包含 TP fan-out 和异构 PP fan-out，不能在部分 D PP worker 尚未到达时提前释放。
 
 #### 3.6.3 零长度握手
 
@@ -1156,13 +1151,13 @@ D request 同时涉及 Store load、PD receive 和可选 Store save，但当前�
 
 | 生命周期 | 当前代码表示 |
 |---|---|
-| Store lookup | `StoreLookupClient._futures` 和 scheduler `_LookupDecision` |
-| Store GET | `MooncakeKVCachePool._loads/_load_events/_invalid` |
-| 两阶段调度 | `MTSCWorker._decode[request_id]` 中 `_DLoadState.stage`，取值为 `STORE_PENDING`、`STORE_DONE` 或 `PD_PENDING` |
-| PD receive | `MooncakeKVTransfer._receive_futures/_finished_recv/_failed_recv` |
+| Store lookup | `StoreLookupClient._futures` 和 scheduler `TransferSpec` |
+| Store GET | `MooncakeKVCachePool._loads` 中的 `_LoadState` 和 `_invalid` |
+| 两阶段调度 | `MTSCWorker._on_transfer[request_id]` 中 `_TransferState.stage`，取值为 `STORE_PENDING`、`STORE_DONE` 或 `TRANSFER_PENDING` |
+| PD receive | `MooncakeKVTransfer._receive_futures/_failed_recv` |
 | Store save | `MooncakeKVCachePool._save_states` |
 
-下列方程是对这些运行对象的逻辑投影；终态 request 会从 `_decode` 移除，而不是保留一个 `SUCCESS/FAILED` stage：
+下列方程是对这些运行对象的逻辑投影；终态 request 会从 `_on_transfer` 移除，而不是保留一个 `SUCCESS/FAILED` stage：
 
 两阶段状态方程：
 
@@ -1200,10 +1195,10 @@ Store completion 不等于 `D_FINISHED_RECVING`；P 的某一个 worker 返回�
 
 MTSC 不设置“整个 D 一次只能拉一个 request”的全局锁。
 
-- 每个 request 有独立 `_DLoadState`，其中引用不可变 `DTwoStageLoadPlan`；
+- 每个 request 有独立 `_TransferState`，其中引用不可变 `KVTransferPlan`；
 - 一个 schedule step 可以发布多个两阶段 plans；
 - Store loads 进入 `MooncakeKVCachePool._load_pool`；默认 `mtsc_store_load_workers=2`，可通过该配置调整单 worker 并行 GET 数；
-- 每个 `_DLoadState` 当前独立启动一次 `MooncakeKVTransfer.recv()`；wire schema 支持 `PDTransferRequest.requests` map，但当前发送路径每条消息只放一个 request；
+- 每个 `_TransferState` 当前独立启动一次 `MooncakeKVTransfer.recv()`；wire schema 支持 `KVTransferRequest.requests` map，但当前发送路径每条消息只放一个 request；
 - P 侧 sender thread pool 可以并行执行多个 TE batches；
 - 不同 D TP workers 独立处理自己的 KV shards。
 
@@ -1258,6 +1253,12 @@ D 当前实现的 timeout 与 fence 为：
 - bootstrap HTTP 查询当前使用 `httpx.AsyncClient` 默认 timeout，没有 MTSC 独立的 `bootstrap_connect_timeout` 配置；
 - D 发出 destination addresses 后的 ZMQ response wait 故意不设本地 timeout，也没有独立 `te_transfer_timeout`，以 P terminal response 作为 DMA fence。
 
+以上三个可配置超时均在使用组件初始化 I/O 资源前要求有限且大于零。
+Lookup 默认 10 秒，GET 默认 180 秒；PD 缺省时使用 vLLM 的
+`VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`，由 Transfer 直接读取并验证。
+Lookup 的毫秒值须适配 ZMQ 有符号 32 位整数，合法亚毫秒正数按 1ms 使用。
+Scheduler 读取 `lookup_async` 时识别字符串 `false/no/off/0`，避免把关闭异步 lookup 的配置当成 True。
+
 当前 Mooncake 同步 Store GET 和 TE WRITE 都没有安全取消原语。Store GET 超时会先标记请求失败，但仍等待底层调用终止后才允许 block 回收；随后将请求涉及的 Store blocks 标为 invalid，进入 P suffix 或本地重算。PD request 在 destination addresses 已发布后同样以 terminal response 为安全 fence，不能用“超时即释放”实现，否则会产生 late-write。
 
 当前 Connector 通过 vLLM logger 记录 `request_id` 及 `L/H/A/T` 等关键边界，尚未实现上述字段的请求终态结构化 metrics record。Proxy 侧 JSONL metrics 与 Connector trace 的后续演进见 [S04-Log Trace 设计](./S04-log-trace设计.md)。
@@ -1290,10 +1291,10 @@ MTSCWorker.close()
 ```text
 mtsc/connector.py   MTSCConnector：vLLM KV Connector hooks 与 load-error 出口
 mtsc/scheduler.py   MTSCScheduler：Store lookup、L/H/T 决策、block 绑定和 plan 生成
-mtsc/worker.py      MTSCWorker：_DLoadState 两阶段状态机与 completion 聚合
+mtsc/worker.py      MTSCWorker：_TransferState 两阶段状态机与 completion 聚合
 mtsc/kv_cache_pool.py  KVCachePool、MooncakeKVCachePool、lookup RPC、namespace 与 GET/PUT
 mtsc/kv_transfer.py    KVTransfer、MooncakeKVTransfer、bootstrap、并行映射与 coverage
-mtsc/protocol.py    DTwoStageLoadPlan、PDTransferSchema/Request/Response
+mtsc/protocol.py    KVTransferPlan、KVTransferSchema/Request/Response
 mtsc/utils.py      CUDA/Ascend event、tensor layout 和 memory registration helpers
 tests/test_mtsc.py  Store fallback、topology、coverage、timeout、preemption 与平台测试
 ```
@@ -1305,10 +1306,10 @@ Proxy D request
   -> MTSCConnector.get_num_new_matched_tokens()
      -> MTSCScheduler.get_num_new_matched_tokens()
         -> StoreLookupClient.lookup()
-        -> record _LookupDecision(L, H, T)
+        -> record TransferSpec(L, H, T)
   -> MTSCConnector.update_state_after_alloc()
      -> MTSCScheduler.update_state_after_alloc()
-        -> build DTwoStageLoadPlan for [L,T)
+        -> build KVTransferPlan for [L,T)
   -> MTSCConnector.build_connector_meta()
      -> MTSCScheduler.build_connector_meta()
   -> MTSCConnector.get_finished()
@@ -1316,7 +1317,7 @@ Proxy D request
         -> MooncakeKVCachePool.load() / poll()
         -> LoadResult.loaded_tokens freezes A
         -> _suffix_blocks() maps [A,T)
-        -> _start_pd()
+        -> _start_transfer()
            -> MooncakeKVTransfer.recv()
               -> _query_workers()
               -> _receive()

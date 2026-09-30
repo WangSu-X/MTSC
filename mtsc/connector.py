@@ -90,9 +90,6 @@ class MTSCConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             self.scheduler = MTSCScheduler(vllm_config, kv_cache_config, decode_save)
         else:
-            timeout = float(extra.get("mtsc_pd_timeout_seconds", 180.0))
-            if timeout <= 0:
-                raise ValueError("mtsc_pd_timeout_seconds must be positive")
             self.worker = MTSCWorker(vllm_config, kv_cache_config)
         logger.info(
             "Initialized MTSC connector: process_role=%s kv_role=%s",

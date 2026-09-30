@@ -38,6 +38,17 @@ Decode ── stage 1: Store GET ──► stage 2: pull remaining KV ──► 
 
 更完整的状态机和协议说明见 [`docs/design`](./docs/design)。
 
+Scheduler→Worker metadata 使用 `pool_loads`、`pool_saves` 分别描述缓存读写，
+每个操作的 token 区间为 `[start_token, end_token)`。`transfer_plans` 描述两阶段
+加载边界，`transfer_states` 发布 producer 状态，`finished_waits` 指定释放 blocks
+前需要等待的 save/send。Worker 统一跟踪所有 pool load/save，并根据实际加载
+前缀启动剩余 KV 的 transfer；等待项只发布一次，完成后清理请求状态。
+
+P↔D RPC 使用 `KVTransferRequest` / `KVTransferResponse`，协议版本为 4（TCP 为 5）。
+请求映射、完成/失败列表和 region coverage 均以 `transfer_id` 为键，
+Worker 向 Scheduler 报告完成时仍使用 `request_id`。P 和 D 需要同步升级；
+旧协议会在 schema 校验时被拒绝。
+
 `mtsc/` 保持 7 个核心模块（另有包入口 `__init__.py`）：
 
 ```text
@@ -68,6 +79,15 @@ Worker 默认创建 `MooncakeKVCachePool` 和 `MooncakeKVTransfer`。可在
 
 当前仅提供 Mooncake 后端，未知名称会在初始化时报错。现有 Mooncake Store
 配置文件和 TE 配置参数继续生效。
+
+配置继续由各组件直接从 vLLM 读取。`lookup_async` 和 NPU 的
+`additional_config.enable_kv_nz` 支持字符串布尔值，例如 `"false"`、`"off"`；
+`mtsc_store_topology_namespace` 缺省或为 `null` 时均默认开启。
+Store lookup、GET 和 PD 超时必须是有限正数，非法值会在初始化 I/O 资源前报错。
+Lookup 默认 10 秒，GET 默认 180 秒；PD 默认使用 vLLM 的
+`VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`，显式设置 `mtsc_pd_timeout_seconds` 可覆盖它。
+Lookup 超时转换为 ZMQ 的有符号 32 位毫秒值，正数小于 1ms 时按 1ms 使用。
+`lookup_rpc_port` 用于区分 IPC 路径，0 也是固定标识，不代表自动分配网络端口。
 
 Pool 支持普通 KV 与 MLA，但不转换 TP/PP/PCP/DCP 布局；默认使用 topology namespace
 隔离不兼容缓存。MLA 在同一 namespace 内跨 TP ranks 共享 key，并分摊完整 chunk 的 PUT。

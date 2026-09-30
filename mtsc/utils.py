@@ -86,7 +86,10 @@ def npu_kv_nz_enabled(config: Any) -> bool:
         return False
     additional = getattr(config, "additional_config", None)
     if isinstance(additional, dict) and "enable_kv_nz" in additional:
-        return bool(additional["enable_kv_nz"])
+        enabled = additional["enable_kv_nz"]
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(enabled)
     try:
         from vllm_ascend.ascend_config import get_ascend_config
 

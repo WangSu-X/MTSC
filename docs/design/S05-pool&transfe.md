@@ -18,6 +18,13 @@ MTSC 已通过 scheduler/worker 串联远程缓存和 P-D 直传：D 先加载�
 
 目标是：接口只传必要元数据，不复制 KV tensor；调用方不维护 task ID 映射；队列、线程、Future 和底层 I/O 由实现选择。request 调度、block 分配和最终释放仍由 Connector 与 vLLM 管理。
 
+当前实现仅保留运行时需要的状态。Pool 通过 `_loads[request_id] -> _LoadState`
+统一保存不可变 `LoadEvent`、Future、起始时间和超时标记；GET/PUT 后台任务直接
+消费 `LoadEvent` / `SaveEvent`，不重建 Scheduler 的 request metadata。
+Transfer 的 receive 终态以 Future 为准，`_failed_recv` 只补充失败信息；
+`_pending_sends` 仅记录尚未收取结果的 request IDs，源 blocks 由 `_Session` 持有。
+Scheduler 的 save metadata 使用 hashes 和 token 区间，不复制完整 token IDs。
+
 ## 2. 总体设计
 
 ### 2.1 核心特性
@@ -236,7 +243,7 @@ request 继续运行时可多次收到 `SaveResult`，之后也可继续 save。
 
 `poll()` 非阻塞且结果只收取一次；终态表示内存访问已停止，成功与否由结果判断。`take_errors()` 非阻塞取出并清空已轮询失败的物理目标 block ID。它只处理 load/recv 的无效目标，不因 save/send 失败而失效本地源 KV。
 
-Worker 的 `_send` 表示 request 结束后的释放依赖，D 仅保存时也需要它。`_save_issued` 表示生成过保存工作，不等于当前正在执行 save。
+Worker 的 `_finished_waits` 表示 request 结束后的释放依赖，D 仅保存时也需要它。`_saving_requests` 表示生成过保存工作，不等于当前正在执行 save。
 
 ```text
 finished_sending = request 已结束
@@ -267,8 +274,13 @@ P 尚未 `send()` 时没有发布源内存，抢占保留早到的 D 等待者�
 | KV 字节分片映射 | `mtsc/kv_transfer.py`：`kv_slice_plan()`，处理 TP 分片与复制 rank |
 
 scheduler-worker metadata 保留现有 wire 结构，Worker 将其转换为不可变事件快照。
-Pool 不接收 request-end 信息，Worker 的 `_save_pending` 与 `_send` 分别管理当前保存工作及最终释放依赖。
+Pool 不接收 request-end 信息，Worker 的 `_on_save_requests` 与 `_finished_waits` 分别管理当前保存工作及最终释放依赖。
 两个 Mooncake 类直接实现 ABC；旧的任务生命周期、完成 API 和兼容导出已移除。
+
+配置继续在各使用位置直接读取 vLLM，不增加独立配置对象。
+Pool/Transfer 在创建 I/O 资源前校验各自超时为有限正数；PD timeout 默认取
+`VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`。线程数仍按 `max(1, int(...))` 归一化。
+Store namespace 配置缺省或为 None 时默认开启；`lookup_rpc_port` 仅作为 IPC 路径标识。
 
 ### 4.2 Pool 并行与 MLA
 

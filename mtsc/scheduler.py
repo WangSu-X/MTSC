@@ -14,12 +14,13 @@ from vllm.v1.request import RequestStatus
 
 from .kv_cache_pool import StoreLookupClient
 from .protocol import (
-    DTwoStageLoadPlan,
+    FinishedWait,
+    KVPoolLoadRequest,
+    KVPoolLoadSpec,
+    KVPoolSaveRequest,
+    KVTransferPlan,
+    KVTransferSourceState,
     MTSCConnectorMetadata,
-    PDSendUpdate,
-    SendRequirement,
-    StoreLoadSpec,
-    StoreRequest,
 )
 
 if TYPE_CHECKING:
@@ -33,9 +34,11 @@ logger = init_logger(__name__)
 
 
 @dataclass
-class _LookupDecision:
+class TransferSpec:
+    """Lookup boundaries awaiting allocation for a pool + transfer load."""
+
     local_tokens: int
-    store_tokens: int
+    pool_tokens: int
     target_tokens: int
 
 
@@ -43,7 +46,6 @@ class _LookupDecision:
 class _TrackedRequest:
     request: Request
     block_ids: tuple[list[int], ...]
-    token_count: int = 0
     saved_tokens: int = 0
 
 
@@ -58,6 +60,8 @@ def _groups(
 
 
 class MTSCScheduler:
+    """Plans per-step operations and retains requests until block release."""
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -67,15 +71,20 @@ class MTSCScheduler:
         assert vllm_config.kv_transfer_config is not None
         transfer = vllm_config.kv_transfer_config
         extra = transfer.kv_connector_extra_config
-        self.kv_role = transfer.kv_role
-        self.is_producer = self.kv_role == "kv_producer"
-        self.is_consumer = self.kv_role == "kv_consumer"
+        self.is_producer = transfer.kv_role == "kv_producer"
+        self.is_consumer = transfer.kv_role == "kv_consumer"
         self.decode_save = decode_save and self.is_consumer
-        self.lookup_async = bool(extra.get("lookup_async", False))
+        lookup_async = extra.get("lookup_async", False)
+        if isinstance(lookup_async, str):
+            lookup_async = lookup_async.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+        self.lookup_async = bool(lookup_async)
         self.lookup_client = StoreLookupClient(vllm_config)
-        self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
-            kv_cache_config, vllm_config
-        )
+        self.block_size, _ = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
         self.group_block_sizes = tuple(
             group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
         )
@@ -87,19 +96,26 @@ class MTSCScheduler:
         )
         self.has_mamba = kv_cache_config.has_mamba_layers
 
-        self._decisions: dict[str, _LookupDecision] = {}
-        self._load_specs: dict[str, StoreLoadSpec] = {}
-        self._tracked: dict[str, _TrackedRequest] = {}
-        self._pending_store: list[StoreRequest] = []
-        self._pending_decode: dict[str, DTwoStageLoadPlan] = {}
-        self._pending_pd: list[PDSendUpdate] = []
-        self._pending_requirements: dict[str, SendRequirement] = {}
-        self._save_issued: set[str] = set()
-        self._pd_registered: set[str] = set()
-        self._delayed: set[str] = set()
+        # Lookup decisions are consumed once local blocks are allocated.
+        self._transfer_decisions: dict[str, TransferSpec] = {}
+        self._load_decisions: dict[str, KVPoolLoadSpec] = {}
+        # Retained through execution and any delayed block release.
+        self._tracked_requests: dict[str, _TrackedRequest] = {}
+        # Per-step operations; detached after metadata is built.
+        self._batch_pool_saves: list[KVPoolSaveRequest] = []
+        self._batch_pool_loads: list[KVPoolLoadRequest] = []
+        self._batch_transfers: list[KVTransferPlan] = []
+        self._batch_transfer_state: list[KVTransferSourceState] = []
+        # Release dependencies awaiting publication to Worker.
+        self._finished_waits: dict[str, FinishedWait] = {}
+        # Save issuance is conservative: Worker reports aggregate completion
+        # only after request_finished, never for intermediate saves.
+        self._saving_requests: set[str] = set()
+        self._transferring_requests: set[str] = set()
+        self._delayed_releases: set[str] = set()
 
     @staticmethod
-    def _valid_pd(params: dict[str, Any]) -> bool:
+    def _valid_transfer(params: dict[str, Any]) -> bool:
         return all(
             params.get(key)
             for key in ("transfer_id", "remote_engine_id", "remote_bootstrap_addr")
@@ -133,7 +149,7 @@ class MTSCScheduler:
 
         lookup_tokens = request.num_tokens // self.block_size * self.block_size
         if lookup_tokens < self.block_size:
-            store_hit = 0
+            pool_hit = 0
         else:
             hit = self.lookup_client.lookup(
                 request.request_id,
@@ -143,21 +159,24 @@ class MTSCScheduler:
             )
             if hit is None:
                 logger.debug(
-                    "MTSC Store lookup pending: request_id=%s", request.request_id
+                    "MTSC pool lookup pending: request_id=%s", request.request_id
                 )
                 return None, False
-            store_hit = hit
-            if store_hit == request.num_tokens:
-                store_hit = max(
+            pool_hit = hit
+            if pool_hit == request.num_tokens:
+                pool_hit = max(
                     0, (request.num_tokens - 1) // self.block_size * self.block_size
                 )
 
-        store_hit = max(num_computed_tokens, store_hit)
+        pool_hit = max(num_computed_tokens, pool_hit)
+        # A retry may resolve to a different hit before allocation.
+        self._load_decisions.pop(request.request_id, None)
+        self._transfer_decisions.pop(request.request_id, None)
         if not (self.is_consumer and params.get("do_remote_prefill")):
-            external = max(0, store_hit - num_computed_tokens)
+            external = max(0, pool_hit - num_computed_tokens)
             if external:
-                self._load_specs[request.request_id] = StoreLoadSpec(
-                    num_computed_tokens, store_hit
+                self._load_decisions[request.request_id] = KVPoolLoadSpec(
+                    num_computed_tokens, pool_hit
                 )
             return external, external > 0
 
@@ -165,26 +184,26 @@ class MTSCScheduler:
             1 if self.has_mamba and request.num_prompt_tokens > 1 else 0
         )
         target = max(num_computed_tokens, min(target, request.num_tokens))
-        store_hit = min(store_hit, target)
-        pd_enabled = self._valid_pd(params)
-        if not pd_enabled:
+        pool_hit = min(pool_hit, target)
+        transfer_enabled = self._valid_transfer(params)
+        if not transfer_enabled:
             logger.warning(
-                "MTSC invalid decode transfer spec; using Store only: request_id=%s",
+                "MTSC invalid decode transfer spec; using pool only: request_id=%s",
                 request.request_id,
             )
-            target = store_hit
-        self._decisions[request.request_id] = _LookupDecision(
-            num_computed_tokens, store_hit, target
+            target = pool_hit
+        self._transfer_decisions[request.request_id] = TransferSpec(
+            num_computed_tokens, pool_hit, target
         )
-        if store_hit > num_computed_tokens:
-            self._load_specs[request.request_id] = StoreLoadSpec(
-                num_computed_tokens, store_hit
+        if pool_hit > num_computed_tokens:
+            self._load_decisions[request.request_id] = KVPoolLoadSpec(
+                num_computed_tokens, pool_hit
             )
         logger.info(
-            "MTSC D load planned: request_id=%s L=%d H=%d T=%d",
+            "MTSC transfer load planned: request_id=%s L=%d H=%d T=%d",
             request.request_id,
             num_computed_tokens,
-            store_hit,
+            pool_hit,
             target,
         )
         external = target - num_computed_tokens
@@ -195,69 +214,60 @@ class MTSCScheduler:
     ) -> None:
         params = request.kv_transfer_params or {}
         all_blocks = _groups(blocks.get_block_ids())
-        tracked = self._tracked.get(request.request_id)
+        tracked = self._tracked_requests.get(request.request_id)
         if tracked is None:
             tracked = _TrackedRequest(request, all_blocks)
-            self._tracked[request.request_id] = tracked
+            self._tracked_requests[request.request_id] = tracked
         elif all_blocks:
             tracked.block_ids = all_blocks
 
-        decision = self._decisions.pop(request.request_id, None)
-        load_spec = self._load_specs.pop(request.request_id, None)
-        if decision is not None:
-            external_blocks = _groups(blocks.get_unhashed_block_ids_all_groups())
-            if load_spec is not None:
-                load_spec.enabled = True
-                self._pending_store.append(
-                    StoreRequest(
-                        request.request_id,
-                        decision.store_tokens,
-                        all_blocks,
-                        list(request.block_hashes),
-                        load=load_spec,
-                    )
+        transfer_spec = self._transfer_decisions.pop(request.request_id, None)
+        load_spec = self._load_decisions.pop(request.request_id, None)
+        if load_spec is not None and (
+            transfer_spec is not None or num_external_tokens > 0
+        ):
+            self._batch_pool_loads.append(
+                KVPoolLoadRequest(
+                    request.request_id,
+                    all_blocks,
+                    list(request.block_hashes),
+                    load_spec.local_tokens,
+                    load_spec.pool_tokens,
                 )
+            )
+        if transfer_spec is not None:
+            external_blocks = _groups(blocks.get_unhashed_block_ids_all_groups())
             transfer_id = str(params.get("transfer_id", request.request_id))
-            self._pending_decode[request.request_id] = DTwoStageLoadPlan(
-                request_id=request.request_id,
-                transfer_id=transfer_id,
-                local_prefix_tokens=decision.local_tokens,
-                store_candidate_tokens=decision.store_tokens,
-                target_prefix_tokens=decision.target_tokens,
-                all_block_ids=all_blocks,
-                external_block_ids=external_blocks,
-                group_block_sizes=self.group_block_sizes,
-                blocks_per_sliding_window=self.blocks_per_sliding_window,
-                pd_enabled=self._valid_pd(params),
-                wait_for_completion=num_external_tokens > 0,
-                kv_transfer_params=dict(params),
+            self._batch_transfers.append(
+                KVTransferPlan(
+                    request_id=request.request_id,
+                    transfer_id=transfer_id,
+                    local_tokens=transfer_spec.local_tokens,
+                    pool_tokens=transfer_spec.pool_tokens,
+                    target_tokens=transfer_spec.target_tokens,
+                    all_block_ids=all_blocks,
+                    external_block_ids=external_blocks,
+                    group_block_sizes=self.group_block_sizes,
+                    blocks_per_sliding_window=self.blocks_per_sliding_window,
+                    transfer_enabled=self._valid_transfer(params),
+                    wait_for_completion=num_external_tokens > 0,
+                    transfer_params=dict(params),
+                )
             )
             params["do_remote_prefill"] = False
             return
 
-        if load_spec is not None and num_external_tokens > 0:
-            load_spec.enabled = True
-            self._pending_store.append(
-                StoreRequest(
-                    request.request_id,
-                    load_spec.store_tokens,
-                    all_blocks,
-                    list(request.block_hashes),
-                    load=load_spec,
-                )
-            )
-
         if (
             self.is_producer
             and params.get("do_remote_decode")
-            and request.request_id not in self._pd_registered
+            and request.request_id not in self._transferring_requests
         ):
             transfer_id = params.get("transfer_id")
             if transfer_id:
-                self._pending_pd.append(
-                    PDSendUpdate(request.request_id, str(transfer_id))
+                self._batch_transfer_state.append(
+                    KVTransferSourceState(request.request_id, str(transfer_id))
                 )
-                self._pd_registered.add(request.request_id)
+                self._transferring_requests.add(request.request_id)
             else:
                 logger.warning(
                     "MTSC producer request lacks transfer_id: request_id=%s",
@@ -278,9 +288,9 @@ class MTSCScheduler:
         for current, new in zip(tracked.block_ids, incoming, strict=True):
             current.extend(new)
 
-    def _save(
+    def _build_save_meta(
         self, tracked: _TrackedRequest, token_count: int, *, decode: bool
-    ) -> StoreRequest | None:
+    ) -> KVPoolSaveRequest | None:
         complete = token_count // self.block_size * self.block_size
         start = tracked.saved_tokens
         if decode:
@@ -292,43 +302,38 @@ class MTSCScheduler:
         if complete <= start:
             return None
         tracked.saved_tokens = complete
-        self._save_issued.add(tracked.request.request_id)
-        return StoreRequest(
+        self._saving_requests.add(tracked.request.request_id)
+        return KVPoolSaveRequest(
             tracked.request.request_id,
-            complete,
             tuple(group.copy() for group in tracked.block_ids),
             list(tracked.request.block_hashes),
-            save=True,
-            save_from=start,
-            token_ids=list(tracked.request.all_token_ids[:complete]),
+            start_token=start,
+            end_token=complete,
             prompt_tokens=tracked.request.num_prompt_tokens,
         )
 
     def build_connector_meta(self, output: SchedulerOutput) -> MTSCConnectorMetadata:
-        store_requests, self._pending_store = self._pending_store, []
-        loading = {
-            request.request_id
-            for request in store_requests
-            if request.load is not None and request.load.enabled
-        }
+        loading = {request.request_id for request in self._batch_pool_loads}
         allow_save = self.is_producer or self.decode_save
         if allow_save:
-            for scheduled in output.scheduled_new_reqs:
-                tracked = self._tracked.get(scheduled.req_id)
-                if tracked is None or scheduled.req_id in loading:
+            # 1. requests newly scheduled this step
+            for req in output.scheduled_new_reqs:
+                tracked = self._tracked_requests.get(req.req_id)
+                if tracked is None or req.req_id in loading:
                     continue
-                tracked.block_ids = _groups(scheduled.block_ids)
+                tracked.block_ids = _groups(req.block_ids)
                 token_count = (
-                    scheduled.num_computed_tokens
-                    + output.num_scheduled_tokens[scheduled.req_id]
+                    req.num_computed_tokens + output.num_scheduled_tokens[req.req_id]
                 )
-                tracked.token_count = token_count
-                request = self._save(tracked, token_count, decode=self.is_consumer)
-                if request is not None:
-                    store_requests.append(request)
+                save_meta = self._build_save_meta(
+                    tracked, token_count, decode=self.is_consumer
+                )
+                if save_meta is not None:
+                    self._batch_pool_saves.append(save_meta)
+            # 2. requests already running (cached) that continue this step
             cached = output.scheduled_cached_reqs
             for index, request_id in enumerate(cached.req_ids):
-                tracked = self._tracked.get(request_id)
+                tracked = self._tracked_requests.get(request_id)
                 if tracked is None:
                     continue
                 self._append_blocks(tracked, cached.new_block_ids[index])
@@ -336,57 +341,70 @@ class MTSCScheduler:
                     cached.num_computed_tokens[index]
                     + output.num_scheduled_tokens[request_id]
                 )
-                tracked.token_count = token_count
-                request = self._save(tracked, token_count, decode=self.is_consumer)
-                if request is not None:
-                    store_requests.append(request)
+                save_meta = self._build_save_meta(
+                    tracked, token_count, decode=self.is_consumer
+                )
+                if save_meta is not None:
+                    self._batch_pool_saves.append(save_meta)
 
         finished = set(output.finished_req_ids)
         preempted = set(output.preempted_req_ids or set())
-        if preempted:
-            # A preempted request's blocks may be recycled by this very step.
-            # Do not publish newly queued reads/writes or stale P placeholders
-            # after the worker-side preemption fence has already run.
-            store_requests = [
-                request
-                for request in store_requests
-                if request.request_id not in preempted
-            ]
-            self._pending_pd = [
-                update
-                for update in self._pending_pd
-                if update.request_id not in preempted
-            ]
-            for request_id in preempted:
-                self._pending_requirements.pop(request_id, None)
+        # Preemption fences have already run before the current model step.
+        # Never republish operations on blocks that can now be recycled.
+        self._batch_pool_loads = [
+            load_meta
+            for load_meta in self._batch_pool_loads
+            if load_meta.request_id not in preempted
+        ]
+        self._batch_pool_saves = [
+            save_meta
+            for save_meta in self._batch_pool_saves
+            if save_meta.request_id not in preempted
+        ]
+        self._batch_transfers = [
+            plan
+            for plan in self._batch_transfers
+            if plan.request_id not in finished | preempted
+        ]
+        self._batch_transfer_state = [
+            source_state
+            for source_state in self._batch_transfer_state
+            if source_state.request_id not in preempted
+        ]
         for request_id in finished | preempted:
             self.lookup_client.discard(request_id)
-            self._load_specs.pop(request_id, None)
-            self._decisions.pop(request_id, None)
-            self._pending_decode.pop(request_id, None)
+            self._load_decisions.pop(request_id, None)
+            self._transfer_decisions.pop(request_id, None)
+        for request_id in preempted:
+            self._finished_waits.pop(request_id, None)
+            self._delayed_releases.discard(request_id)
+            self._tracked_requests.pop(request_id, None)
+            self._saving_requests.discard(request_id)
+            self._transferring_requests.discard(request_id)
 
         metadata = MTSCConnectorMetadata(
-            store_requests=store_requests,
-            decode_plans=list(self._pending_decode.values()),
-            pd_send_updates=self._pending_pd,
-            send_requirements=self._pending_requirements,
+            pool_loads=self._batch_pool_loads,
+            pool_saves=self._batch_pool_saves,
+            transfer_plans=self._batch_transfers,
+            transfer_states=self._batch_transfer_state,
+            finished_waits=dict(self._finished_waits),
             finished_request_ids=finished,
             preempted_request_ids=preempted,
         )
-        self._pending_decode.clear()
-        self._pending_pd = []
-        self._pending_requirements = {}
-        for request_id in preempted:
-            self._tracked.pop(request_id, None)
-            self._save_issued.discard(request_id)
-            self._pd_registered.discard(request_id)
+        self._batch_pool_loads = []
+        self._batch_pool_saves = []
+        self._batch_transfers = []
+        self._batch_transfer_state = []
+        # Publish release dependencies once; Worker owns their progress and
+        # _delayed_releases retains Scheduler state until the terminal result.
+        self._finished_waits = {}
         return metadata
 
     def request_finished(
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
         params = request.kv_transfer_params or {}
-        pd_delay = False
+        transfer_delay = False
         if (
             self.is_producer
             and params.get("transfer_id")
@@ -395,42 +413,45 @@ class MTSCScheduler:
             if request.status == RequestStatus.FINISHED_LENGTH_CAPPED and any(
                 block_ids
             ):
-                self._pending_pd.append(
-                    PDSendUpdate(
+                self._batch_transfer_state.append(
+                    KVTransferSourceState(
                         request.request_id,
                         str(params["transfer_id"]),
                         _groups(block_ids),
-                        source_ready=True,
+                        ready=True,
                     )
                 )
-                pd_delay = True
+                transfer_delay = True
             else:
-                self._pending_pd.append(
-                    PDSendUpdate(
-                        request.request_id, str(params["transfer_id"]), abort=True
+                self._batch_transfer_state.append(
+                    KVTransferSourceState(
+                        request.request_id, str(params["transfer_id"]), cancelled=True
                     )
                 )
-        store_delay = request.request_id in self._save_issued and any(block_ids)
-        delay = store_delay or pd_delay
+        pool_save_delay = request.request_id in self._saving_requests and any(block_ids)
+        delay = pool_save_delay or transfer_delay
         if delay:
-            self._pending_requirements[request.request_id] = SendRequirement(
-                store_delay, pd_delay
+            self._finished_waits[request.request_id] = FinishedWait(
+                store_save=pool_save_delay, kv_transfer=transfer_delay
             )
-            self._delayed.add(request.request_id)
+            self._delayed_releases.add(request.request_id)
         if not delay:
-            self._tracked.pop(request.request_id, None)
+            self._tracked_requests.pop(request.request_id, None)
+            self._saving_requests.discard(request.request_id)
+            self._transferring_requests.discard(request.request_id)
         return delay, None
 
     def update_connector_output(self, output: KVConnectorOutput) -> None:
         completed = output.finished_sending or set()
-        self._delayed.difference_update(completed)
+        self._delayed_releases.difference_update(completed)
         for request_id in completed:
-            self._tracked.pop(request_id, None)
-            self._save_issued.discard(request_id)
-            self._pd_registered.discard(request_id)
+            self._finished_waits.pop(request_id, None)
+            self._tracked_requests.pop(request_id, None)
+            self._saving_requests.discard(request_id)
+            self._transferring_requests.discard(request_id)
 
     def has_pending_push_work(self) -> bool:
-        return bool(self._delayed)
+        return bool(self._delayed_releases)
 
     def reset_store(self) -> bool:
         return self.lookup_client.reset()
