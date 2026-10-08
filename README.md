@@ -1,5 +1,7 @@
 # MTSC
 
+MTSC 的 Store key 映射、缓存命中 coordinator 和配置辅助组件维护在 `mtsc/kv_cache_pool.py`，不依赖 vLLM 自带的 Mooncake Connector 包。运行仍需要兼容的 vLLM 核心接口及 Mooncake SDK。迁入组件保留上游版权声明，许可证见 `mtsc/LICENSE-vllm`。
+
 MTSC 是一个基于 Mooncake Store 和 Transfer Engine（TE）的两阶段 PD KV 传输组件：Decode 先从 Store 加载命中的前缀，再从 Prefill 拉取剩余 KV。
 
 TCP 部署要求 P/D 均安装 `mooncake-transfer-engine>=0.3.13.post1`，并且不设置

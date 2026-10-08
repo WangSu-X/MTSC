@@ -215,11 +215,11 @@ class BackendSetupTest(unittest.TestCase):
                 return_value=StoreConfig("metadata", "master"),
             ),
             patch(
-                "mtsc.kv_cache_pool.rdma_utils.get_requester_local_hostname",
+                "mtsc.kv_cache_pool.get_requester_local_hostname",
                 return_value="host",
             ),
             patch(
-                "mtsc.kv_cache_pool.rdma_utils.get_configured_preferred_segment",
+                "mtsc.kv_cache_pool.get_configured_preferred_segment",
                 return_value=None,
             ),
             patch("mtsc.kv_cache_pool.npu_kv_nz_enabled", return_value=False),

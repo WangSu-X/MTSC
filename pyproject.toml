@@ -13,3 +13,6 @@ tcp = ["mooncake-transfer-engine>=0.3.13.post1"]
 
 [tool.setuptools.packages.find]
 include = ["mtsc*", "proxy*"]
+
+[tool.setuptools.package-data]
+"mtsc" = ["LICENSE-vllm"]
