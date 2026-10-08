@@ -940,11 +940,19 @@ def store_topology_namespace(
         layout = "npu-nz" if npu_kv_nz_enabled(vllm_config) else "npu-normal"
     else:
         layout = str(get_kv_cache_layout())
+    
+    # MLA with PCP=1 and DCP=1 shares Store objects across TP sizes.
+    # All TP ranks use tp_rank:0 keys and stripe chunks; namespace unification
+    # allows P (TP=8) and D (TP=1) to share cached prefixes without D needing
+    # to re-save prompt KV. Other topologies remain isolated.
+    share_mla_tp = bool(model.use_mla) and pcp_size == 1 and dcp_size == 1
+    namespace_tp_size = 1 if share_mla_tp else tp_size
+    
     payload = {
         "version": 1,
         "model_id": str(model.model),
         "model_revision": str(getattr(model, "revision", None) or ""),
-        "tp_size": tp_size,
+        "tp_size": namespace_tp_size,
         "pp_size": pp_size,
         "pcp_size": pcp_size,
         "dcp_size": dcp_size,

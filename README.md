@@ -93,6 +93,10 @@ Lookup 超时转换为 ZMQ 的有符号 32 位毫秒值，正数小于 1ms 时�
 
 Pool 支持普通 KV 与 MLA，但不转换 TP/PP/PCP/DCP 布局；默认使用 topology namespace
 隔离不兼容缓存。MLA 在同一 namespace 内跨 TP ranks 共享 key，并分摊完整 chunk 的 PUT。
+MLA 部署在满足 `PCP=1` 和 `DCP=1` 时，不同 TP size 使用统一的 namespace，允许
+P (TP=8) 和 D (TP=1) 共享 Store 对象，无需 Decode 回写 prompt KV。普通注意力
+及 PCP>1 或 DCP>1 的 MLA 继续按 TP size 隔离。model、dtype、block/layout、
+group 语义、PP、PCP/DCP 配置须保持兼容。
 Transfer 支持整数倍异构 TP、按 layer 交集匹配的异构 PP，以及不同 DP size/rank 的指定副本路由。
 MHA/GQA 按唯一 KV 分片切片，MLA 复制完整 latent KV 并去除重复发送者。model、dtype、
 block/layout、group 语义及 PCP/DCP 配置仍须兼容。

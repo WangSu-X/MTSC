@@ -726,6 +726,199 @@ class MLALayoutTest(unittest.TestCase):
         self.assertNotEqual(tp1, tp2)
         self.assertTrue(tp1.startswith("tenant:mtsc-v1-"))
 
+    def test_mla_namespace_unifies_tp_sizes_when_pcp_and_dcp_are_one(self) -> None:
+        """MLA with PCP=1 and DCP=1 should generate identical namespace across TP sizes."""
+        base_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="org/mla-model",
+                revision="v1",
+                dtype=torch.float16,
+                use_mla=True,
+            ),
+            cache_config=SimpleNamespace(cache_dtype="auto"),
+            kv_transfer_config=SimpleNamespace(
+                kv_connector_extra_config={"cache_prefix": "mla"}
+            ),
+        )
+        groups = [
+            SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(block_size=16, page_size_bytes=64)
+            )
+        ]
+        kwargs = {
+            "pp_size": 1,
+            "pcp_size": 1,
+            "dcp_size": 1,
+            "block_size": 16,
+            "hash_block_size": 16,
+        }
+        with (
+            patch("mtsc.kv_cache_pool.is_npu_platform", return_value=False),
+            patch("mtsc.kv_cache_pool.get_kv_cache_layout", return_value="HND"),
+        ):
+            # All TP sizes should generate the same namespace
+            tp1 = store_topology_namespace(base_config, groups, tp_size=1, **kwargs)
+            tp2 = store_topology_namespace(base_config, groups, tp_size=2, **kwargs)
+            tp4 = store_topology_namespace(base_config, groups, tp_size=4, **kwargs)
+            tp8 = store_topology_namespace(base_config, groups, tp_size=8, **kwargs)
+
+            self.assertEqual(tp1, tp2)
+            self.assertEqual(tp1, tp4)
+            self.assertEqual(tp1, tp8)
+            self.assertTrue(tp1.startswith("mla:mtsc-v1-"))
+
+    def test_mla_namespace_still_isolates_when_pcp_or_dcp_gt_one(self) -> None:
+        """MLA with PCP>1 or DCP>1 should still separate TP sizes."""
+        base_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="org/mla-model",
+                revision="v1",
+                dtype=torch.float16,
+                use_mla=True,
+            ),
+            cache_config=SimpleNamespace(cache_dtype="auto"),
+            kv_transfer_config=SimpleNamespace(
+                kv_connector_extra_config={"cache_prefix": "mla"}
+            ),
+        )
+        groups = [
+            SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(block_size=16, page_size_bytes=64)
+            )
+        ]
+        base_kwargs = {
+            "pp_size": 1,
+            "block_size": 16,
+            "hash_block_size": 16,
+        }
+        with (
+            patch("mtsc.kv_cache_pool.is_npu_platform", return_value=False),
+            patch("mtsc.kv_cache_pool.get_kv_cache_layout", return_value="HND"),
+        ):
+            # PCP=2 should still isolate TP sizes
+            pcp2_tp1 = store_topology_namespace(
+                base_config, groups, tp_size=1, pcp_size=2, dcp_size=1, **base_kwargs
+            )
+            pcp2_tp2 = store_topology_namespace(
+                base_config, groups, tp_size=2, pcp_size=2, dcp_size=1, **base_kwargs
+            )
+            self.assertNotEqual(pcp2_tp1, pcp2_tp2)
+
+            # DCP=2 should still isolate TP sizes
+            dcp2_tp1 = store_topology_namespace(
+                base_config, groups, tp_size=1, pcp_size=1, dcp_size=2, **base_kwargs
+            )
+            dcp2_tp2 = store_topology_namespace(
+                base_config, groups, tp_size=2, pcp_size=1, dcp_size=2, **base_kwargs
+            )
+            self.assertNotEqual(dcp2_tp1, dcp2_tp2)
+
+    def test_non_mla_namespace_still_isolates_tp_sizes(self) -> None:
+        """Non-MLA models should continue to separate TP sizes."""
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="org/regular-model",
+                revision="v1",
+                dtype=torch.float16,
+                use_mla=False,
+            ),
+            cache_config=SimpleNamespace(cache_dtype="auto"),
+            kv_transfer_config=SimpleNamespace(
+                kv_connector_extra_config={"cache_prefix": "regular"}
+            ),
+        )
+        groups = [
+            SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(block_size=16, page_size_bytes=64)
+            )
+        ]
+        kwargs = {
+            "pp_size": 1,
+            "pcp_size": 1,
+            "dcp_size": 1,
+            "block_size": 16,
+            "hash_block_size": 16,
+        }
+        with (
+            patch("mtsc.kv_cache_pool.is_npu_platform", return_value=False),
+            patch("mtsc.kv_cache_pool.get_kv_cache_layout", return_value="HND"),
+        ):
+            tp1 = store_topology_namespace(config, groups, tp_size=1, **kwargs)
+            tp2 = store_topology_namespace(config, groups, tp_size=2, **kwargs)
+            tp8 = store_topology_namespace(config, groups, tp_size=8, **kwargs)
+
+            self.assertNotEqual(tp1, tp2)
+            self.assertNotEqual(tp1, tp8)
+            self.assertNotEqual(tp2, tp8)
+
+    def test_mla_namespace_still_isolates_other_topology_differences(self) -> None:
+        """MLA should still separate incompatible topologies even when TP is unified."""
+        base_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="org/mla-model",
+                revision="v1",
+                dtype=torch.float16,
+                use_mla=True,
+            ),
+            cache_config=SimpleNamespace(cache_dtype="auto"),
+            kv_transfer_config=SimpleNamespace(
+                kv_connector_extra_config={"cache_prefix": "mla"}
+            ),
+        )
+        groups = [
+            SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(block_size=16, page_size_bytes=64)
+            )
+        ]
+        base_kwargs = {
+            "tp_size": 8,
+            "pcp_size": 1,
+            "dcp_size": 1,
+            "block_size": 16,
+            "hash_block_size": 16,
+        }
+        with (
+            patch("mtsc.kv_cache_pool.is_npu_platform", return_value=False),
+            patch("mtsc.kv_cache_pool.get_kv_cache_layout", return_value="HND"),
+        ):
+            pp1 = store_topology_namespace(base_config, groups, pp_size=1, **base_kwargs)
+            pp2 = store_topology_namespace(base_config, groups, pp_size=2, **base_kwargs)
+            self.assertNotEqual(pp1, pp2)
+
+            # Different model should still separate
+            alt_config = SimpleNamespace(
+                model_config=SimpleNamespace(
+                    model="org/other-model",
+                    revision="v1",
+                    dtype=torch.float16,
+                    use_mla=True,
+                ),
+                cache_config=SimpleNamespace(cache_dtype="auto"),
+                kv_transfer_config=SimpleNamespace(
+                    kv_connector_extra_config={"cache_prefix": "mla"}
+                ),
+            )
+            other_model = store_topology_namespace(
+                alt_config, groups, pp_size=1, **base_kwargs
+            )
+            self.assertNotEqual(pp1, other_model)
+
+            # Different dtype should still separate
+            dtype_config = SimpleNamespace(
+                model_config=SimpleNamespace(
+                    model="org/mla-model",
+                    revision="v1",
+                    dtype=torch.bfloat16,
+                    use_mla=True,
+                ),
+                cache_config=SimpleNamespace(cache_dtype="auto"),
+                kv_transfer_config=SimpleNamespace(
+                    kv_connector_extra_config={"cache_prefix": "mla"}
+                ),
+            )
+            bf16 = store_topology_namespace(dtype_config, groups, pp_size=1, **base_kwargs)
+            self.assertNotEqual(pp1, bf16)
+
     def test_store_uses_one_shared_key_and_striped_puts(self) -> None:
         for tp_size in (1, 2, 4, 8):
             for tp_rank in range(tp_size):
