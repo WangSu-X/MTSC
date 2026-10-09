@@ -97,6 +97,28 @@ def _worker(config):
 
 
 class MetadataFlowTest(unittest.TestCase):
+    def test_worker_submits_ready_transfers_in_one_batch(self):
+        _, config, metadata = self._decode_metadata()
+        first = metadata.transfer_plans[0]
+        second = replace(first, request_id="request-2", transfer_id="transfer-2")
+        metadata.transfer_plans = [first, second]
+        worker = _worker(config)
+        worker.get_finished(set(), metadata)
+        worker.pool.poll.return_value = PoolPollResult(
+            loads=[LoadResult(first.request_id, 48), LoadResult(second.request_id, 64)]
+        )
+        worker.get_finished(set(), MTSCConnectorMetadata())
+        worker.transfer.recv_batch.assert_called_once()
+        events = worker.transfer.recv_batch.call_args.args[0]
+        self.assertEqual(
+            [event.request_id for event in events],
+            [first.request_id, second.request_id],
+        )
+        self.assertEqual(
+            [event.block_ids for event in events],
+            [((13, 14, 15, 16),), ((14, 15, 16),)],
+        )
+
     def test_lookup_boolean_config_reaches_lookup_with_correct_mode(self):
         for value, expected in (
             (False, False),
@@ -143,7 +165,7 @@ class MetadataFlowTest(unittest.TestCase):
         load = worker.pool.load.call_args.args[0]
         self.assertEqual((load.start_load, load.end_load), (32, 80))
         self.assertIs(worker._on_load_requests[load.request_id], metadata.pool_loads[0])
-        worker.transfer.recv.assert_not_called()
+        worker.transfer.recv_batch.assert_not_called()
 
         worker.pool.poll.return_value = PoolPollResult(
             loads=[LoadResult(load.request_id, 48, "partial miss")]
@@ -153,7 +175,7 @@ class MetadataFlowTest(unittest.TestCase):
             worker.get_finished(set(), MTSCConnectorMetadata()), (None, None)
         )
         self.assertEqual(worker._on_load_requests, {})
-        recv = worker.transfer.recv.call_args.args[0]
+        recv = worker.transfer.recv_batch.call_args.args[0][0]
         self.assertEqual(recv.block_ids, ((13, 14, 15, 16),))
         self.assertEqual(recv.transfer_id, "transfer-1")
         self.assertEqual(worker.get_block_ids_with_load_errors(), set())
@@ -186,7 +208,7 @@ class MetadataFlowTest(unittest.TestCase):
             worker.get_finished(set(), MTSCConnectorMetadata()),
             (None, {request.request_id}),
         )
-        worker.transfer.recv.assert_not_called()
+        worker.transfer.recv_batch.assert_not_called()
         self.assertEqual(worker._on_load_requests, {})
 
     def test_full_local_hit_still_notifies_transfer_source(self):
@@ -200,7 +222,7 @@ class MetadataFlowTest(unittest.TestCase):
         self.assertEqual(metadata.pool_loads, [])
         worker = _worker(config)
         worker.get_finished(set(), metadata)
-        recv = worker.transfer.recv.call_args.args[0]
+        recv = worker.transfer.recv_batch.call_args.args[0][0]
         self.assertEqual(recv.block_ids, ((),))
         worker.transfer.poll.return_value = TransferPollResult(
             recvs=[TransferResult(request.request_id)]
@@ -226,7 +248,7 @@ class MetadataFlowTest(unittest.TestCase):
         worker.pool.take_errors.return_value = {13, 14}
         self.assertEqual(worker.get_finished(set(), metadata), (None, {"request-1"}))
         self.assertEqual(worker.get_block_ids_with_load_errors(), {13, 14})
-        worker.transfer.recv.assert_not_called()
+        worker.transfer.recv_batch.assert_not_called()
 
     def test_lookup_retry_drops_stale_load_decision(self):
         scheduler, _ = _scheduler(consumer=False)

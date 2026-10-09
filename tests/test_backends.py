@@ -412,6 +412,9 @@ def _transfer():
     transfer.dp_rank = 2
     transfer.tp_size = transfer.pp_size = 1
     transfer.num_blocks = 6
+    transfer._num_blocks_resolved = True
+    transfer.num_sender_tasks = 2
+    transfer.sender_worker_queue = asyncio.Queue()
     transfer.tp_rank = transfer.pp_rank = 0
     transfer.timeout = 1
     transfer.protocol = "rdma"
@@ -699,9 +702,9 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         async def write(*args):
             entered.set()
             await release.wait()
-            return True, {0}
+            return {tid: (True, {0}) for tid in args[0]}
 
-        transfer._write_one = write
+        transfer._write_batch = write
         transfer.send(SendEvent("p-r", "x", ((1,),)))
         request = asyncio.create_task(
             transfer._serve(
@@ -882,9 +885,9 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             calls.append(args)
             entered.set()
             await release.wait()
-            return True, {0}
+            return {tid: (True, {0}) for tid in args[0]}
 
-        transfer._write_one = write
+        transfer._write_batch = write
         socket = _Socket()
         payload = msgspec.msgpack.encode(_request(transfer))
         first = asyncio.create_task(transfer._serve(b"a", payload, socket))

@@ -91,6 +91,7 @@ classDiagram
         cancel(request_id, transfer_id)
         send(SendEvent)
         recv(RecvEvent)
+        recv_batch(list[RecvEvent])
         poll() TransferPollResult
         take_errors() set
         preempt(request_id)
@@ -129,7 +130,7 @@ classDiagram
 | Pool `save()` | 接收增量保存范围，同 request 的 pending 工作在安全条件下合并 |
 | Transfer `prepare()` / `cancel()` | 登记尚未 ready 的 P 会话；永久取消并拒绝迟到请求 |
 | Transfer `send()` | P 发布已经 ready 的源 block 表，等待 D 请求后发送 |
-| Transfer `recv()` | D 发现目标 P workers，提交目标 block 表，等待 P 写入和终态通知 |
+| Transfer `recv()` / `recv_batch()` | D 发现目标 P workers，批量提交目标 block 表，等待 P 写入和各请求终态通知 |
 | `poll()` / `take_errors()` | 收取安全终态与无效目标 block；Worker 决定 fallback 或最终上报 |
 | `preempt()` / `close()` | 停止或等待相关 I/O，内存访问终止后才允许复用 block 或释放资源 |
 
@@ -233,9 +234,12 @@ request 继续运行时可多次收到 `SaveResult`，之后也可继续 save。
 ### 3.4 D 发起请求、P WRITE
 
 1. P 在 KV 可被传输层安全读取后调用 `send()`，发布 ready 的完整源 block 表；此调用不等待接收方或 I/O。
-2. D 调用 `recv()`，后端经 bootstrap 查找指定 engine/DP 的 workers，派生 TP/PP 配对及目标内存描述，发送控制请求。
-3. P 等源发布与 D 请求齐备，按每组目标 block 数量，选取源表等长后缀执行 WRITE。
-4. P 完成写入后通知 D；P 聚合全部预期目标的终态，D 聚合全部必要 worker 的响应与覆盖校验。
+2. D 将同一 Worker 轮次可直传的请求通过 `recv_batch()` 提交；后端按 bootstrap、engine、DP 分组，派生 TP/PP 配对，将多个 transfer_id 合成一条发往各匹配 P worker 的控制消息。`recv()` 等价于单请求批次。
+3. P 对齐 vLLM MooncakeConnector：控制消息进入无容量上限的 `sender_worker_queue`，由 `2 * num_workers` 个固定发送协程处理。消息中的请求同时等待源 ready，每轮将已 ready 请求的地址数组合并，调用一次 TE WRITE；未 ready 的请求继续等待，不阻塞该消息内已 ready 请求。
+4. 源和目标 block 同时连续、两侧 offset 为零且复制覆盖完整物理 block 时，将连续 block 合为较大的传输描述符；TP 切片、半页及 padding 不满足条件时逐 block 复制。
+5. P 每轮返回 completed/failed transfer_ids 和 coverage；还有 pending 请求时状态为 `IN_PROGRESS`，整条消息处理完为 `COMPLETE`。D 为每个请求聚合全部必要 worker 的终态及覆盖，完成本地布局转换后即可独立报告完成。P 保留全部目标终态聚合及源访问 fence。
+
+发送线程池默认 `num_workers=10`，固定发送协程默认 20；没有额外 Semaphore、跨控制消息的 session 合并或收集窗口。TCP 保留同 session 串行、256 描述符分段及接收 ACK。直传 schema 版本为非 TCP 6、TCP 7，P/D 必须同时升级；旧版单响应接收方无法处理分轮结果。
 
 源和目标必须对应同一前缀终点，group/block 布局兼容；当前不支持任意中间区间。send 与 D 控制请求谁先到都可等待匹配。D 成功结果必须包含必要的本地布局转换与设备同步。目标为空时不搬运 KV，但仍需会话确认，使 P 能结束源会话；这一已有行为需在后端适配时保留。
 
@@ -310,15 +314,16 @@ PP size 相同时联系配对 rank，不同时联系对应 TP 的全部 P PP wor
 DP 使用 Proxy 指定的 engine/DP 身份选择 P 副本，不进行跨副本聚合或隐式请求迁移。
 PCP/DCP size 进入 Transfer schema 并要求一致。
 
-Transfer 协议版本为 2，携带双方 engine/DP 身份、目标容量及内存描述。每个源会话绑定一个 D 副本/拓扑，
+Transfer 协议版本为 6（TCP 为 7），携带双方 engine/DP 身份、目标容量、内存描述及批量请求的分轮结果。每个源会话绑定一个 D 副本/拓扑，
 按唯一 `(engine, DP, TP, PP)` 目标聚合终态；重复请求只等待原任务，不再次 WRITE 或重复计数。
 同一目标修改 destination 描述会被拒绝。退休 ID 保留到后端 close，阻止迟到请求再次读取已释放源 blocks。
+整批请求校验失败时，仍需等待该批次所有已有目标的 WRITE 终态，再回复 FAILED；等待集合在校验及创建新目标前收集，不依赖请求顺序，也不等待本批次自身尚未发送的目标。
 
 ### 4.4 Fence 与清理
 
 任何接收 peer 失败后，仍等待其余已发布目标地址的 peer 终态，才报告 recv 失败。
 源超时不能结束 active WRITE；空目标仍完成控制握手。
-P shutdown 保留控制 socket，直到在途 handler 发出终态响应，再关闭 listener 和注册内存。
+P shutdown 及 listener 退出均先排空已接收消息，等待原生 WRITE 完成并发出终态响应，再取消空闲发送协程、关闭控制 socket 和注册内存。
 Pool timeout 标记失败但等待同步 GET 返回。pending save 可取消，running save 必须停止源读取后才能复用 blocks。
 
 ## 5. 验证与后续工作
@@ -326,6 +331,7 @@ Pool timeout 标记失败但等待同步 GET 返回。pending save 可取消，r
 `tests/test_backends.py` 覆盖具体后端的 save 合并、ready 信号、累计错误、增量结果、部分 load、timeout、
 抢占、空 recv、迟到请求、目标去重、指定 DP 身份、多 peer fence，以及模拟 TE 字节写入的异构 TP/PP/MLA。
 `tests/test_mtsc.py` 保留 namespace、MLA key、设备注册、coverage、lookup、Proxy 和 legacy helper 回归测试。
+`tests/test_transfer_batching.py` 覆盖 ready 合并、分轮完成、连续 block 合并、共享批次取消、异常重复请求 fence、部分失败隔离及 listener 退出时的 WRITE fence，并通过真实 ZMQ 控制通道和模拟 TE 校验批量拷贝。
 这些测试不代表真实 Mooncake/GPU E2E 已通过。
 
 后续验证：真实 GPU/Mooncake 的同构及异构 TP/PP E2E、MLA 模型与 Ascend NZ 实机验证；

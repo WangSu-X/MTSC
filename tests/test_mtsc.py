@@ -198,6 +198,10 @@ class FailureFallbackTest(unittest.TestCase):
         def recv(self, event) -> None:
             self.receives.append(event)
 
+        def recv_batch(self, events) -> None:
+            for event in events:
+                self.recv(event)
+
         def poll(self) -> TransferPollResult:
             return TransferPollResult(
                 recvs=[TransferResult(rid, "failed") for rid in self.failed]
@@ -479,6 +483,7 @@ class NPUDataPathTest(unittest.TestCase):
         store = object.__new__(MooncakeKVCachePool)
         store._closed = store._registered = False
         store.num_blocks = 4
+        store._num_blocks_resolved = True
         store.store = Backend()
         database = Database()
         store.databases = [database]
@@ -515,6 +520,7 @@ class NPUDataPathTest(unittest.TestCase):
         v_cache = torch.empty((4, 16, 1, 2), dtype=torch.float16)
         pd = object.__new__(MooncakeKVTransfer)
         pd._closed = pd._registered = False
+        pd._num_blocks_resolved = False
         pd.layer_specs = {"model.layers.0.self_attn": spec}
         pd.layer_groups = {"model.layers.0.self_attn": 0}
         pd.engine = Engine()
@@ -881,8 +887,12 @@ class MLALayoutTest(unittest.TestCase):
             patch("mtsc.kv_cache_pool.is_npu_platform", return_value=False),
             patch("mtsc.kv_cache_pool.get_kv_cache_layout", return_value="HND"),
         ):
-            pp1 = store_topology_namespace(base_config, groups, pp_size=1, **base_kwargs)
-            pp2 = store_topology_namespace(base_config, groups, pp_size=2, **base_kwargs)
+            pp1 = store_topology_namespace(
+                base_config, groups, pp_size=1, **base_kwargs
+            )
+            pp2 = store_topology_namespace(
+                base_config, groups, pp_size=2, **base_kwargs
+            )
             self.assertNotEqual(pp1, pp2)
 
             # Different model should still separate
@@ -916,7 +926,9 @@ class MLALayoutTest(unittest.TestCase):
                     kv_connector_extra_config={"cache_prefix": "mla"}
                 ),
             )
-            bf16 = store_topology_namespace(dtype_config, groups, pp_size=1, **base_kwargs)
+            bf16 = store_topology_namespace(
+                dtype_config, groups, pp_size=1, **base_kwargs
+            )
             self.assertNotEqual(pp1, bf16)
 
     def test_store_uses_one_shared_key_and_striped_puts(self) -> None:
@@ -957,6 +969,7 @@ class MLALayoutTest(unittest.TestCase):
         cache = torch.empty((4, 16, 8), dtype=torch.float16)
         pd = object.__new__(MooncakeKVTransfer)
         pd._closed = pd._registered = False
+        pd._num_blocks_resolved = False
         pd.layer_specs = {"model.layers.0.self_attn": spec}
         pd.layer_groups = {"model.layers.0.self_attn": 0}
         pd.topology = Topology()
@@ -1094,9 +1107,9 @@ class PreemptionLifecycleTest(unittest.TestCase):
 
         async def failed_write(*_args):
             self.assertEqual(source.active_writes, 1)
-            return False, set()
+            return {tid: (False, set()) for tid in _args[0]}
 
-        pd._write_one = failed_write
+        pd._write_batch = failed_write
         asyncio.run(pd._write_target(source, None, "d1"))
 
         self.assertEqual(source.active_writes, 0)
@@ -1302,6 +1315,8 @@ class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
         pd = object.__new__(MooncakeKVTransfer)
         pd._closed = False
         pd.schema = schema
+        pd._source_lock = threading.Lock()
+        pd._sources = {}
         pd._request_decoder = msgspec.msgpack.Decoder(KVTransferRequest)
         pd._response_decoder = msgspec.msgpack.Decoder(KVTransferResponse)
         pd._encoder = msgspec.msgpack.Encoder()
@@ -1350,9 +1365,9 @@ class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
         pd._encoder = msgspec.msgpack.Encoder()
 
         async def write(*_args):
-            return True, set()
+            return {tid: (True, set()) for tid in _args[0]}
 
-        pd._write_one = write
+        pd._write_batch = write
         await pd._serve(b"d", pd._encoder.encode(request), Socket())
         self.assertEqual(source.expected, 2)
         self.assertEqual(source.terminal, 1)

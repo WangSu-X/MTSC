@@ -1,9 +1,9 @@
 """Worker KV transfer contract and Mooncake Transfer Engine implementation."""
 
 from __future__ import annotations
-import logging
 
 import asyncio
+import logging
 import math
 import os
 import threading
@@ -223,6 +223,11 @@ class KVTransfer(ABC):
         including any required device synchronization or layout conversion.
         """
 
+    def recv_batch(self, recv_events: list[RecvEvent]) -> None:
+        """Submit the receives made ready by one worker step."""
+        for event in recv_events:
+            self.recv(event)
+
     @abstractmethod
     def poll(self) -> TransferPollResult:
         """Drain terminal send/recv results without waiting for I/O.
@@ -434,6 +439,7 @@ class _Session:
     transfer_id: str
     block_ids: BlockIds = ()
     ready: threading.Event = field(default_factory=threading.Event)
+    ready_waiters: set[asyncio.Future] = field(default_factory=set)
     published: bool = False
     abort: bool = False
     expected: int = 0
@@ -474,6 +480,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         if not math.isfinite(self.timeout) or self.timeout <= 0:
             raise ValueError("mtsc_pd_timeout_seconds must be finite and positive")
         max_workers = max(1, int(extra.get("num_workers", 10)))
+        self.num_sender_tasks = max_workers * 2
         self.device_id = torch.accelerator.current_device_index()
         current_platform.set_device(self.device_id)
         default_protocol = "ascend" if is_npu_platform() else "rdma"
@@ -525,10 +532,9 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         else:
             cache_layout = "mla" if model.use_mla else "hnd"
         self.schema = KVTransferSchema(
-            # Versions 4/5 key requests, terminal results and coverage by
-            # transfer_id. Keep TCP distinct from the other transports and
-            # reject earlier peers before destination writes.
-            topology_version=5 if protocol == "tcp" else 4,
+            # Versions 6/7 add batched pulls and incremental terminal responses.
+            # Older receivers cannot fence a multi-response transfer.
+            topology_version=7 if protocol == "tcp" else 6,
             pcp_size=getattr(parallel, "prefill_context_parallel_size", 1),
             dcp_size=getattr(parallel, "decode_context_parallel_size", 1),
             model_id=str(model.model),
@@ -573,6 +579,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         self._loop_thread.start()
         self._listener_future = None
         self._serve_tasks: set[asyncio.Task[None]] = set()
+        self.sender_worker_queue: asyncio.Queue[tuple[bytes, bytes]] = asyncio.Queue()
         self._send_pool = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="mtsc-te-write",
@@ -617,8 +624,10 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 raise ValueError(
                     "num_gpu_blocks must be initialized before MooncakeKVTransfer"
                 )
-            logger.info("MTSC KVTransfer inferred num_blocks=%d from KV cache tensors",
-                        self.num_blocks)
+            logger.info(
+                "MTSC KVTransfer inferred num_blocks=%d from KV cache tensors",
+                self.num_blocks,
+            )
         is_npu = is_npu_platform()
         if is_npu:
             pointers, lengths = npu_registration_regions(kv_caches)
@@ -753,37 +762,80 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             source.published = True
             source.expires_at = time.monotonic() + self.timeout
             self._pending_sends.add(event.request_id)
-            source.ready.set()
+            self._signal_ready_locked(source)
             if source.expected > 0 and source.terminal >= source.expected:
                 self._retire_locked(source)
 
     def recv(self, event: RecvEvent) -> None:
+        self.recv_batch([event])
+
+    def recv_batch(self, events: list[RecvEvent]) -> None:
         self._check_open()
         if not self._registered:
             raise RuntimeError("Register KV memory before recv")
-        if event.request_id in self._recv_events or event.request_id in self._invalid:
-            raise ValueError("Uncollected recv or block errors for request")
-        if event.transfer_id in self._retired:
-            raise ValueError("Transfer attempt is retired")
-        self._recv_events[event.request_id] = event
+        if not events:
+            return
+        request_ids: set[str] = set()
+        transfer_ids: set[str] = set()
+        groups: defaultdict[tuple[str, str, int], list[RecvEvent]] = defaultdict(list)
+        for event in events:
+            if (
+                event.request_id in self._recv_events
+                or event.request_id in self._invalid
+                or event.request_id in request_ids
+            ):
+                raise ValueError("Uncollected recv or block errors for request")
+            if event.transfer_id in self._retired or event.transfer_id in transfer_ids:
+                raise ValueError("Transfer attempt is retired or duplicated")
+            request_ids.add(event.request_id)
+            transfer_ids.add(event.transfer_id)
+            groups[
+                (event.bootstrap_addr, event.remote_engine_id, event.remote_dp_rank)
+            ].append(event)
+        futures = {event.request_id: Future() for event in events}
+        with self._receive_lock:
+            self._receive_futures.update(futures)
+        self._recv_events.update((event.request_id, event) for event in events)
         try:
-            self._submit_receive(
-                event.request_id,
-                event.transfer_id,
-                [list(ids) for ids in event.block_ids],
-                event.remote_engine_id,
-                event.bootstrap_addr,
-                event.remote_dp_rank,
+            asyncio.run_coroutine_threadsafe(
+                self._receive_groups(groups, futures), self._loop
             )
         except Exception:
-            self._recv_events.pop(event.request_id, None)
+            with self._receive_lock:
+                for event in events:
+                    self._receive_futures.pop(event.request_id, None)
+                    self._recv_events.pop(event.request_id, None)
             raise
+
+    @staticmethod
+    def _signal_ready_locked(source: _Session) -> None:
+        source.ready.set()
+
+        def wake(waiter):
+            if not waiter.done():
+                waiter.set_result(None)
+
+        for waiter in source.ready_waiters:
+            waiter.get_loop().call_soon_threadsafe(wake, waiter)
+
+    async def _wait_source_ready(self, source: _Session) -> bool:
+        with self._source_lock:
+            if source.ready.is_set():
+                return True
+            waiter = asyncio.get_running_loop().create_future()
+            source.ready_waiters.add(waiter)
+        try:
+            await waiter
+            return True
+        finally:
+            with self._source_lock:
+                source.ready_waiters.discard(waiter)
 
     def _retire_locked(self, source: _Session, *, report: bool = True) -> None:
         if source.active_writes:
             raise RuntimeError("Cannot retire a source with active WRITEs")
         source.abort = True
-        source.ready.set()
+        self._signal_ready_locked(source)
         self._retired.add(source.transfer_id)
         self._sources.pop(source.transfer_id, None)
         if report and source.published:
@@ -798,15 +850,35 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 self._finished_send.add(source.request_id)
 
     async def _serve(self, identity, payload, socket) -> None:
-        completed = []
-        failed = []
-        coverage = {}
+        waiting = {}
+        owners = {}
+        existing_targets = []
         try:
+            request = self._request_decoder.decode(payload)
+            target = (
+                request.engine_id,
+                request.dp_rank,
+                request.tp_rank,
+                request.pp_rank,
+            )
+            # Snapshot the entire batch before validation can fail or this
+            # handler creates targets of its own. A batch-wide failure must
+            # fence existing WRITEs regardless of request iteration order.
+            with self._source_lock:
+                for transfer_id in request.requests:
+                    source = self._sources.get(transfer_id)
+                    if source is not None:
+                        previous = source.targets.get(target)
+                        if previous is not None:
+                            existing_targets.append(previous)
             if self._closed:
                 raise RuntimeError("P transfer is closing")
-            request = self._request_decoder.decode(payload)
-            logger.info("MTSC P _serve got request: transfer_ids=%s from engine=%s dp=%d",
-                        list(request.requests.keys()), request.engine_id, request.dp_rank)
+            logger.info(
+                "MTSC P _serve got request: transfer_ids=%s from engine=%s dp=%d",
+                list(request.requests.keys()),
+                request.engine_id,
+                request.dp_rank,
+            )
             if request.schema != self.schema:
                 raise ValueError("P/D transfer schema mismatch")
             if (
@@ -830,12 +902,6 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 request.dp_rank,
                 request.tp_size,
                 request.pp_size,
-            )
-            target = (
-                request.engine_id,
-                request.dp_rank,
-                request.tp_rank,
-                request.pp_rank,
             )
             for transfer_id, (request_id, _) in request.requests.items():
                 descriptor = (
@@ -881,69 +947,146 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                         else:
                             owner = False
                 if source is None:
-                    failed.append(transfer_id)
-                    continue
-                if owner:
-                    ok, covered = await self._write_target(source, request, transfer_id)
-                    previous.set_result((ok, covered))
+                    task = asyncio.get_running_loop().create_future()
+                    task.set_result((False, set()))
+                elif owner:
+                    owners[transfer_id] = (source, previous)
+                    task = asyncio.create_task(self._wait_source_ready(source))
                 else:
                     # A duplicate pull joins the original fence. It must never
                     # write again or increment source completion twice.
-                    ok, covered = await asyncio.shield(previous)
-                if ok:
-                    completed.append(transfer_id)
-                    coverage[transfer_id] = sorted(covered)
-                else:
-                    failed.append(transfer_id)
-            response = KVTransferResponse(
-                KVTransferStatus.COMPLETE,
-                completed or None,
-                failed or None,
-                "transfer failed" if failed else None,
-                coverage or None,
-            )
+                    task = asyncio.shield(previous)
+                waiting[task] = transfer_id
+
+            while waiting:
+                done, _ = await asyncio.wait(
+                    waiting,
+                    timeout=self.timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                timed_out = not done
+                if timed_out:
+                    # Like MooncakeConnector, abort the pending ready waits
+                    # when a whole round times out. Duplicate pulls still join
+                    # their original WRITE fence before reporting a result.
+                    done = set(waiting)
+                    for task, tid in waiting.items():
+                        if tid in owners:
+                            task.cancel()
+                    await asyncio.gather(*done, return_exceptions=True)
+                results = {}
+                ready_sources = {}
+                for task in done:
+                    transfer_id = waiting.pop(task)
+                    if transfer_id in owners:
+                        source, previous = owners[transfer_id]
+                        if not timed_out and task.result():
+                            ready_sources[transfer_id] = source
+                        else:
+                            self._finish_target(source, False, False)
+                            results[transfer_id] = (False, set())
+                    else:
+                        results[transfer_id] = task.result()
+                if ready_sources:
+                    results.update(
+                        await self._write_ready_targets(ready_sources, request)
+                    )
+                for transfer_id, result in results.items():
+                    owned = owners.pop(transfer_id, None)
+                    if owned is not None:
+                        owned[1].set_result(result)
+                completed = [tid for tid, (ok, _) in results.items() if ok]
+                failed = [tid for tid, (ok, _) in results.items() if not ok]
+                response = KVTransferResponse(
+                    KVTransferStatus.IN_PROGRESS
+                    if waiting
+                    else KVTransferStatus.COMPLETE,
+                    completed or None,
+                    failed or None,
+                    "transfer failed" if failed else None,
+                    {tid: sorted(results[tid][1]) for tid in completed} or None,
+                )
+                await socket.send_multipart((identity, self._encoder.encode(response)))
+            if not request.requests:
+                await socket.send_multipart(
+                    (
+                        identity,
+                        self._encoder.encode(
+                            KVTransferResponse(KVTransferStatus.COMPLETE)
+                        ),
+                    )
+                )
         except Exception as exc:  # noqa: BLE001 - control response boundary
             logger.warning("MTSC P _serve failed: error=%s", exc)
+            # A malformed sibling must not turn a duplicate's in-flight WRITE
+            # into an early terminal response authorizing destination reuse.
+            if existing_targets:
+                await asyncio.gather(
+                    *(asyncio.shield(future) for future in existing_targets),
+                    return_exceptions=True,
+                )
             response = KVTransferResponse(
                 KVTransferStatus.FAILED, error_message=str(exc)
             )
-        await socket.send_multipart((identity, self._encoder.encode(response)))
+            await socket.send_multipart((identity, self._encoder.encode(response)))
+        finally:
+            for task in waiting:
+                task.cancel()
+            if waiting:
+                await asyncio.gather(*waiting, return_exceptions=True)
+            for source, previous in owners.values():
+                self._finish_target(source, False, False)
+                if not previous.done():
+                    previous.set_result((False, set()))
 
     async def _write_target(self, source, request, transfer_id):
-        ready = await asyncio.to_thread(source.ready.wait, self.timeout)
+        try:
+            await asyncio.wait_for(self._wait_source_ready(source), self.timeout)
+        except asyncio.TimeoutError:
+            self._finish_target(source, False, False)
+            return False, set()
+        return (await self._write_ready_targets({transfer_id: source}, request))[
+            transfer_id
+        ]
+
+    async def _write_ready_targets(self, sources, request):
+        results = {tid: (False, set()) for tid in sources}
         with self._source_lock:
-            active = (
-                ready and not source.abort and source.transfer_id not in self._retired
-            )
-            if active:
+            active = {
+                tid: source
+                for tid, source in sources.items()
+                if not source.abort and source.transfer_id not in self._retired
+            }
+            for source in active.values():
                 source.active_writes += 1
-        ok, covered = False, set()
         try:
             if active:
-                ok, covered = await self._write_one(transfer_id, source, request)
+                results.update(await self._write_batch(active, request))
         except Exception as exc:  # noqa: BLE001 - native WRITE result boundary
             logger.warning(
-                "MTSC Transfer WRITE failed: request_id=%s transfer_id=%s error=%s",
-                source.request_id,
-                source.transfer_id,
+                "MTSC Transfer WRITE failed: transfer_ids=%s error=%s",
+                list(active),
                 exc,
             )
-            ok, covered = False, set()
         finally:
-            with self._source_changed:
-                if active:
-                    source.active_writes -= 1
-                source.terminal += 1
-                source.completed += int(ok)
-                if source.active_writes == 0:
-                    self._source_changed.notify_all()
-                    if (
-                        self._sources.get(source.transfer_id) is source
-                        and source.published
-                        and source.terminal >= source.expected
-                    ):
-                        self._retire_locked(source)
-        return ok, covered
+            for tid, source in sources.items():
+                self._finish_target(source, tid in active, results[tid][0])
+        return results
+
+    def _finish_target(self, source, active, ok):
+        with self._source_changed:
+            if active:
+                source.active_writes -= 1
+            source.terminal += 1
+            source.completed += int(ok)
+            if source.active_writes == 0:
+                self._source_changed.notify_all()
+                if (
+                    self._sources.get(source.transfer_id) is source
+                    and source.published
+                    and source.terminal >= source.expected
+                ):
+                    self._retire_locked(source)
 
     def poll(self) -> TransferPollResult:
         result = TransferPollResult()
@@ -1006,7 +1149,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 if source.request_id and source.request_id != request_id:
                     raise ValueError("Cannot cancel another request's session")
                 source.abort = True
-                source.ready.set()
+                self._signal_ready_locked(source)
                 while source.active_writes:
                     self._source_changed.wait()
                 self._retire_locked(source, report=False)
@@ -1039,39 +1182,44 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         with self._source_lock:
             for source in self._sources.values():
                 source.abort = True
-                source.ready.set()
+                self._signal_ready_locked(source)
         # D may have already published destination addresses. A remote P can
         # legally keep writing until its terminal response arrives, so fence
         # every receive before registered cache memory can be torn down.
         with self._receive_lock:
             receive_ids = set(self._receive_futures)
         self._fence_receives(receive_ids)
-        # A running WRITE still uses both registered GPU memory and the TE.
-        self._send_pool.shutdown(wait=True, cancel_futures=True)
         if self._loop.is_running():
 
             async def close_context() -> None:
                 # ZMQ sockets belong to this event-loop thread. Destroying the
                 # context from the vLLM main thread can trip libzmq's signaler
                 # assertion during process shutdown.
-                if self._serve_tasks:
-                    await asyncio.gather(
-                        *tuple(self._serve_tasks), return_exceptions=True
-                    )
+                # Drain accepted messages and native WRITEs before stopping
+                # the fixed sender workers or closing the response socket.
+                await self.sender_worker_queue.join()
                 # Keep the ROUTER alive until terminal responses have been
                 # delivered. Closing it earlier can strand D's receive fence.
                 if self._listener_future is not None:
                     self._listener_future.cancel()
                     await asyncio.sleep(0)
+                if self._serve_tasks:
+                    await asyncio.gather(
+                        *tuple(self._serve_tasks), return_exceptions=True
+                    )
                 self._ctx.destroy(linger=0)
                 await asyncio.sleep(0)
                 await self._loop.shutdown_default_executor()
 
             future = asyncio.run_coroutine_threadsafe(close_context(), self._loop)
             future.result()
+            # Native writes are fenced; pool shutdown can no longer strand D.
+            self._send_pool.shutdown(wait=True, cancel_futures=True)
             self._loop.call_soon_threadsafe(self._loop.stop)
             self._loop_thread.join()
             self._loop.close()
+        else:
+            self._send_pool.shutdown(wait=True, cancel_futures=True)
         if self._bootstrap is not None:
             self._bootstrap.close()
         if self._registered_storage:
@@ -1135,19 +1283,40 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         try:
             port = socket.bind_to_random_port(f"tcp://{self.hostname}")
             await self._register_worker(port)
+            self._serve_tasks.update(
+                asyncio.create_task(self._sender_worker(socket))
+                for _ in range(self.num_sender_tasks)
+            )
             ready.set()
             while True:
                 identity, payload = await socket.recv_multipart()
-                task = asyncio.create_task(self._serve(identity, payload, socket))
-                self._serve_tasks.add(task)
-                task.add_done_callback(self._serve_tasks.discard)
+                await self.sender_worker_queue.put((identity, payload))
         except (asyncio.CancelledError, zmq.ContextTerminated):
             pass
         except Exception:
             ready.set()
             raise
         finally:
+            # Cancelling an asyncio worker cannot stop its native TE thread.
+            # Fence accepted batches and deliver their terminal responses
+            # before cancelling idle workers or closing the ROUTER.
+            await self.sender_worker_queue.join()
+            for task in self._serve_tasks:
+                task.cancel()
+            if self._serve_tasks:
+                await asyncio.gather(*self._serve_tasks, return_exceptions=True)
+            self._serve_tasks.clear()
             socket.close(linger=0)
+
+    async def _sender_worker(self, socket) -> None:
+        while True:
+            identity, payload = await self.sender_worker_queue.get()
+            try:
+                await self._serve(identity, payload, socket)
+            except Exception as exc:  # noqa: BLE001 - sender worker boundary
+                logger.warning("MTSC sender worker failed: error=%s", exc)
+            finally:
+                self.sender_worker_queue.task_done()
 
     def _aligned_regions(
         self, request: KVTransferRequest
@@ -1230,15 +1399,56 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
     async def _write_one(
         self, transfer_id: str, source: _Session, request: KVTransferRequest
     ) -> tuple[bool, set[int]]:
+        return (await self._write_batch({transfer_id: source}, request))[transfer_id]
+
+    async def _write_batch(self, sources, request):
+        src, dst, sizes = [], [], []
+        results = {tid: (False, set()) for tid in sources}
+        coverage = {}
+        for transfer_id, source in sources.items():
+            try:
+                local_src, local_dst, local_sizes, covered = (
+                    self._build_request_transfer_params(transfer_id, source, request)
+                )
+            except Exception as exc:  # noqa: BLE001 - per-request validation
+                logger.warning(
+                    "MTSC transfer plan failed: transfer_id=%s error=%s",
+                    transfer_id,
+                    exc,
+                )
+                continue
+            src.extend(local_src)
+            dst.extend(local_dst)
+            sizes.extend(local_sizes)
+            coverage[transfer_id] = covered
+        ret = 0
+        if src:
+            session = f"{request.hostname}:{request.rpc_port}"
+            logger.info(
+                "MTSC P WRITE batch: transfer_ids=%s session=%s descriptors=%d",
+                list(coverage),
+                session,
+                len(src),
+            )
+            ret = await self._write_buffers(session, src, dst, sizes)
+            if ret != 0:
+                logger.warning(
+                    "MTSC TE WRITE failed: transfer_ids=%s ret=%s", list(coverage), ret
+                )
+        for transfer_id, covered in coverage.items():
+            results[transfer_id] = (ret == 0, covered if ret == 0 else set())
+        return results
+
+    def _build_request_transfer_params(self, transfer_id, source, request):
         _, destination_groups = request.requests[transfer_id]
         if not any(destination_groups):
-            return True, set()
+            return [], [], [], set()
         if len(source.block_ids) != len(destination_groups):
-            return False, set()
+            raise ValueError("P/D KV group count mismatch")
         source_groups: list[list[int]] = []
         for local, remote in zip(source.block_ids, destination_groups, strict=True):
             if len(local) < len(remote):
-                return False, set()
+                raise ValueError("P has fewer source blocks than D requested")
             source_groups.append(local[-len(remote) :] if remote else [])
         src: list[int] = []
         dst: list[int] = []
@@ -1275,6 +1485,13 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 length,
             )
             covered.add(remote_index)
+            region_start = len(src)
+            can_coalesce = (
+                src_offset == 0
+                and dst_offset == 0
+                and length == local_region.block_length
+                and length == remote_region.block_length
+            )
             for source_block, destination_block in zip(
                 source_groups[group], destination_groups[group], strict=True
             ):
@@ -1289,28 +1506,28 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                     and destination_block >= request.destination_num_blocks
                 ):
                     raise ValueError("Destination block exceeds registered memory")
-                src.append(
+                src_address = (
                     local_region.base_address
                     + source_block * local_region.block_length
                     + src_offset
                 )
-                dst.append(
+                dst_address = (
                     remote_region.base_address
                     + destination_block * remote_region.block_length
                     + dst_offset
                 )
-                sizes.append(length)
-        if not src:
-            return True, covered
-        session = f"{request.hostname}:{request.rpc_port}"
-        logger.info("MTSC P _write_one: transfer_id=%s session=%s src_blocks=%d",
-                    transfer_id, session, len(src))
-        ret = await self._write_buffers(session, src, dst, sizes)
-        if ret != 0:
-            logger.warning(
-                "MTSC TE WRITE failed: transfer_id=%s ret=%s", transfer_id, ret
-            )
-        return ret == 0, covered if ret == 0 else set()
+                if (
+                    can_coalesce
+                    and len(src) > region_start
+                    and src[-1] + sizes[-1] == src_address
+                    and dst[-1] + sizes[-1] == dst_address
+                ):
+                    sizes[-1] += length
+                else:
+                    src.append(src_address)
+                    dst.append(dst_address)
+                    sizes.append(length)
+        return src, dst, sizes, covered
 
     async def _write_buffers(self, session, src, dst, sizes) -> int:
         async def write(start, end):
@@ -1360,8 +1577,13 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         }
         tp_size = int(entry.get("tp_size", 0))
         pp_size = int(entry.get("pp_size", 0))
-        logger.info("MTSC D _query_workers: engine=%s dp=%d tp_size=%d workers=%s",
-                    engine_id, dp_rank, tp_size, {k: v for k, v in workers.items()})
+        logger.info(
+            "MTSC D _query_workers: engine=%s dp=%d tp_size=%d workers=%s",
+            engine_id,
+            dp_rank,
+            tp_size,
+            {k: v for k, v in workers.items()},
+        )
         if tp_size <= 0 or pp_size <= 0:
             raise ValueError("Remote P topology dimensions are missing")
         if sorted(workers) != list(range(tp_size)):
@@ -1397,6 +1619,11 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 f"expected={expected} invalid={invalid} unexpected={unexpected}"
             )
 
+    async def _receive_groups(self, groups, futures) -> None:
+        await asyncio.gather(
+            *(self._receive_batch(events, futures) for events in groups.values())
+        )
+
     async def _receive(
         self,
         request_id: str,
@@ -1406,10 +1633,39 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         bootstrap: str,
         remote_dp_rank: int,
     ) -> None:
-        failed = False
+        await self._receive_batch(
+            [
+                RecvEvent(
+                    request_id,
+                    transfer_id,
+                    tuple(tuple(ids) for ids in block_ids),
+                    bootstrap,
+                    remote_engine_id,
+                    remote_dp_rank,
+                )
+            ]
+        )
+
+    def _finish_receive(self, event, failed, future=None) -> None:
+        logger.info(
+            "MTSC D receive done: request_id=%s failed=%s", event.request_id, failed
+        )
+        if failed:
+            with self._result_lock:
+                self._failed_recv.add(event.request_id)
+        if future is not None and not future.done():
+            future.set_result(None)
+
+    async def _receive_batch(self, events, futures=None) -> None:
+        futures = futures or {}
+        finished: set[str] = set()
+        by_id = {event.transfer_id: event for event in events}
+        if not events:
+            return
+        first = events[0]
         try:
             workers = await self._query_workers(
-                bootstrap, remote_engine_id, remote_dp_rank
+                first.bootstrap_addr, first.remote_engine_id, first.remote_dp_rank
             )
             target_tp = self.topology.handshake_target_ranks(len(workers))
             addresses: list[str] = []
@@ -1423,8 +1679,12 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 addresses.extend(pp_map[rank] for rank in pp_ranks)
             if not addresses:
                 raise RuntimeError("No matching P workers in bootstrap response")
-            logger.info("MTSC D _receive: request_id=%s transfer_id=%s target_tp=%s addresses=%s",
-                        request_id, transfer_id, target_tp, addresses)
+            logger.info(
+                "MTSC D receive batch: transfer_ids=%s target_tp=%s addresses=%s",
+                list(by_id),
+                target_tp,
+                addresses,
+            )
             request = KVTransferRequest(
                 hostname=self.hostname,
                 rpc_port=self.rpc_port,
@@ -1433,7 +1693,13 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 pp_size=self.pp_size,
                 pp_rank=self.pp_rank,
                 schema=self.schema,
-                requests={transfer_id: (request_id, block_ids)},
+                requests={
+                    event.transfer_id: (
+                        event.request_id,
+                        [list(ids) for ids in event.block_ids],
+                    )
+                    for event in events
+                },
                 region_base_addresses=[region.base_address for region in self.regions],
                 block_lengths=[region.block_length for region in self.regions],
                 kv_block_lengths=[region.kv_block_length for region in self.regions],
@@ -1442,23 +1708,98 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 group_indices=[region.group_index for region in self.regions],
                 engine_id=self.engine_id,
                 dp_rank=self.dp_rank,
-                remote_engine_id=remote_engine_id,
-                remote_dp_rank=remote_dp_rank,
+                remote_engine_id=first.remote_engine_id,
+                remote_dp_rank=first.remote_dp_rank,
                 destination_num_blocks=self.num_blocks,
             )
             payload = self._encoder.encode(request)
+            responses = {tid: {} for tid in by_id}
+            p_shards = effective_tp(
+                len(workers), self.topology.total_num_kv_heads, self.schema.is_mla
+            )
+            d_shards = effective_tp(
+                self.tp_size, self.topology.total_num_kv_heads, self.schema.is_mla
+            )
+            expected = max(1, p_shards // d_shards)
 
-            async def call(address: str) -> KVTransferResponse:
+            def record(address, transfer_id, response):
+                peer_responses = responses[transfer_id]
+                peer_responses[address] = response
+                if len(peer_responses) != len(addresses):
+                    return
+                event = by_id[transfer_id]
+                failed = any(
+                    transfer_id not in (result.completed_transfer_ids or [])
+                    or transfer_id in (result.failed_transfer_ids or [])
+                    or result.status == KVTransferStatus.FAILED
+                    for result in peer_responses.values()
+                )
+                if not failed:
+                    try:
+                        if any(event.block_ids):
+                            self._validate_coverage(
+                                transfer_id,
+                                event.block_ids,
+                                list(peer_responses.values()),
+                                expected,
+                            )
+                        self.reformat_npu_blocks(event.block_ids, len(workers))
+                    except Exception as exc:  # noqa: BLE001 - completion boundary
+                        logger.warning(
+                            "MTSC D completion failed: transfer_id=%s error=%s",
+                            transfer_id,
+                            exc,
+                        )
+                        failed = True
+                self._finish_receive(event, failed, futures.get(event.request_id))
+                finished.add(transfer_id)
+
+            async def call(address: str) -> None:
                 socket = self._ctx.socket(zmq.DEALER)
-                socket.setsockopt(zmq.LINGER, 0)
-                socket.connect(address)
+                remaining = set(by_id)
                 try:
+                    socket.setsockopt(zmq.LINGER, 0)
+                    socket.connect(address)
                     await socket.send(payload)
-                    # Once P has the destination addresses it may already be
-                    # writing. Do not time out locally and release D blocks;
-                    # wait for P's terminal response to fence the DMA.
-                    raw = await socket.recv()
-                    return self._response_decoder.decode(raw)
+                    # A local timeout cannot fence published destination memory.
+                    # Each response is terminal for the IDs it reports, while
+                    # IN_PROGRESS keeps this socket open for the other IDs.
+                    while True:
+                        response = self._response_decoder.decode(await socket.recv())
+                        if response.status == KVTransferStatus.FAILED:
+                            raise RuntimeError(
+                                response.error_message or "P peer failed"
+                            )
+                        if response.status not in (
+                            KVTransferStatus.IN_PROGRESS,
+                            KVTransferStatus.COMPLETE,
+                        ):
+                            raise ValueError("Invalid P response status")
+                        completed = set(response.completed_transfer_ids or [])
+                        failed = set(response.failed_transfer_ids or [])
+                        reported = completed | failed
+                        if completed & failed or not reported <= remaining:
+                            raise ValueError(
+                                "P response contains conflicting or repeated transfer IDs"
+                            )
+                        for tid in reported:
+                            record(address, tid, response)
+                        remaining.difference_update(reported)
+                        if response.status == KVTransferStatus.COMPLETE:
+                            if remaining:
+                                raise ValueError(
+                                    "P final response omitted pending transfer IDs"
+                                )
+                            break
+                except Exception as exc:  # noqa: BLE001 - peer response boundary
+                    logger.warning(
+                        "MTSC D peer pull failed: address=%s error=%s", address, exc
+                    )
+                    response = KVTransferResponse(
+                        KVTransferStatus.FAILED, error_message=str(exc)
+                    )
+                    for tid in remaining:
+                        record(address, tid, response)
                 finally:
                     socket.close(linger=0)
 
@@ -1471,61 +1812,14 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             ]
             if errors:
                 raise RuntimeError(f"P peer request failed: {errors[0]}")
-            responses = outcomes
-            failed = any(
-                response.status != KVTransferStatus.COMPLETE
-                or transfer_id not in (response.completed_transfer_ids or [])
-                or transfer_id in (response.failed_transfer_ids or [])
-                for response in responses
-            )
-            if not failed and any(block_ids):
-                p_shards = effective_tp(
-                    len(workers), self.topology.total_num_kv_heads, self.schema.is_mla
-                )
-                d_shards = effective_tp(
-                    self.tp_size, self.topology.total_num_kv_heads, self.schema.is_mla
-                )
-                expected = max(1, p_shards // d_shards)
-                self._validate_coverage(transfer_id, block_ids, responses, expected)
-            if not failed:
-                self.reformat_npu_blocks(block_ids, len(workers))
         except Exception as exc:  # noqa: BLE001 - async transport boundary
-            failed = True
             logger.warning(
-                "MTSC D pull failed: request_id=%s error=%s", request_id, exc
+                "MTSC D pull batch failed: transfer_ids=%s error=%s", list(by_id), exc
             )
-        logger.info("MTSC D _receive done: request_id=%s failed=%s",
-                    request_id, failed)
-        if failed:
-            with self._result_lock:
-                self._failed_recv.add(request_id)
-
-    def _submit_receive(
-        self,
-        request_id: str,
-        transfer_id: str,
-        block_ids: list[list[int]],
-        remote_engine_id: str,
-        bootstrap_address: str,
-        remote_dp_rank: int,
-    ) -> None:
-        future = asyncio.run_coroutine_threadsafe(
-            self._receive(
-                request_id,
-                transfer_id,
-                block_ids,
-                remote_engine_id,
-                bootstrap_address,
-                remote_dp_rank,
-            ),
-            self._loop,
-        )
-        with self._receive_lock:
-            previous = self._receive_futures.get(request_id)
-            if previous is not None and not previous.done():
-                future.cancel()
-                raise RuntimeError(f"Duplicate PD receive for request {request_id}")
-            self._receive_futures[request_id] = future
+        finally:
+            for transfer_id, event in by_id.items():
+                if transfer_id not in finished:
+                    self._finish_receive(event, True, futures.get(event.request_id))
 
     def _fence_receives(self, request_ids: set[str]) -> None:
         """Fence in-flight P writes before vLLM can recycle D blocks."""

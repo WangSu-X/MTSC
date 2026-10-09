@@ -280,6 +280,7 @@ class BackendSetupTest(unittest.TestCase):
             self.addCleanup(transfer.close)
             self.assertEqual(transfer.timeout, 37.5)
             self.assertEqual(transfer._send_pool._max_workers, 10)
+            self.assertEqual(transfer.num_sender_tasks, 20)
             config = _config()
             config.kv_transfer_config.kv_connector_extra_config.update(
                 mtsc_pd_timeout_seconds="12.5", num_workers=0
@@ -288,6 +289,7 @@ class BackendSetupTest(unittest.TestCase):
             try:
                 self.assertEqual(override.timeout, 12.5)
                 self.assertEqual(override._send_pool._max_workers, 1)
+                self.assertEqual(override.num_sender_tasks, 2)
             finally:
                 override.close()
         client = AsyncMock()

@@ -93,6 +93,8 @@ class MTSCConnectorMetadata(KVConnectorMetadata):
 
 
 class KVTransferStatus(IntEnum):
+    # COMPLETE ends the control message; IN_PROGRESS reports terminal results
+    # for a subset of its transfer IDs while the remaining IDs are pending.
     COMPLETE = 0
     IN_PROGRESS = 1
     FAILED = 2
@@ -139,6 +141,8 @@ class KVTransferRequest(msgspec.Struct, omit_defaults=True):  # type: ignore[cal
 
 
 class KVTransferResponse(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
+    """Per-round terminal results, including destination coverage for each ID."""
+
     status: KVTransferStatus
     completed_transfer_ids: list[str] | None = None
     failed_transfer_ids: list[str] | None = None

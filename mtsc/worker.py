@@ -1,8 +1,8 @@
 """Unified MTSC worker and Decode two-stage state machine."""
 
 from __future__ import annotations
-import logging
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -163,7 +163,11 @@ class MTSCWorker:
             state = self._finished_waits.get(save_meta.request_id)
             if state is not None:
                 state.pool_save_done = False
-        ready_updates = [source_state for source_state in metadata.transfer_states if source_state.ready]
+        ready_updates = [
+            source_state
+            for source_state in metadata.transfer_states
+            if source_state.ready
+        ]
         if ready_updates:
             # send() publishes readable source memory. This fences preceding
             # device writes before the transport can access those addresses.
@@ -238,7 +242,12 @@ class MTSCWorker:
             result.append(suffix)
         return result
 
-    def _start_transfer(self, state: _TransferState, actual_pool_prefix: int) -> bool:
+    def _start_transfer(
+        self,
+        state: _TransferState,
+        actual_pool_prefix: int,
+        receives: list[RecvEvent] | None = None,
+    ) -> bool:
         plan = state.plan
         suffix = self._suffix_blocks(plan, actual_pool_prefix)
         state.suffix_block_ids = suffix
@@ -253,16 +262,18 @@ class MTSCWorker:
             state.stage = "DONE"
             return False
         params = plan.transfer_params
-        self.transfer.recv(
-            RecvEvent(
-                plan.request_id,
-                plan.transfer_id,
-                tuple(tuple(group) for group in suffix),
-                str(params["remote_bootstrap_addr"]),
-                str(params["remote_engine_id"]),
-                int(params.get("remote_dp_rank", 0)),
-            )
+        event = RecvEvent(
+            plan.request_id,
+            plan.transfer_id,
+            tuple(tuple(group) for group in suffix),
+            str(params["remote_bootstrap_addr"]),
+            str(params["remote_engine_id"]),
+            int(params.get("remote_dp_rank", 0)),
         )
+        if receives is None:
+            self.transfer.recv(event)
+        else:
+            receives.append(event)
         state.stage = "TRANSFER_PENDING"
         if not plan.wait_for_completion:
             self._ignored_recvs.add(plan.request_id)
@@ -316,6 +327,7 @@ class MTSCWorker:
             if request_id not in staged_ids:
                 finished_recv.add(request_id)
 
+        receives: list[RecvEvent] = []
         for request_id, state in list(self._on_transfer.items()):
             if state.stage == "STORE_DONE":
                 actual = state.plan.local_tokens
@@ -332,10 +344,13 @@ class MTSCWorker:
                 )
             else:
                 continue
-            if not self._start_transfer(state, actual):
+            if not self._start_transfer(state, actual, receives):
                 if state.plan.wait_for_completion:
                     finished_recv.add(request_id)
                 del self._on_transfer[request_id]
+
+        if receives:
+            self.transfer.recv_batch(receives)
 
         transfer_results = self.transfer.poll()
         transfer_errors = self.transfer.take_errors()

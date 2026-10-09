@@ -46,10 +46,15 @@ Scheduler→Worker metadata 使用 `pool_loads`、`pool_saves` 分别描述缓�
 前需要等待的 save/send。Worker 统一跟踪所有 pool load/save，并根据实际加载
 前缀启动剩余 KV 的 transfer；等待项只发布一次，完成后清理请求状态。
 
-P↔D RPC 使用 `KVTransferRequest` / `KVTransferResponse`，协议版本为 4（TCP 为 5）。
+P↔D RPC 使用 `KVTransferRequest` / `KVTransferResponse`，协议版本为 6（TCP 为 7）。
 请求映射、完成/失败列表和 region coverage 均以 `transfer_id` 为键，
 Worker 向 Scheduler 报告完成时仍使用 `request_id`。P 和 D 需要同步升级；
 旧协议会在 schema 校验时被拒绝。
+
+直传调度对齐 vLLM MooncakeConnector：D 将同一轮可直传的请求批量提交，P 使用消息队列
+和固定发送协程，在一条消息内合并本轮 ready 请求后执行 TE WRITE，并分轮回复完成结果。
+连续完整 block 满足两侧地址连续条件时合并传输描述符。`num_workers` 默认 10，
+发送协程数为其两倍；不同控制消息分别处理。
 
 `mtsc/` 保持 7 个核心模块（另有包入口 `__init__.py`）：
 
@@ -101,8 +106,8 @@ Transfer 支持整数倍异构 TP、按 layer 交集匹配的异构 PP，以及�
 MHA/GQA 按唯一 KV 分片切片，MLA 复制完整 latent KV 并去除重复发送者。model、dtype、
 block/layout、group 语义及 PCP/DCP 配置仍须兼容。
 
-新的 Transfer 控制协议使用 `topology_version=2`，包含双方 engine/DP 身份和目标 block
-容量。P/D 应一起升级；旧协议会被拒绝。
+Transfer 控制协议使用 `topology_version=6`（TCP 为 7），包含双方 engine/DP 身份、目标
+block 容量及批量请求的分轮结果。P/D 应一起升级；旧协议会被拒绝。
 
 ## 配置示例
 
