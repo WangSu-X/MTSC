@@ -1,6 +1,7 @@
 """Unified MTSC worker and Decode two-stage state machine."""
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def _backend(config, key: str) -> str:

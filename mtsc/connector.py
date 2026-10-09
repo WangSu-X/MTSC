@@ -1,6 +1,7 @@
 """vLLM external connector entry point for the self-owned MTSC stack."""
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def _config_bool(value: Any, default: bool) -> bool:

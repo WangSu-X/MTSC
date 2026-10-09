@@ -4,6 +4,7 @@
 """Remote KV cache contract and Mooncake Store implementation."""
 
 from __future__ import annotations
+import logging
 
 import dataclasses
 import hashlib
@@ -332,6 +333,7 @@ class _CompatBlobBlockHashes(Sequence[BlockHash]):
 BlobBlockHashes = _CompatBlobBlockHashes
 
 logger = init_logger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def normalize_string_override(value: Any) -> str | None:
@@ -1262,11 +1264,9 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, config
         )
-        if config.cache_config.num_gpu_blocks is None:
-            raise ValueError(
-                "num_gpu_blocks must be initialized before MooncakeKVCachePool"
-            )
         self.num_blocks = config.cache_config.num_gpu_blocks
+        self._num_blocks_resolved = config.cache_config.num_gpu_blocks is not None
+        self._config_ref = config
         num_kv_heads, self.put_step, key_tp_rank = store_tp_layout(
             use_mla=model.use_mla,
             total_num_kv_heads=model.get_total_num_kv_heads(),
@@ -1350,6 +1350,10 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         if ret != 0:
             raise RuntimeError(f"Mooncake Store setup failed: {ret}")
         self.replicate_config = ReplicateConfig()
+        self.replicate_config.model_name = (
+            os.getenv("MOONCAKE_MODEL_NAME")
+            or model.model.rstrip("/").split("/")[-1]
+        )
         preferred = get_configured_preferred_segment(extra)
         if preferred is not None:
             self.replicate_config.preferred_segment = preferred
@@ -1392,6 +1396,20 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             raise RuntimeError("KV cache memory is already registered")
         if not kv_caches:
             raise RuntimeError("No KV caches supplied")
+        if not self._num_blocks_resolved:
+            for raw in kv_caches.values():
+                for tensor in cache_tensors(raw):
+                    if tensor.ndim > 0 and tensor.shape[0] > 0:
+                        self.num_blocks = int(tensor.shape[0])
+                        self._num_blocks_resolved = True
+                        break
+                if self._num_blocks_resolved:
+                    break
+            if not self._num_blocks_resolved:
+                raise ValueError(
+                    "num_gpu_blocks must be initialized before MooncakeKVCachePool"
+                )
+            logger.info("MTSC Store inferred num_blocks=%d from KV cache tensors", self.num_blocks)
         seen: set[int] = set()
         addresses: list[int] = []
         block_lengths: list[int] = []

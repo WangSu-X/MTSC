@@ -1,6 +1,7 @@
 """Worker KV transfer contract and Mooncake Transfer Engine implementation."""
 
 from __future__ import annotations
+import logging
 
 import asyncio
 import math
@@ -269,6 +270,7 @@ class KVTransfer(ABC):
 
 
 logger = init_logger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def _run_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -460,6 +462,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         transfer = config.kv_transfer_config
         assert transfer.engine_id is not None
         self.num_blocks = config.cache_config.num_gpu_blocks
+        self._num_blocks_resolved = config.cache_config.num_gpu_blocks is not None
         self.engine_id = transfer.engine_id
         self.is_producer = transfer.kv_role == "kv_producer"
         extra = transfer.kv_connector_extra_config
@@ -601,6 +604,21 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         if self._registered:
             raise RuntimeError("KV transfer memory is already registered")
         self.kv_caches = kv_caches
+        if not self._num_blocks_resolved:
+            for raw in kv_caches.values():
+                for tensor in cache_tensors(raw):
+                    if tensor.ndim > 0 and tensor.shape[0] > 0:
+                        self.num_blocks = int(tensor.shape[0])
+                        self._num_blocks_resolved = True
+                        break
+                if self._num_blocks_resolved:
+                    break
+            if not self._num_blocks_resolved:
+                raise ValueError(
+                    "num_gpu_blocks must be initialized before MooncakeKVTransfer"
+                )
+            logger.info("MTSC KVTransfer inferred num_blocks=%d from KV cache tensors",
+                        self.num_blocks)
         is_npu = is_npu_platform()
         if is_npu:
             pointers, lengths = npu_registration_regions(kv_caches)
@@ -787,6 +805,8 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             if self._closed:
                 raise RuntimeError("P transfer is closing")
             request = self._request_decoder.decode(payload)
+            logger.info("MTSC P _serve got request: transfer_ids=%s from engine=%s dp=%d",
+                        list(request.requests.keys()), request.engine_id, request.dp_rank)
             if request.schema != self.schema:
                 raise ValueError("P/D transfer schema mismatch")
             if (
@@ -883,6 +903,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 coverage or None,
             )
         except Exception as exc:  # noqa: BLE001 - control response boundary
+            logger.warning("MTSC P _serve failed: error=%s", exc)
             response = KVTransferResponse(
                 KVTransferStatus.FAILED, error_message=str(exc)
             )
@@ -1282,6 +1303,8 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         if not src:
             return True, covered
         session = f"{request.hostname}:{request.rpc_port}"
+        logger.info("MTSC P _write_one: transfer_id=%s session=%s src_blocks=%d",
+                    transfer_id, session, len(src))
         ret = await self._write_buffers(session, src, dst, sizes)
         if ret != 0:
             logger.warning(
@@ -1337,6 +1360,8 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         }
         tp_size = int(entry.get("tp_size", 0))
         pp_size = int(entry.get("pp_size", 0))
+        logger.info("MTSC D _query_workers: engine=%s dp=%d tp_size=%d workers=%s",
+                    engine_id, dp_rank, tp_size, {k: v for k, v in workers.items()})
         if tp_size <= 0 or pp_size <= 0:
             raise ValueError("Remote P topology dimensions are missing")
         if sorted(workers) != list(range(tp_size)):
@@ -1398,6 +1423,8 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
                 addresses.extend(pp_map[rank] for rank in pp_ranks)
             if not addresses:
                 raise RuntimeError("No matching P workers in bootstrap response")
+            logger.info("MTSC D _receive: request_id=%s transfer_id=%s target_tp=%s addresses=%s",
+                        request_id, transfer_id, target_tp, addresses)
             request = KVTransferRequest(
                 hostname=self.hostname,
                 rpc_port=self.rpc_port,
@@ -1467,6 +1494,8 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
             logger.warning(
                 "MTSC D pull failed: request_id=%s error=%s", request_id, exc
             )
+        logger.info("MTSC D _receive done: request_id=%s failed=%s",
+                    request_id, failed)
         if failed:
             with self._result_lock:
                 self._failed_recv.add(request_id)

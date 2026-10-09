@@ -1,6 +1,7 @@
 """MTSC-owned scheduler state for Store + direct P/D transfer."""
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+logger.setLevel(logging.INFO)
 
 
 @dataclass
