@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -483,6 +484,7 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         self.num_sender_tasks = max_workers * 2
         self.device_id = torch.accelerator.current_device_index()
         current_platform.set_device(self.device_id)
+        self._setup_ascend_local_comm_res()
         default_protocol = "ascend" if is_npu_platform() else "rdma"
         protocol = extra.get("mooncake_protocol", default_protocol)
         _require_tcp_write_ack(protocol)
@@ -601,6 +603,35 @@ class MooncakeKVTransfer(KVLayoutAdapter, KVTransfer):
         self._invalid: dict[str, set[int]] = {}
         self._registered = False
         self._closed = False
+
+    def _setup_ascend_local_comm_res(self) -> None:
+        """按 device 设置 ASCEND_LOCAL_COMM_RES（HIXL 机内 UB endpoint）。
+
+        与 vllm-ascend 的 setup_ascend_local_comm_res 相同：
+        读 /etc/hixlep/ub_endpoint_npu_{device}.json -> ASCEND_LOCAL_COMM_RES env。
+        缺失该 env 时 HIXL 生成错误 rank_table -> 103900。
+        """
+        if os.getenv("ASCEND_LOCAL_COMM_RES"):
+            return
+        res_path = "/etc/hixlep"
+        visible_devices = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
+        if not visible_devices:
+            return
+        devices = [int(x) for x in visible_devices.split(",") if x.strip()]
+        if not devices:
+            return
+        current_dev = int(torch.npu.current_device()) if hasattr(torch, "npu") else self.device_id
+        if current_dev not in devices:
+            return
+        endpoint_file = os.path.join(res_path, f"ub_endpoint_npu_{current_dev}.json")
+        try:
+            with open(endpoint_file, encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+        os.environ["ASCEND_LOCAL_COMM_RES"] = json.dumps(
+            data, ensure_ascii=False, separators=(",", ":")
+        )
 
     def _check_open(self) -> None:
         if self._closed:

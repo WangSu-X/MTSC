@@ -1335,6 +1335,10 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             num_kv_heads, pp_size=pp_size, pcp_size=pcp_size, dcp_size=dcp_size
         )
 
+        # 必须在 store 的 TE 初始化前设置 ASCEND_LOCAL_COMM_RES，
+        # 否则 HIXL 缺机内 UB 拓扑 -> rank_table 格式错 -> 103900。
+        self._setup_ascend_local_comm_res()
+
         cfg = StoreConfig.load()
         self.store = MooncakeDistributedStore()
         hostname = get_requester_local_hostname(get_ip())
@@ -1702,6 +1706,37 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                             state.running.result()
                         except Exception:  # noqa: BLE001, S110 - _advance_save retains the error
                             pass
+
+    def _setup_ascend_local_comm_res(self) -> None:
+        """按 device 设置 ASCEND_LOCAL_COMM_RES（HIXL 机内 UB endpoint）。
+
+        与 vllm-ascend 的 setup_ascend_local_comm_res 相同：
+        读 /etc/hixlep/ub_endpoint_npu_{device}.json -> ASCEND_LOCAL_COMM_RES env。
+        缺失该 env 时 HIXL 生成错误 rank_table -> 103900。
+        必须在 store/TE 初始化前调用。
+        """
+        if os.getenv("ASCEND_LOCAL_COMM_RES"):
+            return
+        res_path = "/etc/hixlep"
+        visible_devices = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
+        if not visible_devices:
+            return
+        devices = [int(x) for x in visible_devices.split(",") if x.strip()]
+        if not devices:
+            return
+        # 用当前进程绑定的 NPU device（P: TP=8 rank 0-7；D: DP=8 每 worker 一卡）
+        current_dev = int(torch.npu.current_device()) if hasattr(torch, "npu") else self.tp_rank
+        if current_dev not in devices:
+            return
+        endpoint_file = os.path.join(res_path, f"ub_endpoint_npu_{current_dev}.json")
+        try:
+            with open(endpoint_file, encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+        os.environ["ASCEND_LOCAL_COMM_RES"] = json.dumps(
+            data, ensure_ascii=False, separators=(",", ":")
+        )
 
     def close(self) -> None:
         with self._task_lock:
