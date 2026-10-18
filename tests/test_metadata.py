@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import msgspec
 from vllm.v1.request import RequestStatus
@@ -104,11 +104,12 @@ class MetadataFlowTest(unittest.TestCase):
         metadata.transfer_plans = [first, second]
         worker = _worker(config)
         worker.get_finished(set(), metadata)
+        worker.transfer.recv_batch.assert_called_once_with([])
         worker.pool.poll.return_value = PoolPollResult(
             loads=[LoadResult(first.request_id, 48), LoadResult(second.request_id, 64)]
         )
         worker.get_finished(set(), MTSCConnectorMetadata())
-        worker.transfer.recv_batch.assert_called_once()
+        self.assertEqual(worker.transfer.recv_batch.call_count, 2)
         events = worker.transfer.recv_batch.call_args.args[0]
         self.assertEqual(
             [event.request_id for event in events],
@@ -144,6 +145,40 @@ class MetadataFlowTest(unittest.TestCase):
                     expected,
                 )
 
+    def test_scheduler_rejects_invalid_transfer_params_before_lookup(self):
+        missing = object()
+        for field in ("remote_bootstrap_addr", "remote_engine_id"):
+            for value in (missing, None, "", "  ", 123, {}):
+                with self.subTest(field=field, value=value):
+                    scheduler, _ = _scheduler()
+                    request = _request()
+                    if value is missing:
+                        request.kv_transfer_params.pop(field)
+                    else:
+                        request.kv_transfer_params[field] = value
+                    with self.assertRaisesRegex(
+                        ValueError, f"request_id=request-1.*{field}"
+                    ):
+                        scheduler.get_num_new_matched_tokens(request, 32)
+                    scheduler.lookup_client.lookup.assert_not_called()
+                    self.assertEqual(scheduler._load_decisions, {})
+                    self.assertEqual(scheduler._transfer_decisions, {})
+
+    def test_scheduler_revalidates_transfer_params_before_publishing_plan(self):
+        for params in (None, {}, {"remote_engine_id": "producer"}):
+            with self.subTest(params=params):
+                scheduler, _ = _scheduler()
+                request = _request()
+                external, _ = scheduler.get_num_new_matched_tokens(request, 32)
+                request.kv_transfer_params = params
+                with self.assertRaisesRegex(
+                    ValueError, "request_id=request-1.*remote_bootstrap_addr"
+                ):
+                    scheduler.update_state_after_alloc(request, _blocks(), external)
+                self.assertEqual(scheduler._tracked_requests, {})
+                self.assertEqual(scheduler._batch_pool_loads, [])
+                self.assertEqual(scheduler._batch_transfers, [])
+
     def _decode_metadata(self):
         scheduler, config = _scheduler()
         request = _request()
@@ -165,7 +200,7 @@ class MetadataFlowTest(unittest.TestCase):
         load = worker.pool.load.call_args.args[0]
         self.assertEqual((load.start_load, load.end_load), (32, 80))
         self.assertIs(worker._on_load_requests[load.request_id], metadata.pool_loads[0])
-        worker.transfer.recv_batch.assert_not_called()
+        worker.transfer.recv_batch.assert_called_once_with([])
 
         worker.pool.poll.return_value = PoolPollResult(
             loads=[LoadResult(load.request_id, 48, "partial miss")]
@@ -208,7 +243,9 @@ class MetadataFlowTest(unittest.TestCase):
             worker.get_finished(set(), MTSCConnectorMetadata()),
             (None, {request.request_id}),
         )
-        worker.transfer.recv_batch.assert_not_called()
+        self.assertEqual(
+            worker.transfer.recv_batch.call_args_list, [call([]), call([])]
+        )
         self.assertEqual(worker._on_load_requests, {})
 
     def test_full_local_hit_still_notifies_transfer_source(self):
@@ -230,17 +267,15 @@ class MetadataFlowTest(unittest.TestCase):
         self.assertEqual(
             worker.get_finished(set(), MTSCConnectorMetadata()), (None, None)
         )
-        self.assertEqual(worker._ignored_recvs, set())
         self.assertEqual(worker._on_transfer, {})
 
     def test_pool_only_partial_load_invalidates_unusable_suffix(self):
-        _, config, metadata = self._decode_metadata()
-        metadata.transfer_plans[0] = replace(
-            metadata.transfer_plans[0],
-            transfer_enabled=False,
-            target_tokens=80,
-            external_block_ids=([12, 13, 14],),
-        )
+        scheduler, config = _scheduler(consumer=False)
+        request = _request(params={})
+        external, _ = scheduler.get_num_new_matched_tokens(request, 32)
+        scheduler.update_state_after_alloc(request, _blocks(), external)
+        metadata = scheduler.build_connector_meta(_output())
+        self.assertEqual(metadata.transfer_plans, [])
         worker = _worker(config)
         worker.pool.poll.return_value = PoolPollResult(
             loads=[LoadResult("request-1", 48)]
@@ -248,7 +283,7 @@ class MetadataFlowTest(unittest.TestCase):
         worker.pool.take_errors.return_value = {13, 14}
         self.assertEqual(worker.get_finished(set(), metadata), (None, {"request-1"}))
         self.assertEqual(worker.get_block_ids_with_load_errors(), {13, 14})
-        worker.transfer.recv_batch.assert_not_called()
+        worker.transfer.recv_batch.assert_called_once_with([])
 
     def test_lookup_retry_drops_stale_load_decision(self):
         scheduler, _ = _scheduler(consumer=False)
@@ -440,17 +475,14 @@ class MetadataFlowTest(unittest.TestCase):
         self.assertIsInstance(decoded.pool_loads[0], KVPoolLoadRequest)
         self.assertIsInstance(decoded.pool_saves[0], KVPoolSaveRequest)
 
-    def test_wire_response_roundtrip_reports_transfer_ids(self):
+    def test_wire_response_roundtrip_reports_decode_request_ids(self):
         response = KVTransferResponse(
-            KVTransferStatus.COMPLETE,
-            completed_transfer_ids=["transfer-1"],
-            failed_transfer_ids=["transfer-2"],
-            error_message="partial failure",
-            covered_regions={"transfer-1": [0, 1]},
+            KVTransferStatus.FINISH,
+            ok_reqs=["decode-1"],
+            err_reqs=["decode-2"],
+            err_msg="partial failure",
         )
         encoded = msgspec.msgpack.encode(response)
         decoded = msgspec.msgpack.decode(encoded, type=KVTransferResponse)
         self.assertEqual(decoded, response)
-        self.assertEqual(
-            msgspec.msgpack.decode(encoded)["completed_transfer_ids"], ["transfer-1"]
-        )
+        self.assertEqual(msgspec.msgpack.decode(encoded)["ok_reqs"], ["decode-1"])

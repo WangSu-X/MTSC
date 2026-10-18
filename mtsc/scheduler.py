@@ -1,8 +1,8 @@
 """MTSC-owned scheduler state for Store + direct P/D transfer."""
 
 from __future__ import annotations
-import logging
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -39,9 +39,9 @@ logger.setLevel(logging.INFO)
 class TransferSpec:
     """Lookup boundaries awaiting allocation for a pool + transfer load."""
 
-    local_tokens: int
-    pool_tokens: int
-    target_tokens: int
+    computed_tokens: int  # Already computed tokens (local)
+    pool_hit_tokens: int  # Tokens available in pool
+    target_tokens: int    # Target total tokens to load
 
 
 @dataclass
@@ -98,11 +98,11 @@ class MTSCScheduler:
         )
         self.has_mamba = kv_cache_config.has_mamba_layers
 
-        # Lookup decisions are consumed once local blocks are allocated.
-        self._transfer_decisions: dict[str, TransferSpec] = {}
-        self._load_decisions: dict[str, KVPoolLoadSpec] = {}
         # Retained through execution and any delayed block release.
         self._tracked_requests: dict[str, _TrackedRequest] = {}
+        # Lookup decisions are consumed once local blocks are allocated.
+        self._transfer_decisions: dict[str, TransferSpec] = {} # for requests that need to transfer blocks from a remote engine e.g. D side reqeust pull P kv cache
+        self._load_decisions: dict[str, KVPoolLoadSpec] = {}
         # Per-step operations; detached after metadata is built.
         self._batch_pool_saves: list[KVPoolSaveRequest] = []
         self._batch_pool_loads: list[KVPoolLoadRequest] = []
@@ -115,13 +115,6 @@ class MTSCScheduler:
         self._saving_requests: set[str] = set()
         self._transferring_requests: set[str] = set()
         self._delayed_releases: set[str] = set()
-
-    @staticmethod
-    def _valid_transfer(params: dict[str, Any]) -> bool:
-        return all(
-            params.get(key)
-            for key in ("transfer_id", "remote_engine_id", "remote_bootstrap_addr")
-        )
 
     def _truncate_mamba_prefill(self, request: Request) -> None:
         params = request.kv_transfer_params or {}
@@ -142,66 +135,70 @@ class MTSCScheduler:
         request.max_tokens = 1
         params["_mtsc_p_truncated"] = True
 
+    @staticmethod
+    def _validate_transfer_params(request: Request) -> None:
+        params = request.kv_transfer_params or {}
+        invalid_fields = [
+            name
+            for name in ("remote_bootstrap_addr", "remote_engine_id")
+            if not isinstance(params.get(name), str) or not params[name].strip()
+        ]
+        if invalid_fields:
+            raise ValueError(
+                "MTSC remote prefill requires non-empty string transfer parameters: "
+                f"request_id={request.request_id}, "
+                f"invalid_fields={', '.join(invalid_fields)}"
+            )
+
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         params = request.kv_transfer_params or {}
+        if self.is_consumer and params.get("do_remote_prefill"):
+            self._validate_transfer_params(request)
         if self.is_producer and params.get("do_remote_decode"):
             self._truncate_mamba_prefill(request)
 
-        lookup_tokens = request.num_tokens // self.block_size * self.block_size
+        target = request.num_prompt_tokens - (
+            1 if self.has_mamba and request.num_prompt_tokens > 1 else 0
+        )
+
+        lookup_tokens = target // self.block_size * self.block_size
         if lookup_tokens < self.block_size:
             pool_hit = 0
         else:
-            hit = self.lookup_client.lookup(
+            pool_hit = self.lookup_client.lookup(
                 request.request_id,
                 lookup_tokens,
                 request.block_hashes,
                 asynchronous=self.lookup_async,
             )
-            if hit is None:
+            if pool_hit is None:
                 logger.debug(
                     "MTSC pool lookup pending: request_id=%s", request.request_id
                 )
                 return None, False
-            pool_hit = hit
-            if pool_hit == request.num_tokens:
-                pool_hit = max(
-                    0, (request.num_tokens - 1) // self.block_size * self.block_size
-                )
 
-        pool_hit = max(num_computed_tokens, pool_hit)
         # A retry may resolve to a different hit before allocation.
         self._load_decisions.pop(request.request_id, None)
-        self._transfer_decisions.pop(request.request_id, None)
-        if not (self.is_consumer and params.get("do_remote_prefill")):
-            external = max(0, pool_hit - num_computed_tokens)
-            if external:
-                self._load_decisions[request.request_id] = KVPoolLoadSpec(
-                    num_computed_tokens, pool_hit
-                )
-            return external, external > 0
-
-        target = request.num_prompt_tokens - (
-            1 if self.has_mamba and request.num_prompt_tokens > 1 else 0
-        )
-        target = max(num_computed_tokens, min(target, request.num_tokens))
-        pool_hit = min(pool_hit, target)
-        transfer_enabled = self._valid_transfer(params)
-        if not transfer_enabled:
-            logger.warning(
-                "MTSC invalid decode transfer spec; using pool only: request_id=%s",
-                request.request_id,
-            )
-            target = pool_hit
-        self._transfer_decisions[request.request_id] = TransferSpec(
-            num_computed_tokens, pool_hit, target
-        )
+        # can load from poll
         if pool_hit > num_computed_tokens:
             self._load_decisions[request.request_id] = KVPoolLoadSpec(
-                num_computed_tokens, pool_hit
+                computed_tokens=num_computed_tokens,
+                pool_hit_tokens=pool_hit
             )
-        logger.info(
+        if not (self.is_consumer and params.get("do_remote_prefill")):
+            external = max(0, pool_hit - num_computed_tokens)
+            return external, external > 0
+
+        # for decode side pd transfer
+        self._transfer_decisions.pop(request.request_id, None)
+        self._transfer_decisions[request.request_id] = TransferSpec(
+            computed_tokens=num_computed_tokens,
+            pool_hit_tokens=pool_hit,
+            target_tokens=target
+        )
+        logger.debug(
             "MTSC transfer load planned: request_id=%s L=%d H=%d T=%d",
             request.request_id,
             num_computed_tokens,
@@ -215,6 +212,8 @@ class MTSCScheduler:
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ) -> None:
         params = request.kv_transfer_params or {}
+        if request.request_id in self._transfer_decisions:
+            self._validate_transfer_params(request)
         all_blocks = _groups(blocks.get_block_ids())
         tracked = self._tracked_requests.get(request.request_id)
         if tracked is None:
@@ -223,20 +222,19 @@ class MTSCScheduler:
         elif all_blocks:
             tracked.block_ids = all_blocks
 
-        transfer_spec = self._transfer_decisions.pop(request.request_id, None)
         load_spec = self._load_decisions.pop(request.request_id, None)
-        if load_spec is not None and (
-            transfer_spec is not None or num_external_tokens > 0
-        ):
+        if load_spec is not None:
             self._batch_pool_loads.append(
                 KVPoolLoadRequest(
                     request.request_id,
                     all_blocks,
                     list(request.block_hashes),
-                    load_spec.local_tokens,
-                    load_spec.pool_tokens,
+                    load_spec.computed_tokens,
+                    load_spec.pool_hit_tokens,
                 )
             )
+
+        transfer_spec = self._transfer_decisions.pop(request.request_id, None)
         if transfer_spec is not None:
             external_blocks = _groups(blocks.get_unhashed_block_ids_all_groups())
             transfer_id = str(params.get("transfer_id", request.request_id))
@@ -244,15 +242,13 @@ class MTSCScheduler:
                 KVTransferPlan(
                     request_id=request.request_id,
                     transfer_id=transfer_id,
-                    local_tokens=transfer_spec.local_tokens,
-                    pool_tokens=transfer_spec.pool_tokens,
+                    computed_tokens=transfer_spec.computed_tokens,
+                    pool_hit_tokens=transfer_spec.pool_hit_tokens,
                     target_tokens=transfer_spec.target_tokens,
                     all_block_ids=all_blocks,
                     external_block_ids=external_blocks,
                     group_block_sizes=self.group_block_sizes,
                     blocks_per_sliding_window=self.blocks_per_sliding_window,
-                    transfer_enabled=self._valid_transfer(params),
-                    wait_for_completion=num_external_tokens > 0,
                     transfer_params=dict(params),
                 )
             )
@@ -277,74 +273,74 @@ class MTSCScheduler:
                 )
 
     def _append_blocks(
-        self, tracked: _TrackedRequest, value: tuple[list[int], ...] | list[int] | None
+        self, tracked_req: _TrackedRequest, new_block_ids: tuple[list[int], ...] | list[int] | None
     ) -> None:
-        if value is None:
+        if new_block_ids is None:
             return
-        incoming = _groups(value)
-        if not tracked.block_ids:
-            tracked.block_ids = incoming
+        incoming = _groups(new_block_ids)
+        if not tracked_req.block_ids:
+            tracked_req.block_ids = incoming
             return
-        if len(incoming) != len(tracked.block_ids):
+        if len(incoming) != len(tracked_req.block_ids):
             raise ValueError("KV group count changed")
-        for current, new in zip(tracked.block_ids, incoming, strict=True):
+        for current, new in zip(tracked_req.block_ids, incoming, strict=True):
             current.extend(new)
 
     def _build_save_meta(
-        self, tracked: _TrackedRequest, token_count: int, *, decode: bool
+        self, tracked_req: _TrackedRequest, token_count: int, *, decode: bool
     ) -> KVPoolSaveRequest | None:
         complete = token_count // self.block_size * self.block_size
-        start = tracked.saved_tokens
+        start = tracked_req.saved_tokens
         if decode:
             prompt_end = (
-                cdiv(tracked.request.num_prompt_tokens, self.block_size)
+                cdiv(tracked_req.request.num_prompt_tokens, self.block_size)
                 * self.block_size
             )
             start = max(start, prompt_end)
         if complete <= start:
             return None
-        tracked.saved_tokens = complete
-        self._saving_requests.add(tracked.request.request_id)
+        tracked_req.saved_tokens = complete
+        self._saving_requests.add(tracked_req.request.request_id)
         return KVPoolSaveRequest(
-            tracked.request.request_id,
-            tuple(group.copy() for group in tracked.block_ids),
-            list(tracked.request.block_hashes),
+            tracked_req.request.request_id,
+            tuple(group.copy() for group in tracked_req.block_ids),
+            list(tracked_req.request.block_hashes),
             start_token=start,
             end_token=complete,
-            prompt_tokens=tracked.request.num_prompt_tokens,
+            prompt_tokens=tracked_req.request.num_prompt_tokens,
         )
 
     def build_connector_meta(self, output: SchedulerOutput) -> MTSCConnectorMetadata:
-        loading = {request.request_id for request in self._batch_pool_loads}
+        pool_loading_req_ids = {request.request_id for request in self._batch_pool_loads}
         allow_save = self.is_producer or self.decode_save
         if allow_save:
             # 1. requests newly scheduled this step
             for req in output.scheduled_new_reqs:
-                tracked = self._tracked_requests.get(req.req_id)
-                if tracked is None or req.req_id in loading:
+                tracked_req = self._tracked_requests.get(req.req_id)
+                if tracked_req is None or req.req_id in pool_loading_req_ids:
                     continue
-                tracked.block_ids = _groups(req.block_ids)
+                tracked_req.block_ids = _groups(req.block_ids)
                 token_count = (
                     req.num_computed_tokens + output.num_scheduled_tokens[req.req_id]
                 )
                 save_meta = self._build_save_meta(
-                    tracked, token_count, decode=self.is_consumer
+                    tracked_req, token_count, decode=self.is_consumer
                 )
                 if save_meta is not None:
                     self._batch_pool_saves.append(save_meta)
             # 2. requests already running (cached) that continue this step
             cached = output.scheduled_cached_reqs
             for index, request_id in enumerate(cached.req_ids):
-                tracked = self._tracked_requests.get(request_id)
-                if tracked is None:
+                tracked_req = self._tracked_requests.get(request_id)
+                if tracked_req is None:
                     continue
-                self._append_blocks(tracked, cached.new_block_ids[index])
+                self._append_blocks(tracked_req, cached.new_block_ids[index])
                 token_count = (
                     cached.num_computed_tokens[index]
                     + output.num_scheduled_tokens[request_id]
                 )
                 save_meta = self._build_save_meta(
-                    tracked, token_count, decode=self.is_consumer
+                    tracked_req, token_count, decode=self.is_consumer
                 )
                 if save_meta is not None:
                     self._batch_pool_saves.append(save_meta)
@@ -430,6 +426,7 @@ class MTSCScheduler:
                         request.request_id, str(params["transfer_id"]), cancelled=True
                     )
                 )
+
         pool_save_delay = request.request_id in self._saving_requests and any(block_ids)
         delay = pool_save_delay or transfer_delay
         if delay:

@@ -5,6 +5,7 @@ import ctypes
 import threading
 import time
 import unittest
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
@@ -16,9 +17,11 @@ import zmq
 import zmq.asyncio
 
 from mtsc.kv_cache_pool import (
+    KeyMetadata,
     KVCachePool,
     LoadEvent,
     MooncakeKVCachePool,
+    PoolKey,
     PoolPollResult,
     SaveEvent,
     SaveResult,
@@ -32,17 +35,20 @@ from mtsc.kv_transfer import (
     TransferRegion,
     _NPUTransferTopology,
     _require_tcp_write_ack,
-    effective_tp,
-    kv_slice_plan,
+    _Session,
+)
+from mtsc.kv_transfer import (
+    _compute_sender_transfer_plan as local_sender_plan,
 )
 from mtsc.protocol import (
     FinishedWait,
     KVPoolSaveRequest,
     KVTransferRequest,
     KVTransferResponse,
-    KVTransferSchema,
+    KVTransferStatus,
     MTSCConnectorMetadata,
 )
+from mtsc.utils import effective_tp
 from mtsc.worker import MTSCWorker
 
 
@@ -51,10 +57,11 @@ class _Database:
 
     def process_tokens(self, token_count, hashes, start):
         for index in range((start + 15) // 16, token_count // 16):
-            yield index * 16, (index + 1) * 16, hashes[index]
-
-    def key_for(self, value):
-        return value.hex()
+            yield (
+                index * 16,
+                (index + 1) * 16,
+                PoolKey(KeyMetadata("model", 0, 0, 0, 0), hashes[index].hex()),
+            )
 
     def prepare_value(self, start, end, ids):
         block = ids[start // 16]
@@ -97,9 +104,9 @@ class _Ready:
 
 def _pool():
     pool = object.__new__(MooncakeKVCachePool)
+    pool._task_lock = threading.RLock()
     pool._closed = False
     pool._registered = True
-    pool._task_lock = threading.RLock()
     pool._save_states = {}
     pool._invalid = {}
     pool._loads = {}
@@ -119,7 +126,6 @@ def _pool():
     pool.tp_rank = 0
     pool.tp_size = 1
     pool.num_blocks = 100
-    pool.cache_namespace = "test"
     pool.kv_caches = {}
     return pool
 
@@ -269,16 +275,18 @@ class PoolBackendTest(unittest.TestCase):
         self.assertEqual(self.pool.take_errors(), {11, 12})
         self.assertEqual(self.pool.poll().loads, [])
 
-    def test_load_completion_includes_device_conversion_without_blocking_poll(self):
+    def test_load_completion_waits_for_store_writes_without_blocking_poll(self):
         entered, release = threading.Event(), threading.Event()
         self.addCleanup(release.set)
+        store_get = self.pool.store.batch_get_into_multi_buffers
 
-        def convert(*args):
+        def get(*args):
             entered.set()
             if not release.wait(3):
-                raise TimeoutError("Test did not release layout conversion")
+                raise TimeoutError("Test did not release Store GET")
+            return store_get(*args)
 
-        self.pool.reformat_npu_blocks = convert
+        self.pool.store.batch_get_into_multi_buffers = get
         self.pool.load(LoadEvent("r", ((10, 11),), (b"a", b"b"), 0, 32))
         self.assertTrue(entered.wait(1))
         self.assertEqual(self.pool.poll().loads, [])
@@ -319,38 +327,9 @@ class PoolBackendTest(unittest.TestCase):
 
 
 class KVTopologyTest(unittest.TestCase):
-    def test_failed_layout_conversion_still_fences_device_writes(self):
-        transfer = _transfer()
-        transfer.device_id = 0
-        transfer.topology = _NPUTransferTopology(0, 1, 2, False, 2)
-        transfer.npu_kv_nz = False
-        transfer.kv_caches = {
-            "layer.0": torch.tensor([[[0, 1], [10, 11]]]),
-            "layer.1": torch.tensor(0),
-        }
-        transfer.layer_groups = {"layer.0": 0, "layer.1": 0}
-        transfer.layer_specs = {}
-        fences = []
-        with (
-            patch("mtsc.utils.is_npu_platform", return_value=True),
-            patch(
-                "mtsc.utils.current_platform",
-                SimpleNamespace(set_device=lambda device: None),
-            ),
-            patch.object(
-                torch,
-                "npu",
-                SimpleNamespace(synchronize=lambda: fences.append(True)),
-                create=True,
-            ),
-            self.assertRaises(ValueError),
-        ):
-            transfer.reformat_npu_blocks([[0]], 2)
-        self.assertEqual(fences, [True])
-
-    def test_every_target_byte_is_written_once_for_mha_gqa_and_mla(self):
+    def test_every_target_byte_is_written_once_for_mha_and_mla(self):
         for mla in (False, True):
-            for heads in (1, 2, 4, 8):
+            for heads in (8,):
                 for p_size in (1, 2, 4, 8):
                     for d_size in (1, 2, 4, 8):
                         p_shards = effective_tp(p_size, heads, mla)
@@ -368,15 +347,14 @@ class KVTopologyTest(unittest.TestCase):
                                 else [d_rank // (d_size // p_size)]
                             )
                             for p_rank in peers:
-                                copy, src, dst, count, _, _ = kv_slice_plan(
+                                copy, src, dst, count = local_sender_plan(
                                     p_rank,
                                     p_size,
                                     d_rank,
                                     d_size,
                                     total // p_shards,
                                     total // d_shards,
-                                    heads,
-                                    mla,
+                                    mla or p_size > heads,
                                 )
                                 if copy:
                                     shard_start = (p_rank // (p_size // p_shards)) * (
@@ -399,28 +377,32 @@ class KVTopologyTest(unittest.TestCase):
                             )
 
     def test_nonintegral_tp_ratio_rejected(self):
-        with self.assertRaises(ValueError):
-            kv_slice_plan(0, 2, 0, 3, 32, 32, 6, False)
+        with self.assertRaises(AssertionError):
+            local_sender_plan(0, 2, 0, 3, 32, 32, False or 2 > 6)
 
 
 def _transfer():
     transfer = object.__new__(MooncakeKVTransfer)
+    transfer._remote_layouts = OrderedDict()
+    transfer.layer_groups = {}
+    transfer.has_mamba = False
     transfer._closed = False
+    transfer._receive_error = None
     transfer._registered = True
     transfer.is_producer = True
     transfer.engine_id = "p"
     transfer.dp_rank = 2
     transfer.tp_size = transfer.pp_size = 1
     transfer.num_blocks = 6
-    transfer._num_blocks_resolved = True
     transfer.num_sender_tasks = 2
     transfer.sender_worker_queue = asyncio.Queue()
     transfer.tp_rank = transfer.pp_rank = 0
     transfer.timeout = 1
     transfer.protocol = "rdma"
-    transfer._tcp_write_locks = {}
+    transfer.kv_caches_base_addr = []
+    transfer.block_lens = []
+    transfer.regions = [TransferRegion(1000, 16, 16)]
     transfer.topology = _NPUTransferTopology(0, 1, 16, False, 8)
-    transfer.schema = KVTransferSchema(2, "model", "", "float16", "hnd", 16, False)
     transfer._source_lock = threading.Lock()
     transfer._source_changed = threading.Condition(transfer._source_lock)
     transfer._result_lock = threading.Lock()
@@ -443,26 +425,7 @@ def _transfer():
 
 def _request(transfer, **kwargs):
     return KVTransferRequest(
-        "host",
-        123,
-        1,
-        0,
-        1,
-        0,
-        transfer.schema,
-        {"x": ("d-r", [[4]])},
-        [2000],
-        [16],
-        [16],
-        layer_names=["layer.0"],
-        layer_indices=[0],
-        group_indices=[0],
-        engine_id="d",
-        dp_rank=3,
-        remote_engine_id="p",
-        remote_dp_rank=2,
-        destination_num_blocks=6,
-        **kwargs,
+        "host", 123, 1, 0, {"d-r": ("x", [[4]])}, [2000], [16], **kwargs
     )
 
 
@@ -516,61 +479,48 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         transfer.send(replace(event, transfer_id="next"))
         self.assertEqual(transfer._sources["next"].request_id, "p-r")
 
-    async def test_tcp_batches_apply_backpressure_for_concurrent_same_peer(self):
+    async def test_native_write_receives_whole_batch(self):
         transfer = _transfer()
-        transfer.protocol = "tcp"
         transfer._loop = asyncio.get_running_loop()
-        transfer._send_pool = ThreadPoolExecutor(max_workers=2)
-        entered, release = threading.Event(), threading.Event()
         calls = []
-
-        def write(session, src, dst, sizes):
-            calls.append((session, list(src)))
-            if len(calls) == 1:
-                entered.set()
-                if not release.wait(3):
-                    raise TimeoutError("Test did not release receiver ACK")
-            return 0
-
-        transfer.engine = SimpleNamespace(batch_transfer_sync_write=write)
-        first = asyncio.create_task(
-            transfer._write_buffers("peer", list(range(600)), [0] * 600, [1] * 600)
+        transfer.engine = SimpleNamespace(
+            batch_transfer_sync_write=lambda *args: calls.append(args) or 0
         )
-        try:
-            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
-            second = asyncio.create_task(
-                transfer._write_buffers("peer", [900], [0], [1])
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            transfer._send_pool = pool
+            self.assertEqual(
+                await transfer._write_buffers(
+                    "peer", list(range(600)), [0] * 600, [1] * 600
+                ),
+                0,
             )
-            await asyncio.sleep(0.01)
-            self.assertEqual(len(calls), 1)
-            self.assertFalse(first.done())
-            self.assertFalse(second.done())
-            release.set()
-            self.assertEqual(await asyncio.gather(first, second), [0, 0])
-            self.assertEqual([len(src) for _, src in calls], [256, 256, 88, 1])
-            self.assertEqual([i for _, src in calls for i in src], [*range(600), 900])
-        finally:
-            release.set()
-            await first
-            transfer._send_pool.shutdown(wait=True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], list(range(600)))
 
-    async def test_tcp_schema_rejects_legacy_peer_before_write(self):
-        for local_version, remote_version in [(3, 2), (2, 3)]:
-            with self.subTest(local=local_version, remote=remote_version):
-                transfer = _transfer()
-                transfer.schema = msgspec.structs.replace(
-                    transfer.schema, topology_version=local_version
-                )
-                request = _request(transfer)
-                request.schema = msgspec.structs.replace(
-                    request.schema, topology_version=remote_version
-                )
-                socket = _Socket()
-                await transfer._serve(b"peer", msgspec.msgpack.encode(request), socket)
-                self.assertEqual(
-                    socket.messages[0].error_message, "P/D transfer schema mismatch"
-                )
-                self.assertEqual(transfer._sources, {})
+    async def test_region_mismatch_is_rejected_before_write(self):
+        transfer = _transfer()
+        transfer.regions = [TransferRegion(1000, 16, 16)]
+        request = msgspec.structs.replace(_request(transfer), block_lens=[32])
+        socket = _Socket()
+        await transfer._serve(b"peer", msgspec.msgpack.encode(request), socket)
+        self.assertEqual(socket.messages[0].status, KVTransferStatus.ERROR)
+        self.assertIn("length mismatch", socket.messages[0].err_msg)
+        self.assertEqual(transfer._sources, {})
+
+    async def test_replicated_gqa_uses_head_counts_when_building_the_plan(self):
+        transfer = _transfer()
+        transfer.tp_size = 8
+        transfer.topology = _NPUTransferTopology(0, 8, 16, False, 2)
+        request = msgspec.structs.replace(_request(transfer), block_lens=[32])
+        src, dst, sizes = transfer._build_request_transfer_params(
+            "d-r", _Session("p-r", "x", block_ids=((1,),)), request
+        )
+        self.assertEqual((src, dst, sizes), ([1016], [2128], [16]))
+        transfer.tp_rank = 4
+        src, dst, sizes = transfer._build_request_transfer_params(
+            "d-r", _Session("p-r", "x", block_ids=((1,),)), request
+        )
+        self.assertEqual((src, dst, sizes), ([1016], [2144], [16]))
 
     async def test_blocks_first_write_copies_k_and_v_with_tp_slicing(self):
         class CopyEngine:
@@ -590,6 +540,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             transfer.topology = SimpleNamespace(
                 virtually_split_kv_in_blocks=True,
                 total_num_kv_heads=2,
+                local_replicates_kv_cache=False,
                 is_mla=False,
                 get_transfer_cache_regions=lambda raw, spec: [raw],
             )
@@ -613,25 +564,26 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                 receiver = registered(target, tp_size, tp_rank)
                 request = msgspec.structs.replace(
                     _request(sender),
-                    tp_size=tp_size,
-                    tp_rank=tp_rank,
-                    region_base_addresses=[r.base_address for r in receiver.regions],
-                    block_lengths=[r.block_length for r in receiver.regions],
-                    kv_block_lengths=[r.kv_block_length for r in receiver.regions],
-                    layer_names=[r.layer_name for r in receiver.regions],
-                    layer_indices=[r.layer_index for r in receiver.regions],
-                    group_indices=[r.group_index for r in receiver.regions],
+                    remote_tp_size=tp_size,
+                    remote_tp_rank=tp_rank,
+                    kv_caches_base_addr=receiver.kv_caches_base_addr,
+                    block_lens=receiver.block_lens,
+                    kv_block_lens=[r.kv_block_len for r in receiver.regions],
+                    registered_layer_names=[r.layer_name for r in receiver.regions],
+                    registered_layer_indices=[r.layer_index for r in receiver.regions],
+                    registered_group_indices=[r.group_index for r in receiver.regions],
                 )
-                ok, covered = await sender._write_one(
-                    "x", SimpleNamespace(block_ids=[[2]]), request
-                )
+                ok = (
+                    await sender._write_batch(
+                        {"d-r": SimpleNamespace(block_ids=[[2]])}, request
+                    )
+                )["d-r"]
                 expected = (
                     source[2]
                     if tp_size == 1
                     else source[2, :, :, tp_rank : tp_rank + 1, :]
                 )
                 self.assertTrue(ok)
-                self.assertEqual(covered, {0, 1})
                 self.assertTrue(torch.equal(target[4], expected))
                 self.assertTrue(torch.all(target[:4] == -1))
                 self.assertTrue(torch.all(target[5] == -1))
@@ -650,7 +602,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             transfer.side_port = port
 
         transfer.engine = SimpleNamespace(batch_transfer_sync_write=write)
-        transfer.regions = [TransferRegion("layer.0", 0, 0, 1000, 16, 16)]
+        transfer.regions = [TransferRegion(1000, 16, 16)]
         transfer.hostname = "127.0.0.1"
         transfer._register_worker = register
         transfer._ctx = zmq.asyncio.Context()
@@ -681,7 +633,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             response = msgspec.msgpack.decode(
                 await asyncio.wait_for(client.recv(), 2), type=KVTransferResponse
             )
-            self.assertEqual(response.completed_transfer_ids, ["x"])
+            self.assertEqual(response.ok_reqs, ["d-r"])
             await asyncio.wait_for(closing, 2)
             self.assertFalse(transfer._loop_thread.is_alive())
             self.assertTrue(transfer._loop.is_closed())
@@ -702,7 +654,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         async def write(*args):
             entered.set()
             await release.wait()
-            return {tid: (True, {0}) for tid in args[0]}
+            return dict.fromkeys(args[0], True)
 
         transfer._write_batch = write
         transfer.send(SendEvent("p-r", "x", ((1,),)))
@@ -751,26 +703,27 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
 
             async def send(self, payload):
                 request = msgspec.msgpack.decode(payload, type=KVTransferRequest)
-                self_identity = (request.engine_id, request.dp_rank)
-                if self_identity != ("p", 2):
-                    raise AssertionError("Missing local replica identity")
-                if request.requests != {"x": ("d-r", [[]])}:
+                if request.req_blocks != {"d-r": ("x", [[]])}:
                     raise AssertionError(
-                        "Transfer wire request must be keyed by transfer_id"
+                        "Transfer wire request must be keyed by D request ID"
                     )
 
             async def recv(self):
                 if self.address == "fail":
-                    raise RuntimeError("First peer failed")
+                    return msgspec.msgpack.encode(
+                        KVTransferResponse(
+                            KVTransferStatus.ERROR, err_msg="First peer failed"
+                        )
+                    )
                 waiting.set()
                 await release.wait()
-                return msgspec.msgpack.encode(KVTransferResponse(0, ["x"]))
+                return msgspec.msgpack.encode(KVTransferResponse(0, ["d-r"]))
 
             def close(self, **kwargs):
                 pass
 
         async def query(*args):
-            return {0: {0: "fail", 1: "wait"}}
+            return {0: {0: "fail"}, 1: {0: "wait"}}
 
         transfer._ctx = SimpleNamespace(socket=lambda kind: Client())
         transfer._query_workers = query
@@ -788,12 +741,14 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         await receive
         self.assertEqual(transfer._failed_recv, {"d-r"})
 
-    async def test_real_region_plan_transfers_heterogeneous_tp_pp_and_mla(self):
+    async def test_real_region_plan_transfers_heterogeneous_tp_and_mla(self):
         # Simulate TE bytes while executing the production region mapper,
         # source suffix selection, control handlers and completion aggregation.
-        for mla in (False, True):
+        for mla, p_size, d_size in (
+            (mla, p, d) for mla in (False, True) for p, d in ((4, 2), (8, 1))
+        ):
             memory = {}
-            d_shards = 1 if mla else 2
+            d_shards = 1 if mla else d_size
             d_page = 64 // d_shards
             for layer in range(2):
                 memory[20000 + layer * 1000] = bytearray(d_page * 6)
@@ -815,59 +770,37 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                     ]
                 return 0
 
-            responses = []
-            for p_rank in (0, 1):  # Peers for D TP rank 0 of 2.
-                for pp_rank in (0, 1):
-                    transfer = _transfer()
-                    transfer.tp_size, transfer.tp_rank = 4, p_rank
-                    transfer.pp_size, transfer.pp_rank = 2, pp_rank
-                    transfer.topology = _NPUTransferTopology(p_rank, 4, 16, mla, 4)
-                    transfer.schema = msgspec.structs.replace(
-                        transfer.schema, is_mla=mla
-                    )
-                    p_page = 64 if mla else 16
-                    base = 1000 + p_rank * 4000 + pp_rank * 1000
+            for p_rank in range(p_size // d_size):  # Peers for D rank 0; PP=1.
+                transfer = _transfer()
+                transfer.tp_size, transfer.tp_rank = p_size, p_rank
+                transfer.topology = _NPUTransferTopology(p_rank, p_size, 16, mla, 8)
+                p_page = 64 if mla else 64 // p_size
+                transfer.regions = []
+                for layer in range(2):
+                    base = 1000 + p_rank * 2000 + layer * 500
                     shard_start = 0 if mla else p_rank * p_page
                     memory[base] = bytearray(
                         block * 64 + shard_start + offset
                         for block in range(3)
                         for offset in range(p_page)
                     )
-                    transfer.regions = [
-                        TransferRegion(
-                            f"layer.{pp_rank}", pp_rank, 0, base, p_page, p_page
-                        )
-                    ]
-                    transfer.engine = SimpleNamespace(batch_transfer_sync_write=write)
-                    transfer._loop = asyncio.get_running_loop()
-                    transfer.send(SendEvent("p-r", "x", ((0, 1, 2),)))
-                    request = msgspec.structs.replace(
-                        _request(transfer),
-                        tp_size=2,
-                        requests={"x": ("d-r", [[4, 5]])},
-                        region_base_addresses=[20000, 21000],
-                        block_lengths=[d_page] * 2,
-                        kv_block_lengths=[d_page] * 2,
-                        layer_names=["layer.0", "layer.1"],
-                        layer_indices=[0, 1],
-                        group_indices=[0, 0],
-                    )
-                    socket = _Socket()
-                    with ThreadPoolExecutor(max_workers=1) as executor:
-                        transfer._send_pool = executor
-                        await transfer._serve(
-                            b"a", msgspec.msgpack.encode(request), socket
-                        )
-                    responses.extend(socket.messages)
-                    self.assertIsNone(transfer.poll().sends[0].error)
-            receiver = _transfer()
-            receiver.regions = [
-                TransferRegion(
-                    f"layer.{layer}", layer, 0, 20000 + layer * 1000, d_page, d_page
+                    transfer.regions.append(TransferRegion(base, p_page, p_page))
+                transfer.engine = SimpleNamespace(batch_transfer_sync_write=write)
+                transfer._loop = asyncio.get_running_loop()
+                transfer.send(SendEvent("p-r", "x", ((0, 1, 2),)))
+                request = msgspec.structs.replace(
+                    _request(transfer),
+                    remote_tp_size=d_size,
+                    req_blocks={"d-r": ("x", [[4, 5]])},
+                    kv_caches_base_addr=[20000, 21000],
+                    block_lens=[d_page] * 2,
                 )
-                for layer in range(2)
-            ]
-            receiver._validate_coverage("x", [[4, 5]], responses, 1 if mla else 2)
+                socket = _Socket()
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    transfer._send_pool = executor
+                    await transfer._serve(b"a", msgspec.msgpack.encode(request), socket)
+                self.assertEqual(socket.messages[0].ok_reqs, ["d-r"])
+                self.assertIsNone(transfer.poll().sends[0].error)
             for layer in range(2):
                 data = memory[20000 + layer * 1000]
                 for dest, source in ((4, 1), (5, 2)):
@@ -885,7 +818,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             calls.append(args)
             entered.set()
             await release.wait()
-            return {tid: (True, {0}) for tid in args[0]}
+            return dict.fromkeys(args[0], True)
 
         transfer._write_batch = write
         socket = _Socket()
@@ -905,7 +838,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transfer.poll().sends, [])
         late = _Socket()
         await transfer._serve(b"c", payload, late)
-        self.assertEqual(late.messages[0].failed_transfer_ids, ["x"])
+        self.assertEqual(late.messages[0].err_reqs, ["d-r"])
 
     async def test_cancel_unpublished_session_wakes_early_receiver(self):
         transfer = _transfer()
@@ -916,7 +849,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         transfer.cancel("p-r", "x")
         await asyncio.wait_for(task, 1)
-        self.assertEqual(socket.messages[0].failed_transfer_ids, ["x"])
+        self.assertEqual(socket.messages[0].err_reqs, ["d-r"])
         self.assertEqual(transfer.poll().sends, [])
         with self.assertRaises(ValueError):
             transfer.prepare("p-r", "x")
@@ -928,13 +861,13 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         transfer.send(SendEvent("p-r", "x", ((1,),)))
         self.assertNotIn("x", transfer._retired)
 
-    async def test_wrong_dp_rejected_before_source_access(self):
+    async def test_unpaired_tp_rejected_before_source_access(self):
         transfer = _transfer()
         socket = _Socket()
-        request = msgspec.structs.replace(_request(transfer), remote_dp_rank=99)
+        request = msgspec.structs.replace(_request(transfer), remote_tp_rank=1)
         await transfer._serve(b"a", msgspec.msgpack.encode(request), socket)
         self.assertEqual(
-            socket.messages[0].error_message, "P engine/DP identity mismatch"
+            socket.messages[0].err_msg, "D TP rank is not paired with this P rank"
         )
         self.assertEqual(transfer._sources, {})
 
@@ -953,11 +886,11 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         transfer = _transfer()
         transfer.send(SendEvent("p-r", "x", ((1,),)))
         request = msgspec.structs.replace(
-            _request(transfer), requests={"x": ("d-r", [[]])}
+            _request(transfer), req_blocks={"d-r": ("x", [[]])}
         )
         socket = _Socket()
         await transfer._serve(b"a", msgspec.msgpack.encode(request), socket)
-        self.assertEqual(socket.messages[0].completed_transfer_ids, ["x"])
+        self.assertEqual(socket.messages[0].ok_reqs, ["d-r"])
         self.assertIsNone(transfer.poll().sends[0].error)
 
     async def test_recv_result_waits_for_future_terminal_and_invalidates_only_targets(
@@ -982,7 +915,9 @@ class WorkerReleaseTest(unittest.TestCase):
             poll=lambda: PoolPollResult(), take_errors=lambda: set()
         )
         worker.transfer = SimpleNamespace(
-            poll=lambda: TransferPollResult(), take_errors=lambda: set()
+            poll=lambda: TransferPollResult(),
+            take_errors=lambda: set(),
+            recv_batch=lambda events: None,
         )
         worker._on_save_requests = {}
         worker._finished_waits = {}

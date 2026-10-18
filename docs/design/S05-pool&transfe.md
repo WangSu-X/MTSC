@@ -5,7 +5,7 @@
 
 本文定义外部 KV 能力的抽象契约，现已由 `MooncakeKVCachePool(KVCachePool)` 和
 `MooncakeKVTransfer(KVTransfer)` 实现。接口与对应 Mooncake 实现放在同一个模块中，
-具体类持有 namespace、内存注册、bootstrap 和底层 I/O；Worker 通过 ABC 提交事件和消费结果。
+具体类持有 Store key metadata、内存注册、bootstrap 和底层 I/O；Worker 通过 ABC 提交事件和消费结果。
 
 ## 1. 背景
 
@@ -163,7 +163,7 @@ sequenceDiagram
         DP-->>DW: 安全终态，实际可用前缀 A
         DW->>DT: recv，目标后缀 blocks
         DT->>BS: 查询指定 engine/DP 的 P workers
-        BS-->>DT: TP/PP worker 地址
+        BS-->>DT: TP worker 地址（PP=1）
         DT->>PT: transfer_id + 目标 blocks及内存信息
     end
     Note over PT,DT: send 和 D 请求到达顺序不限；两者齐备后传输
@@ -234,12 +234,12 @@ request 继续运行时可多次收到 `SaveResult`，之后也可继续 save。
 ### 3.4 D 发起请求、P WRITE
 
 1. P 在 KV 可被传输层安全读取后调用 `send()`，发布 ready 的完整源 block 表；此调用不等待接收方或 I/O。
-2. D 将同一 Worker 轮次可直传的请求通过 `recv_batch()` 提交；后端按 bootstrap、engine、DP 分组，派生 TP/PP 配对，将多个 transfer_id 合成一条发往各匹配 P worker 的控制消息。`recv()` 等价于单请求批次。
+2. D 将同一 Worker 轮次可直传的请求通过 `recv_batch()` 提交；后端按 bootstrap、engine、DP 分组，派生 TP 配对，将多个 transfer_id 合成一条发往各匹配 P worker 的控制消息。`recv()` 等价于单请求批次。
 3. P 对齐 vLLM MooncakeConnector：控制消息进入无容量上限的 `sender_worker_queue`，由 `2 * num_workers` 个固定发送协程处理。消息中的请求同时等待源 ready，每轮将已 ready 请求的地址数组合并，调用一次 TE WRITE；未 ready 的请求继续等待，不阻塞该消息内已 ready 请求。
 4. 源和目标 block 同时连续、两侧 offset 为零且复制覆盖完整物理 block 时，将连续 block 合为较大的传输描述符；TP 切片、半页及 padding 不满足条件时逐 block 复制。
-5. P 每轮返回 completed/failed transfer_ids 和 coverage；还有 pending 请求时状态为 `IN_PROGRESS`，整条消息处理完为 `COMPLETE`。D 为每个请求聚合全部必要 worker 的终态及覆盖，完成本地布局转换后即可独立报告完成。P 保留全部目标终态聚合及源访问 fence。
+5. P 每轮返回 `ok_reqs` / `err_reqs`（D request IDs）；还有 pending 请求时状态为 `CONTINUE`，整条消息处理完为 `FINISH`，整批异常为 `ERROR`。D 按请求统计所有必要 P worker 的终态，完成本地布局转换后报告完成。P 保留全部目标终态聚合及源访问 fence。
 
-发送线程池默认 `num_workers=10`，固定发送协程默认 20；没有额外 Semaphore、跨控制消息的 session 合并或收集窗口。TCP 保留同 session 串行、256 描述符分段及接收 ACK。直传 schema 版本为非 TCP 6、TCP 7，P/D 必须同时升级；旧版单响应接收方无法处理分轮结果。
+发送线程池默认 `num_workers=10`，固定发送协程默认 20；没有额外 Semaphore、跨控制消息的 session 合并或收集窗口。原生 WRITE 接收完整批次，不再增加 TCP 专用分段和同 peer 串行层。TCP 仍要求接收端 ACK。控制消息字段与官方 Mooncake 一致，P/D 必须一起升级。
 
 源和目标必须对应同一前缀终点，group/block 布局兼容；当前不支持任意中间区间。send 与 D 控制请求谁先到都可等待匹配。D 成功结果必须包含必要的本地布局转换与设备同步。目标为空时不搬运 KV，但仍需会话确认，使 P 能结束源会话；这一已有行为需在后端适配时保留。
 
@@ -269,13 +269,13 @@ P 尚未 `send()` 时没有发布源内存，抢占保留早到的 D 等待者�
 | 功能 | 当前代码路径 |
 |---|---|
 | 正式 ABC、事件与结果 | `mtsc/kv_cache_pool.py`、`mtsc/kv_transfer.py` |
-| Pool 生命周期与 I/O | `mtsc/kv_cache_pool.py`：lookup RPC、namespace、注册、GET/PUT、load 聚合、pending save 合并、错误与 fence |
-| Transfer 生命周期与 I/O | `mtsc/kv_transfer.py`：bootstrap、注册、region 对齐与 WRITE、prepare/send/recv/cancel、去重、退休 ID 与 fence |
+| Pool 生命周期与 I/O | `mtsc/kv_cache_pool.py`：lookup RPC、官方 key、注册、GET/PUT、load 聚合、pending save 合并、错误与 fence |
+| Transfer 生命周期与 I/O | `mtsc/kv_transfer.py`：bootstrap、注册、layer/group region 与 WRITE、prepare/send/recv/cancel、去重、退休 ID 与 fence |
 | Worker 编排 | `mtsc/worker.py`：消费 metadata、Pool-first、以 loaded_tokens 固化 A、聚合 request 结束后的释放依赖 |
 | Backend 配置 | `mtsc/worker.py` 私有工厂：`mtsc_pool_backend` / `mtsc_transfer_backend`，默认且当前仅支持 `mooncake` |
 | 共享协议 | `mtsc/protocol.py`：Scheduler/Worker metadata 与 P/D wire 结构 |
-| 设备布局转换 | `mtsc/utils.py`：共享设备事件、注册区域、NPU 转换与有效 KV 分片数 |
-| KV 字节分片映射 | `mtsc/kv_transfer.py`：`kv_slice_plan()`，处理 TP 分片与复制 rank |
+| 设备布局转换 | `mtsc/utils.py`：共享设备事件、注册区域、NZ 配置与有效 KV 分片数 |
+| KV 字节分片映射 | `mtsc/kv_transfer.py`：`_compute_sender_transfer_plan()`，处理 TP 分片与复制 rank |
 
 scheduler-worker metadata 保留现有 wire 结构，Worker 将其转换为不可变事件快照。
 Pool 不接收 request-end 信息，Worker 的 `_on_save_requests` 与 `_finished_waits` 分别管理当前保存工作及最终释放依赖。
@@ -284,55 +284,66 @@ Pool 不接收 request-end 信息，Worker 的 `_on_save_requests` 与 `_finishe
 配置继续在各使用位置直接读取 vLLM，不增加独立配置对象。
 Pool/Transfer 在创建 I/O 资源前校验各自超时为有限正数；PD timeout 默认取
 `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`。线程数仍按 `max(1, int(...))` 归一化。
-Store namespace 配置缺省或为 None 时默认开启；`lookup_rpc_port` 仅作为 IPC 路径标识。
+`lookup_rpc_port` 仅作为 IPC 路径标识。
 
 ### 4.2 Pool 并行与 MLA
 
-Pool 不执行跨 TP/PP/PCP/DCP 布局转换；默认 topology namespace 包含这些维度及 model、dtype、layout、group schema。
-DP 是副本身份，不进入 KV 分片 key 的布局坐标，兼容副本可以共享缓存。
+Pool 直接保存 TP/PP/PCP/DCP 的 rank/size，以及 `use_mla`、`num_kv_head`、`put_step`、
+`head_or_tp_rank` 和 `metadata`；数据库与 lookup 初始化使用这些属性，不再通过元组传递拓扑。
 
-MLA 在 TP 间复制 latent KV，同一 namespace 内使用有效 KV head 数 1 和共享 TP key；
-各 rank 按 chunk 分摊 PUT，每个 rank 都能加载完整副本。暂不移除 namespace 中的 TP size，
-因此 MLA 也不额外启用跨 TP size 的 Pool 复用。
+Pool 直接使用所指定 vLLM Store 的 `PoolKey.to_string()` 格式。
+`_process_tokens()` 只应用 mask 与 PUT 条带化，原样返回 `database.process_tokens()` 生成的 key 对象；
+GET/PUT 在 SDK 边界调用 `to_string()`。lookup 仅缓存各 rank 的 `KeyMetadata`，以相同序列化方法生成 key。
+不再使用 `_database_key()`、自定义 topology namespace 或 `cache_prefix`。
+
+Pool 不执行跨 TP/PP/PCP/DCP 布局转换；共享 Store 的实例须由部署保证 model、dtype、block/layout 和 group 兼容。
+DP 是副本身份，不进入 KV 分片 key 的布局坐标。MLA 在 DCP=1 时使用有效 KV head 数 1 和共享 `tp_rank:0` key；
+各 rank 按 chunk 分摊 PUT，每个 rank 均可加载完整副本，兼容布局可跨 TP size 复用。
+DCP>1 时保留物理 TP rank，并使用 `put_step=1`，避免对不同 token 分片应用副本 PUT 分摊。
+Store GET 恢复原始物理字节，不执行 PD 重排。
 
 ### 4.3 Transfer TP/PP/DP
 
-物理 TP rank 用于发现与控制会话，唯一 KV 分片用于数据切片：
+Transfer 采用官方物理 TP 切片规则，P/D TP size 必须互为整数倍，且 `PP=1`。
+TP 规划与 region 对齐算法跟踪 vLLM `da9134bc89364465f68aa679564435936d157a14`。
+MLA 使用复制策略，普通注意力按有效 KV head 数处理分片和 GQA 复制 rank，支持跨越 head 数边界。
+每个 region 保存地址、block stride、payload 长度、layer name/index、group/shared groups 和 row offset。
+双方按 layer name 与出现次数配对；每个 region 只对其 group 的 source/destination blocks 做连续分组。
+共享 packed row 只合并真正共用该 region 的 group，独立 group 不互相复制。
+NPU NHD 按 token 暴露 head-contiguous region，双向异构 TP 均无需接收后重排；
+HND 可直接切片，NZ 异构 head 重分片及 padding/NVFP4 不支持的布局在 WRITE 前回退。
 
-```text
-MHA/GQA: effective_tp = min(tp_size, total_kv_heads)
-MLA:     effective_tp = 1
-replica_count = tp_size / effective_tp
-```
+DP 使用 Proxy 指定的 engine/DP 选择 P 副本。控制消息 `req_blocks` 的键为 D request ID，值为 `(transfer_id, block_groups)`。
+Bootstrap 地址和启动条件沿用官方：local engines 使用 `127.0.0.1`，其余使用 `data_parallel_master_ip`；仅当 `is_local_first_rank()` 且为 local engines 或 DP index 0 时启动服务。
+D 按去掉末尾斜杠的 bootstrap 地址合并在途查询，不同 engine/DP 的并发首次查询共享一次 HTTP GET，随后分别校验副本身份并缓存 worker 地址。查询失败或发起者取消时通知全部等待者并清理 pending 状态，允许后续重试；单个等待者取消不影响共享查询。
+消息包含上游 `kv_block_lens`、layer/group/shared-group/row-offset 元数据。
+D 每次发送完整布局，`layout_id=0`；P 支持缓存上游非零 layout ID，并在缺失时返回 `LAYOUT_MISS`。
+协议校验 layer/group 及 payload 长度；model、dtype、layout 和 PCP/DCP 配置须由部署保持兼容。
 
-P/D TP size 保持整数倍要求。每个 D rank 的 P peer 集合中，同一个 KV 分片只选择一个发送者。
-P 分片较细时拼接到 D 的对应 byte offset；P 分片较粗时取 D 所需切片。
-覆盖次数按唯一分片计算，避免 GQA 在 TP 超过 KV head 数时漏算或重复计算；MLA 始终复制完整 page。
+MTSC 保留 transfer attempt 去重和在途 I/O 等待：重复目标等待原 WRITE，同一目标更改 destination 描述会失败。
+退休 ID 保留到 close，阻止迟到请求读取已释放 blocks。整批校验失败时，先等该批已有目标的 WRITE 结束，再回复 `ERROR`。
+D 的全部必要 P worker 返回成功后才完成对应请求；任一失败会使目标 blocks 进入 recompute。
+源超时不能结束 active WRITE；空目标仍完成控制握手。抢占、取消和关闭均先等在途 I/O 终止，再释放内存。
+CUDA 按底层 storage 去重注册，传输 payload 与 block stride 分开描述；dense packed layer 保留独立 region，
+不连续 packed view 按上游规则合并为共享 row。NPU 注册区间覆盖 strided view 的物理跨度并保留合并逻辑。
+直传 TE 的协议/网卡按字段解析：extra config 的 `mooncake_protocol`/`device_name` >
+Store JSON 的 `protocol`/`device_name` > 默认 `rdma`/空字符串。
+`null` 视为缺省，空 `device_name` 是显式覆盖。已配置且需要读取的 JSON 无效时直接报错，
+避免静默使用不同协议。该默认值共享是 MTSC 扩展，直传仍使用 `P2PHANDSHAKE`；
+Store 自己的 TE 继续从 JSON 初始化。
 
-PP size 相同时联系配对 rank，不同时联系对应 TP 的全部 P PP workers，再按全局 layer 身份及 region 顺序取交集。
-兼容 group/layout 仍是前提，不支持任意 group 语义或 block 大小转换。
-DP 使用 Proxy 指定的 engine/DP 身份选择 P 副本，不进行跨副本聚合或隐式请求迁移。
-PCP/DCP size 进入 Transfer schema 并要求一致。
-
-Transfer 协议版本为 6（TCP 为 7），携带双方 engine/DP 身份、目标容量、内存描述及批量请求的分轮结果。每个源会话绑定一个 D 副本/拓扑，
-按唯一 `(engine, DP, TP, PP)` 目标聚合终态；重复请求只等待原任务，不再次 WRITE 或重复计数。
-同一目标修改 destination 描述会被拒绝。退休 ID 保留到后端 close，阻止迟到请求再次读取已释放源 blocks。
-整批请求校验失败时，仍需等待该批次所有已有目标的 WRITE 终态，再回复 FAILED；等待集合在校验及创建新目标前收集，不依赖请求顺序，也不等待本批次自身尚未发送的目标。
-
-### 4.4 Fence 与清理
-
-任何接收 peer 失败后，仍等待其余已发布目标地址的 peer 终态，才报告 recv 失败。
-源超时不能结束 active WRITE；空目标仍完成控制握手。
-P shutdown 及 listener 退出均先排空已接收消息，等待原生 WRITE 完成并发出终态响应，再取消空闲发送协程、关闭控制 socket 和注册内存。
-Pool timeout 标记失败但等待同步 GET 返回。pending save 可取消，running save 必须停止源读取后才能复用 blocks。
+D 使用官方的 `RCVTIMEO = (P ready timeout + 60s)`。P 的 `ERROR` / `FINISH` 是终态，可将失败目标回退重算。接收超时、断连或非终态协议异常无法证明远端 WRITE 已停止：后端记录致命错误，唤醒所有接收等待者，由 `poll()` / `preempt()` / `close()` 向 worker 抛出；不发布普通加载失败、不注销内存，等待 worker 进程终止。
 
 ## 5. 验证与后续工作
 
 `tests/test_backends.py` 覆盖具体后端的 save 合并、ready 信号、累计错误、增量结果、部分 load、timeout、
-抢占、空 recv、迟到请求、目标去重、指定 DP 身份、多 peer fence，以及模拟 TE 字节写入的异构 TP/PP/MLA。
-`tests/test_mtsc.py` 保留 namespace、MLA key、设备注册、coverage、lookup、Proxy 和 legacy helper 回归测试。
+抢占、空 recv、迟到请求、目标去重、指定 DP 身份、多 peer fence，以及模拟 TE 字节写入的异构 TP/MLA。
+`tests/test_mtsc.py` 保留原生 key、MLA key、设备注册、TP 切片、lookup、Proxy 和 legacy helper 回归测试。
 `tests/test_transfer_batching.py` 覆盖 ready 合并、分轮完成、连续 block 合并、共享批次取消、异常重复请求 fence、部分失败隔离及 listener 退出时的 WRITE fence，并通过真实 ZMQ 控制通道和模拟 TE 校验批量拷贝。
+`tests/test_review_fixes.py` 覆盖启动、Store 成功加载、NHD/HND head 重分片、独立/共享 group、packed layer、
+固定上游 schema、layout cache 与直传配置优先级。`tests/reference_mooncake.py` 固定上游 `da9134bc` wire schema。
+`tests/test_store_keys.py` 对照指定 vLLM 的 key 生成结果，并验证多 group 的 lookup/PUT/GET 使用相同 key。
 这些测试不代表真实 Mooncake/GPU E2E 已通过。
 
-后续验证：真实 GPU/Mooncake 的同构及异构 TP/PP E2E、MLA 模型与 Ascend NZ 实机验证；
+后续验证：真实 GPU/Mooncake 的同构及异构 TP E2E、MLA 模型与 Ascend 实机验证；
 替代 Pool 后端可在相同 ABC 下另行实现。非整数倍 TP 和跨 Pool 布局复用不在本版范围。

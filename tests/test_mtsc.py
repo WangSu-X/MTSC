@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 import threading
 import time
 import unittest
@@ -10,7 +9,6 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import msgspec
 import torch
 import zmq
 from vllm.config import KVTransferConfig, VllmConfig
@@ -22,19 +20,17 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from mtsc.connector import _require_recompute_policy
 from mtsc.kv_cache_pool import (
+    KeyMetadata,
     LoadEvent,
     LoadResult,
     MooncakeKVCachePool,
+    PoolKey,
     PoolPollResult,
     StoreLookupClient,
     _CompatBlobBlockHashes,
-    _key_prefix,
-    _key_string,
     _LoadOutcome,
     _LoadState,
     _SaveState,
-    store_topology_namespace,
-    store_tp_layout,
 )
 from mtsc.kv_transfer import (
     MooncakeKVTransfer,
@@ -44,25 +40,22 @@ from mtsc.kv_transfer import (
     TransferResult,
     _NPUTransferTopology,
     _Session,
-    kv_slice_plan,
+    _validate_asymmetric_region_lengths,
+)
+from mtsc.kv_transfer import (
+    _compute_sender_transfer_plan as local_sender_plan,
 )
 from mtsc.protocol import (
     FinishedWait,
     KVPoolLoadRequest,
     KVPoolSaveRequest,
     KVTransferPlan,
-    KVTransferRequest,
-    KVTransferResponse,
-    KVTransferSchema,
-    KVTransferStatus,
     MTSCConnectorMetadata,
 )
 from mtsc.scheduler import _groups
 from mtsc.utils import (
-    _transpose_npu_cache_blocks,
     cache_tensors,
     new_device_event,
-    npu_kv_nz_enabled,
     npu_registration_regions,
 )
 from mtsc.worker import MTSCWorker, _FinishedWaitState, _TransferState
@@ -78,15 +71,13 @@ def _plan() -> KVTransferPlan:
     return KVTransferPlan(
         request_id="d-1",
         transfer_id="xfer-1",
-        local_tokens=32,
-        pool_tokens=80,
+        computed_tokens=32,
+        pool_hit_tokens=80,
         target_tokens=112,
         all_block_ids=([10, 11, 12, 13, 14, 15, 16],),
         external_block_ids=([12, 13, 14, 15, 16],),
         group_block_sizes=(16,),
         blocks_per_sliding_window=(0,),
-        transfer_enabled=True,
-        wait_for_completion=True,
         transfer_params={
             "transfer_id": "xfer-1",
             "remote_engine_id": "p0",
@@ -106,8 +97,8 @@ class TwoStageBoundaryTest(unittest.TestCase):
             plan.request_id,
             tuple(tuple(ids) for ids in plan.all_block_ids),
             (),
-            plan.local_tokens,
-            plan.pool_tokens,
+            plan.computed_tokens,
+            plan.pool_hit_tokens,
         )
         return pool._loaded_prefix(event, invalid)
 
@@ -131,38 +122,38 @@ class TwoStageBoundaryTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.requests = []
 
-            def recv(self, event) -> None:
-                self.requests.append(event)
+            def recv_batch(self, events) -> None:
+                self.requests.extend(events)
 
         worker = object.__new__(MTSCWorker)
         worker.transfer = PD()
-        worker._ignored_recvs = set()
         plan = replace(
             _plan(),
-            pool_tokens=32,
+            pool_hit_tokens=32,
             target_tokens=32,
             external_block_ids=([],),
-            wait_for_completion=False,
         )
-        state = _TransferState(plan=plan, stage="STORE_DONE")
-        self.assertTrue(worker._start_transfer(state, 32))
-        self.assertEqual(len(worker.transfer.requests), 1)
-        self.assertIn(plan.request_id, worker._ignored_recvs)
+        state = _TransferState(plan=plan, stage="POOL_DONE")
+        receives = []
+        worker._start_transfer(state, 32, receives)
+        # Even with empty external_block_ids, we should still create a recv event
+        self.assertEqual(len(receives), 1)
+        self.assertEqual(receives[0].request_id, plan.request_id)
 
     def test_mla_replicated_tp_only_uses_one_sender(self) -> None:
         self.assertEqual(
-            kv_slice_plan(0, 2, 0, 1, 128, 128, 1, True)[:4],
+            local_sender_plan(0, 2, 0, 1, 128, 128, True or 2 > 1)[:4],
             (True, 0, 0, 128),
         )
         self.assertEqual(
-            kv_slice_plan(1, 2, 0, 1, 128, 128, 1, True)[:4],
-            (False, 0, 0, 0),
+            local_sender_plan(1, 2, 0, 1, 128, 128, True or 2 > 1)[:4],
+            (False, 0, 0, 128),
         )
 
     def test_partial_prompt_tail_is_pulled_from_prefill(self) -> None:
         plan = replace(
             _plan(),
-            pool_tokens=48,
+            pool_hit_tokens=48,
             target_tokens=50,
             all_block_ids=([10, 11, 12, 13],),
             external_block_ids=([12, 13],),
@@ -210,9 +201,6 @@ class FailureFallbackTest(unittest.TestCase):
         def take_errors(self) -> set[int]:
             return set()
 
-        def reformat_npu_blocks(self, block_ids, remote_tp_size) -> None:
-            self.reformatted.append((block_ids, remote_tp_size))
-
     @staticmethod
     def _worker(store, pd) -> MTSCWorker:
         worker = object.__new__(MTSCWorker)
@@ -231,7 +219,7 @@ class FailureFallbackTest(unittest.TestCase):
         store = self._Store({"d-1"}, {13})
         pd = self._PD()
         worker = self._worker(store, pd)
-        worker._on_transfer["d-1"] = _TransferState(_plan(), "STORE_PENDING")
+        worker._on_transfer["d-1"] = _TransferState(_plan(), "POOL_LOADING")
 
         sent, received = worker.get_finished(set(), MTSCConnectorMetadata())
 
@@ -239,17 +227,24 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertIsNone(received)
         self.assertEqual(len(pd.receives), 1)
         self.assertEqual(pd.receives[0].block_ids, ((13, 14, 15, 16),))
-        self.assertEqual(pd.reformatted, [])  # Layout conversion belongs to Pool.
-        self.assertEqual(worker._on_transfer["d-1"].stage, "TRANSFER_PENDING")
+        self.assertEqual(
+            pd.reformatted, []
+        )  # PD layout conversion belongs to its backend.
+        self.assertEqual(worker._on_transfer["d-1"].stage, "TRANSFER_LOADING")
         self.assertEqual(worker.get_block_ids_with_load_errors(), set())
 
     def test_pd_failure_reports_suffix_for_local_recompute(self) -> None:
         store = self._Store()
         pd = self._PD({"d-1"})
         worker = self._worker(store, pd)
-        state = _TransferState(_plan(), "STORE_DONE")
+        state = _TransferState(_plan(), "POOL_DONE")
         worker._on_transfer["d-1"] = state
-        self.assertTrue(worker._start_transfer(state, 80))
+        receives = []
+        worker._start_transfer(state, 80, receives)
+        pd.recv_batch(receives)
+        self.assertEqual(len(pd.receives), 1)
+        self.assertEqual(pd.receives[0].block_ids, ((15, 16),))
+        self.assertEqual(state.stage, "TRANSFER_LOADING")
 
         sent, received = worker.get_finished(set(), MTSCConnectorMetadata())
 
@@ -306,8 +301,14 @@ class TransferTopologyTest(unittest.TestCase):
                     )
                     for p_rank in peers:
                         for replicated in (False, True):
-                            actual = kv_slice_plan(
-                                p_rank, p_size, d_rank, d_size, 128, 128, 8, replicated
+                            actual = local_sender_plan(
+                                p_rank,
+                                p_size,
+                                d_rank,
+                                d_size,
+                                128,
+                                128,
+                                replicated or p_size > 8,
                             )[:4]
                             expected = _compute_sender_transfer_plan(
                                 p_rank, p_size, d_rank, d_size, 128, 128, replicated
@@ -317,10 +318,10 @@ class TransferTopologyTest(unittest.TestCase):
                                 self.assertEqual(actual[3], expected[3])
 
     def test_non_integral_tp_ratio_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            kv_slice_plan(0, 2, 0, 3, 128, 128, 8, False)
-        with self.assertRaises(ValueError):
-            kv_slice_plan(0, 3, 0, 2, 128, 128, 8, False)
+        with self.assertRaises(AssertionError):
+            local_sender_plan(0, 2, 0, 3, 128, 128, False or 2 > 8)
+        with self.assertRaises(AssertionError):
+            local_sender_plan(0, 3, 0, 2, 128, 128, False or 3 > 8)
 
     def test_npu_topology_maps_all_required_prefill_ranks(self) -> None:
         topology = _NPUTransferTopology(
@@ -332,101 +333,29 @@ class TransferTopologyTest(unittest.TestCase):
         )
         self.assertEqual(topology.handshake_target_ranks(4), [2, 3])
 
-    @staticmethod
-    def _schema() -> KVTransferSchema:
-        return KVTransferSchema(1, "model", "", "torch.float16", "hnd", 16, False)
-
-    def test_pp_alignment_uses_layer_intersection(self) -> None:
-        pd = object.__new__(MooncakeKVTransfer)
-        pd.regions = [
-            TransferRegion("layers.0.attn", 0, 0, 100, 64, 64),
-            TransferRegion("layers.2.attn", 2, 0, 200, 64, 64),
-        ]
-        request = KVTransferRequest(
-            hostname="d",
-            rpc_port=1,
-            tp_size=1,
-            tp_rank=0,
-            pp_size=1,
-            pp_rank=0,
-            schema=self._schema(),
-            requests={"x": ("r", [[1]])},
-            region_base_addresses=[300, 400],
-            block_lengths=[64, 64],
-            kv_block_lengths=[64, 64],
-            layer_names=["layers.0.attn", "layers.1.attn"],
-            layer_indices=[0, 1],
-            group_indices=[0, 0],
+    def test_region_count_mismatch_is_rejected(self) -> None:
+        self.assertIsNotNone(
+            _validate_asymmetric_region_lengths(
+                [TransferRegion(100, 64, 64)],
+                [],
+                1,
+                1,
+                False,
+            )
         )
 
-        aligned = pd._aligned_regions(request)
-
-        self.assertEqual(len(aligned), 1)
-        self.assertEqual(aligned[0][0].layer_name, "layers.0.attn")
-        self.assertEqual(aligned[0][2], 0)
-
     def test_region_length_must_match_tp_ratio(self) -> None:
-        local = TransferRegion("layers.0.attn", 0, 0, 100, 64, 64)
-        remote = TransferRegion("layers.0.attn", 0, 0, 200, 96, 96)
-        with self.assertRaisesRegex(ValueError, "TP ratio"):
-            MooncakeKVTransfer._validate_region_plan(
-                local, remote, 2, 1, False, 0, 0, 64
-            )
-
-    def test_region_coverage_rejects_missing_duplicate_and_unexpected(self) -> None:
-        pd = object.__new__(MooncakeKVTransfer)
-        pd.regions = [
-            TransferRegion("layers.0.attn", 0, 0, 100, 64, 64),
-            TransferRegion("layers.1.attn", 1, 0, 200, 64, 64),
-        ]
-        valid = [
-            KVTransferResponse(
-                KVTransferStatus.COMPLETE, ["r"], covered_regions={"r": [0, 1]}
-            )
-        ]
-        pd._validate_coverage("r", [[10]], valid, expected=1)
-
-        duplicate = [
-            KVTransferResponse(
-                KVTransferStatus.COMPLETE,
-                ["r"],
-                covered_regions={"r": [0, 0, 1]},
-            )
-        ]
-        with self.assertRaisesRegex(ValueError, "coverage mismatch"):
-            pd._validate_coverage("r", [[10]], duplicate, expected=1)
-
-        missing = [
-            KVTransferResponse(
-                KVTransferStatus.COMPLETE, ["r"], covered_regions={"r": [0]}
-            )
-        ]
-        with self.assertRaisesRegex(ValueError, "coverage mismatch"):
-            pd._validate_coverage("r", [[10]], missing, expected=1)
+        error = _validate_asymmetric_region_lengths(
+            [TransferRegion(100, 64, 64)],
+            [TransferRegion(200, 96, 96)],
+            2,
+            1,
+            False,
+        )
+        self.assertIn("TP ratio", error)
 
 
 class NPUDataPathTest(unittest.TestCase):
-    def test_npu_nz_config_handles_string_booleans(self) -> None:
-        with patch("mtsc.utils.is_npu_platform", return_value=True):
-            for value, expected in (
-                (False, False),
-                (None, False),
-                (0, False),
-                ("false", False),
-                (" OFF ", False),
-                ("no", False),
-                ("0", False),
-                (True, True),
-                (1, True),
-                ("true", True),
-                (" ON ", True),
-            ):
-                with self.subTest(value=value):
-                    config = SimpleNamespace(additional_config={"enable_kv_nz": value})
-                    self.assertIs(npu_kv_nz_enabled(config), expected)
-        with patch("mtsc.utils.is_npu_platform", return_value=False):
-            self.assertFalse(npu_kv_nz_enabled(config))
-
     def test_device_event_uses_torch_npu(self) -> None:
         class Event:
             pass
@@ -481,6 +410,7 @@ class NPUDataPathTest(unittest.TestCase):
         k_cache = torch.empty((4, 16, 2, 8))
         v_cache = torch.empty((4, 16, 2, 8))
         store = object.__new__(MooncakeKVCachePool)
+        store._task_lock = threading.RLock()
         store._closed = store._registered = False
         store.num_blocks = 4
         store._num_blocks_resolved = True
@@ -520,11 +450,13 @@ class NPUDataPathTest(unittest.TestCase):
         v_cache = torch.empty((4, 16, 1, 2), dtype=torch.float16)
         pd = object.__new__(MooncakeKVTransfer)
         pd._closed = pd._registered = False
-        pd._num_blocks_resolved = False
+        pd._receive_error = None
         pd.layer_specs = {"model.layers.0.self_attn": spec}
         pd.layer_groups = {"model.layers.0.self_attn": 0}
         pd.engine = Engine()
         pd.regions = []
+        pd.kv_caches_base_addr, pd.block_lens = [], []
+        pd.topology = _NPUTransferTopology(0, 1, 16, True, 1)
         pd._registered_storage = []
         pd.is_producer = False
         pd.kv_caches = {}
@@ -534,57 +466,13 @@ class NPUDataPathTest(unittest.TestCase):
 
         self.assertEqual(len(pd.regions), 2)
         self.assertEqual(
-            [region.kv_block_length for region in pd.regions],
+            [region.kv_block_len for region in pd.regions],
             [
                 k_cache.stride(0) * k_cache.element_size(),
                 v_cache.stride(0) * v_cache.element_size(),
             ],
         )
         self.assertEqual(len(pd.engine.regions), 2)
-
-    def test_heterogeneous_tp_transposes_appended_npu_shards(self) -> None:
-        cache = torch.tensor([[[0, 1], [10, 11]]])
-
-        _transpose_npu_cache_blocks(cache, [0], block_size=2, tp_ratio=2)
-
-        self.assertEqual(cache.tolist(), [[[0, 10], [1, 11]]])
-
-    def test_npu_nz_path_uses_gather_and_scatter_ops(self) -> None:
-        calls = []
-
-        def gather(*_args, **_kwargs) -> None:
-            calls.append("gather")
-
-        def scatter(*_args, **_kwargs) -> None:
-            calls.append("scatter")
-
-        fake_torch_npu = SimpleNamespace(
-            npu_gather_pa_kv_cache=gather,
-            npu_scatter_pa_kv_cache=scatter,
-        )
-        pd = object.__new__(MooncakeKVTransfer)
-        pd.topology = _NPUTransferTopology(
-            tp_rank=0,
-            tp_size=1,
-            block_size=4,
-            is_mla=True,
-            total_num_kv_heads=1,
-        )
-        k_cache = torch.empty((2, 4, 1, 16))
-        v_cache = torch.empty((2, 4, 1, 16))
-
-        with (
-            patch.dict(sys.modules, {"torch_npu": fake_torch_npu}),
-            patch.object(
-                torch,
-                "npu",
-                SimpleNamespace(synchronize=lambda: calls.append("sync")),
-                create=True,
-            ),
-        ):
-            pd._npu_nz_pair([k_cache, v_cache], [0])
-
-        self.assertEqual(calls, ["sync", "gather", "scatter"])
 
 
 class Vllm023CompatibilityTest(unittest.TestCase):
@@ -599,8 +487,8 @@ class Vllm023CompatibilityTest(unittest.TestCase):
         with self.assertRaises(IndexError):
             _ = hashes[3]
 
-    def test_local_key_builder_does_not_require_new_pool_key_helpers(self) -> None:
-        metadata = SimpleNamespace(
+    def test_pool_key_serializes_rank_and_group(self) -> None:
+        metadata = KeyMetadata(
             model_name="model",
             tp_rank=0,
             pcp_rank=0,
@@ -608,15 +496,14 @@ class Vllm023CompatibilityTest(unittest.TestCase):
             pp_rank=0,
             group_id=2,
         )
-        prefix = _key_prefix(metadata, "namespace", tp_rank=3, pp_rank=1)
+        key = PoolKey(replace(metadata, tp_rank=3, pp_rank=1), "0102")
 
         self.assertEqual(
-            prefix,
-            "namespace@model@tp_rank:3@pcp0@dcp0@pp_rank:1@group:2",
+            key.to_string(),
+            "model@tp_rank:3@pcp0@dcp0@pp_rank:1@group:2@0102",
         )
-        self.assertEqual(_key_string(prefix, b"\x01\x02"), prefix + "@0102")
 
-    def test_old_database_pool_keys_and_put_striping_are_normalized(self) -> None:
+    def test_database_pool_keys_and_put_striping_are_preserved(self) -> None:
         class OldPoolKey:
             def __init__(self, value: str) -> None:
                 self.value = value
@@ -641,7 +528,7 @@ class Vllm023CompatibilityTest(unittest.TestCase):
                     )
 
         store = object.__new__(MooncakeKVCachePool)
-        store.cache_namespace = "namespace"
+        store._task_lock = threading.RLock()
         rows = list(
             store._process_tokens(
                 OldDatabase(),
@@ -655,10 +542,10 @@ class Vllm023CompatibilityTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            rows,
+            [(start, end, key.to_string()) for start, end, key in rows],
             [
-                (0, 16, "namespace@base@61"),
-                (32, 48, "namespace@base@63"),
+                (0, 16, "base@61"),
+                (32, 48, "base@63"),
             ],
         )
 
@@ -670,6 +557,7 @@ class Vllm023CompatibilityTest(unittest.TestCase):
                 return ([True, False, True, True],)
 
         store = object.__new__(MooncakeKVCachePool)
+        store._task_lock = threading.RLock()
         store.coordinator = OldCoordinator()
         store.databases = [SimpleNamespace(block_size=16)]
 
@@ -677,275 +565,7 @@ class Vllm023CompatibilityTest(unittest.TestCase):
 
 
 class MLALayoutTest(unittest.TestCase):
-    def test_store_namespace_separates_incompatible_topologies(self) -> None:
-        config = SimpleNamespace(
-            model_config=SimpleNamespace(
-                model="org/model",
-                revision="rev1",
-                dtype=torch.float16,
-                use_mla=False,
-            ),
-            cache_config=SimpleNamespace(cache_dtype="auto"),
-            kv_transfer_config=SimpleNamespace(
-                kv_connector_extra_config={"cache_prefix": "tenant"}
-            ),
-        )
-        groups = [
-            SimpleNamespace(
-                kv_cache_spec=SimpleNamespace(block_size=16, page_size_bytes=64)
-            )
-        ]
-        kwargs = {
-            "pp_size": 1,
-            "pcp_size": 1,
-            "dcp_size": 1,
-            "block_size": 16,
-            "hash_block_size": 16,
-        }
-        with (
-            patch("mtsc.kv_cache_pool.is_npu_platform", return_value=False),
-            patch("mtsc.kv_cache_pool.get_kv_cache_layout", return_value="HND"),
-        ):
-            tp1 = store_topology_namespace(config, groups, tp_size=1, **kwargs)
-            tp1_again = store_topology_namespace(config, groups, tp_size=1, **kwargs)
-            tp2 = store_topology_namespace(config, groups, tp_size=2, **kwargs)
-            for value in (None, True, "true"):
-                with self.subTest(namespace_enabled=value):
-                    config.kv_transfer_config.kv_connector_extra_config[
-                        "mtsc_store_topology_namespace"
-                    ] = value
-                    self.assertEqual(
-                        store_topology_namespace(config, groups, tp_size=1, **kwargs),
-                        tp1,
-                    )
-            for value in (False, "false", " OFF ", "0"):
-                with self.subTest(namespace_enabled=value):
-                    config.kv_transfer_config.kv_connector_extra_config[
-                        "mtsc_store_topology_namespace"
-                    ] = value
-                    self.assertEqual(
-                        store_topology_namespace(config, groups, tp_size=1, **kwargs),
-                        "tenant",
-                    )
-
-        self.assertEqual(tp1, tp1_again)
-        self.assertNotEqual(tp1, tp2)
-        self.assertTrue(tp1.startswith("tenant:mtsc-v1-"))
-
-    def test_mla_namespace_unifies_tp_sizes_when_pcp_and_dcp_are_one(self) -> None:
-        """MLA with PCP=1 and DCP=1 should generate identical namespace across TP sizes."""
-        base_config = SimpleNamespace(
-            model_config=SimpleNamespace(
-                model="org/mla-model",
-                revision="v1",
-                dtype=torch.float16,
-                use_mla=True,
-            ),
-            cache_config=SimpleNamespace(cache_dtype="auto"),
-            kv_transfer_config=SimpleNamespace(
-                kv_connector_extra_config={"cache_prefix": "mla"}
-            ),
-        )
-        groups = [
-            SimpleNamespace(
-                kv_cache_spec=SimpleNamespace(block_size=16, page_size_bytes=64)
-            )
-        ]
-        kwargs = {
-            "pp_size": 1,
-            "pcp_size": 1,
-            "dcp_size": 1,
-            "block_size": 16,
-            "hash_block_size": 16,
-        }
-        with (
-            patch("mtsc.kv_cache_pool.is_npu_platform", return_value=False),
-            patch("mtsc.kv_cache_pool.get_kv_cache_layout", return_value="HND"),
-        ):
-            # All TP sizes should generate the same namespace
-            tp1 = store_topology_namespace(base_config, groups, tp_size=1, **kwargs)
-            tp2 = store_topology_namespace(base_config, groups, tp_size=2, **kwargs)
-            tp4 = store_topology_namespace(base_config, groups, tp_size=4, **kwargs)
-            tp8 = store_topology_namespace(base_config, groups, tp_size=8, **kwargs)
-
-            self.assertEqual(tp1, tp2)
-            self.assertEqual(tp1, tp4)
-            self.assertEqual(tp1, tp8)
-            self.assertTrue(tp1.startswith("mla:mtsc-v1-"))
-
-    def test_mla_namespace_still_isolates_when_pcp_or_dcp_gt_one(self) -> None:
-        """MLA with PCP>1 or DCP>1 should still separate TP sizes."""
-        base_config = SimpleNamespace(
-            model_config=SimpleNamespace(
-                model="org/mla-model",
-                revision="v1",
-                dtype=torch.float16,
-                use_mla=True,
-            ),
-            cache_config=SimpleNamespace(cache_dtype="auto"),
-            kv_transfer_config=SimpleNamespace(
-                kv_connector_extra_config={"cache_prefix": "mla"}
-            ),
-        )
-        groups = [
-            SimpleNamespace(
-                kv_cache_spec=SimpleNamespace(block_size=16, page_size_bytes=64)
-            )
-        ]
-        base_kwargs = {
-            "pp_size": 1,
-            "block_size": 16,
-            "hash_block_size": 16,
-        }
-        with (
-            patch("mtsc.kv_cache_pool.is_npu_platform", return_value=False),
-            patch("mtsc.kv_cache_pool.get_kv_cache_layout", return_value="HND"),
-        ):
-            # PCP=2 should still isolate TP sizes
-            pcp2_tp1 = store_topology_namespace(
-                base_config, groups, tp_size=1, pcp_size=2, dcp_size=1, **base_kwargs
-            )
-            pcp2_tp2 = store_topology_namespace(
-                base_config, groups, tp_size=2, pcp_size=2, dcp_size=1, **base_kwargs
-            )
-            self.assertNotEqual(pcp2_tp1, pcp2_tp2)
-
-            # DCP=2 should still isolate TP sizes
-            dcp2_tp1 = store_topology_namespace(
-                base_config, groups, tp_size=1, pcp_size=1, dcp_size=2, **base_kwargs
-            )
-            dcp2_tp2 = store_topology_namespace(
-                base_config, groups, tp_size=2, pcp_size=1, dcp_size=2, **base_kwargs
-            )
-            self.assertNotEqual(dcp2_tp1, dcp2_tp2)
-
-    def test_non_mla_namespace_still_isolates_tp_sizes(self) -> None:
-        """Non-MLA models should continue to separate TP sizes."""
-        config = SimpleNamespace(
-            model_config=SimpleNamespace(
-                model="org/regular-model",
-                revision="v1",
-                dtype=torch.float16,
-                use_mla=False,
-            ),
-            cache_config=SimpleNamespace(cache_dtype="auto"),
-            kv_transfer_config=SimpleNamespace(
-                kv_connector_extra_config={"cache_prefix": "regular"}
-            ),
-        )
-        groups = [
-            SimpleNamespace(
-                kv_cache_spec=SimpleNamespace(block_size=16, page_size_bytes=64)
-            )
-        ]
-        kwargs = {
-            "pp_size": 1,
-            "pcp_size": 1,
-            "dcp_size": 1,
-            "block_size": 16,
-            "hash_block_size": 16,
-        }
-        with (
-            patch("mtsc.kv_cache_pool.is_npu_platform", return_value=False),
-            patch("mtsc.kv_cache_pool.get_kv_cache_layout", return_value="HND"),
-        ):
-            tp1 = store_topology_namespace(config, groups, tp_size=1, **kwargs)
-            tp2 = store_topology_namespace(config, groups, tp_size=2, **kwargs)
-            tp8 = store_topology_namespace(config, groups, tp_size=8, **kwargs)
-
-            self.assertNotEqual(tp1, tp2)
-            self.assertNotEqual(tp1, tp8)
-            self.assertNotEqual(tp2, tp8)
-
-    def test_mla_namespace_still_isolates_other_topology_differences(self) -> None:
-        """MLA should still separate incompatible topologies even when TP is unified."""
-        base_config = SimpleNamespace(
-            model_config=SimpleNamespace(
-                model="org/mla-model",
-                revision="v1",
-                dtype=torch.float16,
-                use_mla=True,
-            ),
-            cache_config=SimpleNamespace(cache_dtype="auto"),
-            kv_transfer_config=SimpleNamespace(
-                kv_connector_extra_config={"cache_prefix": "mla"}
-            ),
-        )
-        groups = [
-            SimpleNamespace(
-                kv_cache_spec=SimpleNamespace(block_size=16, page_size_bytes=64)
-            )
-        ]
-        base_kwargs = {
-            "tp_size": 8,
-            "pcp_size": 1,
-            "dcp_size": 1,
-            "block_size": 16,
-            "hash_block_size": 16,
-        }
-        with (
-            patch("mtsc.kv_cache_pool.is_npu_platform", return_value=False),
-            patch("mtsc.kv_cache_pool.get_kv_cache_layout", return_value="HND"),
-        ):
-            pp1 = store_topology_namespace(
-                base_config, groups, pp_size=1, **base_kwargs
-            )
-            pp2 = store_topology_namespace(
-                base_config, groups, pp_size=2, **base_kwargs
-            )
-            self.assertNotEqual(pp1, pp2)
-
-            # Different model should still separate
-            alt_config = SimpleNamespace(
-                model_config=SimpleNamespace(
-                    model="org/other-model",
-                    revision="v1",
-                    dtype=torch.float16,
-                    use_mla=True,
-                ),
-                cache_config=SimpleNamespace(cache_dtype="auto"),
-                kv_transfer_config=SimpleNamespace(
-                    kv_connector_extra_config={"cache_prefix": "mla"}
-                ),
-            )
-            other_model = store_topology_namespace(
-                alt_config, groups, pp_size=1, **base_kwargs
-            )
-            self.assertNotEqual(pp1, other_model)
-
-            # Different dtype should still separate
-            dtype_config = SimpleNamespace(
-                model_config=SimpleNamespace(
-                    model="org/mla-model",
-                    revision="v1",
-                    dtype=torch.bfloat16,
-                    use_mla=True,
-                ),
-                cache_config=SimpleNamespace(cache_dtype="auto"),
-                kv_transfer_config=SimpleNamespace(
-                    kv_connector_extra_config={"cache_prefix": "mla"}
-                ),
-            )
-            bf16 = store_topology_namespace(
-                dtype_config, groups, pp_size=1, **base_kwargs
-            )
-            self.assertNotEqual(pp1, bf16)
-
-    def test_store_uses_one_shared_key_and_striped_puts(self) -> None:
-        for tp_size in (1, 2, 4, 8):
-            for tp_rank in range(tp_size):
-                self.assertEqual(
-                    store_tp_layout(
-                        use_mla=True,
-                        total_num_kv_heads=128,
-                        tp_size=tp_size,
-                        dcp_size=1,
-                        tp_rank=tp_rank,
-                    ),
-                    (1, tp_size, 0),
-                )
-
-    def test_pd_register_uses_mla_page_size_as_transfer_length(self) -> None:
+    def test_pd_register_uses_mla_physical_block_stride(self) -> None:
         class Engine:
             def __init__(self) -> None:
                 self.registrations = []
@@ -966,15 +586,16 @@ class MLALayoutTest(unittest.TestCase):
             head_size=8,
             dtype=torch.float16,
         )
-        cache = torch.empty((4, 16, 8), dtype=torch.float16)
+        cache = torch.empty((4, 16, 16), dtype=torch.float16)[:, :, :8]
         pd = object.__new__(MooncakeKVTransfer)
         pd._closed = pd._registered = False
-        pd._num_blocks_resolved = False
+        pd._receive_error = None
         pd.layer_specs = {"model.layers.0.self_attn": spec}
         pd.layer_groups = {"model.layers.0.self_attn": 0}
         pd.topology = Topology()
         pd.engine = Engine()
         pd.regions = []
+        pd.kv_caches_base_addr, pd.block_lens = [], []
         pd._registered_storage = []
         pd.is_producer = False
 
@@ -982,8 +603,9 @@ class MLALayoutTest(unittest.TestCase):
 
         self.assertEqual(len(pd.regions), 1)
         region = pd.regions[0]
-        self.assertEqual(region.block_length, cache.stride(0) * cache.element_size())
-        self.assertEqual(region.kv_block_length, spec.page_size_bytes)
+        self.assertEqual(region.block_len, cache.stride(0) * cache.element_size())
+        self.assertEqual(region.kv_block_len, cache.stride(0) * cache.element_size())
+        self.assertGreater(region.kv_block_len, spec.page_size_bytes)
         self.assertEqual(len(pd.engine.registrations), 1)
 
 
@@ -994,8 +616,10 @@ class CompletionAggregationTest(unittest.TestCase):
         worker._finished_waits = {
             "p-1": _FinishedWaitState(FinishedWait(store_save=True, kv_transfer=True))
         }
-        self.assertEqual(worker._aggregate_sends({"p-1"}, set()), set())
-        self.assertEqual(worker._aggregate_sends(set(), {"p-1"}), {"p-1"})
+        # When only pool save completes, request is not finished
+        self.assertEqual(worker._aggregate_send_finished({"p-1"}, set()), set())
+        # When kv transfer also completes, request is finished
+        self.assertEqual(worker._aggregate_send_finished(set(), {"p-1"}), {"p-1"})
 
 
 class PreemptionLifecycleTest(unittest.TestCase):
@@ -1046,6 +670,7 @@ class PreemptionLifecycleTest(unittest.TestCase):
     def _polling_pd(source: _Session) -> MooncakeKVTransfer:
         pd = object.__new__(MooncakeKVTransfer)
         pd._closed = False
+        pd._receive_error = None
         pd._registered = True
         pd._source_lock = threading.Lock()
         pd._source_changed = threading.Condition(pd._source_lock)
@@ -1107,10 +732,10 @@ class PreemptionLifecycleTest(unittest.TestCase):
 
         async def failed_write(*_args):
             self.assertEqual(source.active_writes, 1)
-            return {tid: (False, set()) for tid in _args[0]}
+            return dict.fromkeys(_args[0], False)
 
         pd._write_batch = failed_write
-        asyncio.run(pd._write_target(source, None, "d1"))
+        asyncio.run(pd._write_ready_targets({"d1": source}, None))
 
         self.assertEqual(source.active_writes, 0)
         self.assertEqual(source.terminal, 1)
@@ -1118,12 +743,17 @@ class PreemptionLifecycleTest(unittest.TestCase):
         self.assertEqual(pd._finished_send, {"r1"})
 
     def test_early_decode_timeout_waits_for_prefill_terminal(self) -> None:
-        source = _Session("r1", "x1", expected=1)
-        pd = self._polling_pd(source)
-        pd.is_producer = True
-        pd.timeout = 0.001
+        import msgspec
+        from test_backends import _request, _Socket, _transfer
 
-        asyncio.run(pd._write_target(source, None, "d1"))
+        source = _Session("r1", "x1", expected=1)
+        pd = _transfer()
+        pd._sources["x1"] = source
+        pd.timeout = 0.001
+        request = msgspec.structs.replace(
+            _request(pd), req_blocks={"d1": ("x1", [[4]])}
+        )
+        asyncio.run(pd._serve(b"d", msgspec.msgpack.encode(request), _Socket()))
 
         self.assertIn("x1", pd._sources)
         self.assertEqual(pd._finished_send, set())
@@ -1282,102 +912,12 @@ class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
 
         pd = object.__new__(MooncakeKVTransfer)
         pd._remote_workers = {}
+        pd._pending_bootstrap_queries = {}
         with patch("mtsc.kv_transfer.httpx.AsyncClient", return_value=Client()):
             workers = await pd._query_workers("http://bootstrap", "p1", 1)
             self.assertEqual(workers, {0: {0: "tcp://p1"}})
             with self.assertRaisesRegex(KeyError, "not 'p0'"):
                 await pd._query_workers("http://bootstrap", "p0", 1)
-
-    async def test_schema_mismatch_is_rejected_before_write(self) -> None:
-        class Socket:
-            def __init__(self) -> None:
-                self.frames = None
-
-            async def send_multipart(self, frames) -> None:
-                self.frames = frames
-
-        schema = KVTransferSchema(1, "model", "", "float16", "hnd", 16, False)
-        request = KVTransferRequest(
-            hostname="d",
-            rpc_port=1,
-            tp_size=1,
-            tp_rank=0,
-            pp_size=1,
-            pp_rank=0,
-            schema=KVTransferSchema(
-                1, "different-model", "", "float16", "hnd", 16, False
-            ),
-            requests={"x": ("r", [[1]])},
-            region_base_addresses=[],
-            block_lengths=[],
-            kv_block_lengths=[],
-        )
-        pd = object.__new__(MooncakeKVTransfer)
-        pd._closed = False
-        pd.schema = schema
-        pd._source_lock = threading.Lock()
-        pd._sources = {}
-        pd._request_decoder = msgspec.msgpack.Decoder(KVTransferRequest)
-        pd._response_decoder = msgspec.msgpack.Decoder(KVTransferResponse)
-        pd._encoder = msgspec.msgpack.Encoder()
-        socket = Socket()
-
-        await pd._serve(b"d", pd._encoder.encode(request), socket)
-
-        response = pd._response_decoder.decode(socket.frames[1])
-        self.assertEqual(response.status, KVTransferStatus.FAILED)
-        self.assertIn("schema mismatch", response.error_message)
-
-    async def test_source_completion_counts_heterogeneous_pp_fanout(self) -> None:
-        class Socket:
-            async def send_multipart(self, _frames) -> None:
-                return
-
-        schema = KVTransferSchema(2, "model", "", "float16", "hnd", 16, False)
-        request = KVTransferRequest(
-            hostname="d",
-            rpc_port=1,
-            tp_size=1,
-            tp_rank=0,
-            pp_size=2,
-            pp_rank=0,
-            schema=schema,
-            requests={"x": ("d-r", [[]])},
-            region_base_addresses=[],
-            block_lengths=[],
-            kv_block_lengths=[],
-            engine_id="d",
-            dp_rank=0,
-            remote_engine_id="p",
-            remote_dp_rank=0,
-            destination_num_blocks=4,
-        )
-        source = _Session("p-r", "x", published=True)
-        source.ready.set()
-        pd = PreemptionLifecycleTest._polling_pd(source)
-        pd.schema = schema
-        pd.topology = _NPUTransferTopology(0, 1, 16, False, 8)
-        pd.engine_id = "p"
-        pd.dp_rank = pd.tp_rank = pd.pp_rank = 0
-        pd.pp_size = 1
-        pd.timeout = 0.01
-        pd._request_decoder = msgspec.msgpack.Decoder(KVTransferRequest)
-        pd._encoder = msgspec.msgpack.Encoder()
-
-        async def write(*_args):
-            return {tid: (True, set()) for tid in _args[0]}
-
-        pd._write_batch = write
-        await pd._serve(b"d", pd._encoder.encode(request), Socket())
-        self.assertEqual(source.expected, 2)
-        self.assertEqual(source.terminal, 1)
-        self.assertIn("x", pd._sources)
-
-        request = msgspec.structs.replace(request, pp_rank=1)
-        await pd._serve(b"d", pd._encoder.encode(request), Socket())
-        self.assertEqual(source.terminal, 2)
-        self.assertNotIn("x", pd._sources)
-        self.assertEqual(pd.poll().sends, [TransferResult("p-r")])
 
     async def test_prefill_error_wins_while_decode_headers_are_pending(self) -> None:
         class RawRequest:

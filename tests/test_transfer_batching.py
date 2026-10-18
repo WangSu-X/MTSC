@@ -22,14 +22,14 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
     def _sender(self, write):
         transfer = _transfer()
         transfer._loop = asyncio.get_running_loop()
-        transfer.regions = [TransferRegion("layer.0", 0, 0, 1000, 16, 16)]
+        transfer.regions = [TransferRegion(1000, 16, 16)]
         transfer.engine = SimpleNamespace(batch_transfer_sync_write=write)
         return transfer
 
     @staticmethod
     def _two_requests(transfer):
         return msgspec.structs.replace(
-            _request(transfer), requests={"x": ("d-x", [[4]]), "y": ("d-y", [[5]])}
+            _request(transfer), req_blocks={"d-x": ("x", [[4]]), "d-y": ("y", [[5]])}
         )
 
     async def test_ready_requests_share_one_native_write_and_batch_failure(self):
@@ -60,13 +60,9 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(len(socket.messages), 1)
                 response = socket.messages[0]
-                self.assertEqual(response.status, KVTransferStatus.COMPLETE)
-                ids = (
-                    response.completed_transfer_ids
-                    if ret == 0
-                    else response.failed_transfer_ids
-                )
-                self.assertEqual(set(ids), {"x", "y"})
+                self.assertEqual(response.status, KVTransferStatus.FINISH)
+                ids = response.ok_reqs if ret == 0 else response.err_reqs
+                self.assertEqual(set(ids), {"d-x", "d-y"})
                 results = transfer.poll().sends
                 self.assertEqual(
                     {result.request_id for result in results}, {"p-x", "p-y"}
@@ -103,18 +99,16 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(first_response.wait(), 1)
                 self.assertFalse(serving.done())
                 self.assertEqual(len(calls), 1)
-                self.assertEqual(
-                    socket.messages[0].status, KVTransferStatus.IN_PROGRESS
-                )
-                self.assertEqual(socket.messages[0].completed_transfer_ids, ["x"])
+                self.assertEqual(socket.messages[0].status, KVTransferStatus.CONTINUE)
+                self.assertEqual(socket.messages[0].ok_reqs, ["d-x"])
                 self.assertEqual(
                     {result.request_id for result in transfer.poll().sends}, {"p-x"}
                 )
                 await asyncio.to_thread(transfer.send, SendEvent("p-y", "y", ((2,),)))
                 await asyncio.wait_for(serving, 1)
                 self.assertEqual(len(calls), 2)
-                self.assertEqual(socket.messages[-1].status, KVTransferStatus.COMPLETE)
-                self.assertEqual(socket.messages[-1].completed_transfer_ids, ["y"])
+                self.assertEqual(socket.messages[-1].status, KVTransferStatus.FINISH)
+                self.assertEqual(socket.messages[-1].ok_reqs, ["d-y"])
             finally:
                 transfer.cancel("p-y", "y")
                 await serving
@@ -131,15 +125,15 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
         transfer.send(SendEvent("p-y", "y", ((2,),)))
         request = msgspec.structs.replace(
             self._two_requests(transfer),
-            requests={"x": ("d-x", [[4]]), "y": ("d-y", [[6]])},
+            req_blocks={"d-x": ("x", [[4]]), "d-y": ("y", [[0, 1]])},
         )
         socket = _Socket()
         with ThreadPoolExecutor(max_workers=1) as pool:
             transfer._send_pool = pool
             await transfer._serve(b"d", msgspec.msgpack.encode(request), socket)
         self.assertEqual(calls, [("host:123", [1016], [2064], [16])])
-        self.assertEqual(socket.messages[0].completed_transfer_ids, ["x"])
-        self.assertEqual(socket.messages[0].failed_transfer_ids, ["y"])
+        self.assertEqual(socket.messages[0].ok_reqs, ["d-x"])
+        self.assertEqual(socket.messages[0].err_reqs, ["d-y"])
 
     async def test_ready_wait_timeout_finishes_all_pending_ids_without_writes(self):
         calls = []
@@ -155,8 +149,8 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
             1,
         )
         self.assertEqual(calls, [])
-        self.assertEqual(socket.messages[0].status, KVTransferStatus.COMPLETE)
-        self.assertEqual(set(socket.messages[0].failed_transfer_ids), {"x", "y"})
+        self.assertEqual(socket.messages[0].status, KVTransferStatus.FINISH)
+        self.assertEqual(set(socket.messages[0].err_reqs), {"d-x", "d-y"})
         self.assertEqual(transfer.poll().sends, [])
         for tid in ("x", "y"):
             self.assertEqual(transfer._sources[tid].terminal, 1)
@@ -170,37 +164,44 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
         transfer = self._sender(lambda *args: 0)
         source = _Session("p-x", "x", block_ids=((0, 1),))
         request = msgspec.structs.replace(
-            _request(transfer), requests={"x": ("d-x", [[2, 3]])}
+            _request(transfer), req_blocks={"d-x": ("x", [[2, 3]])}
         )
-        src, dst, sizes, coverage = transfer._build_request_transfer_params(
-            "x", source, request
+        src, dst, sizes = transfer._build_request_transfer_params(
+            "d-x", source, request
         )
-        self.assertEqual((src, dst, sizes, coverage), ([1000], [2032], [32], {0}))
+        self.assertEqual((src, dst, sizes), ([1000], [2032], [32]))
 
         source.block_ids = ((0, 2),)
         self.assertEqual(
-            transfer._build_request_transfer_params("x", source, request)[2], [16, 16]
+            transfer._build_request_transfer_params("d-x", source, request)[2], [16, 16]
         )
         source.block_ids = ((0, 1),)
-        request = msgspec.structs.replace(request, requests={"x": ("d-x", [[2, 4]])})
+        request = msgspec.structs.replace(request, req_blocks={"d-x": ("x", [[2, 4]])})
         self.assertEqual(
-            transfer._build_request_transfer_params("x", source, request)[2], [16, 16]
+            transfer._build_request_transfer_params("d-x", source, request)[2], [16, 16]
         )
 
         # Padding and TP slices cannot be copied as a contiguous full page.
-        transfer.regions = [TransferRegion("layer.0", 0, 0, 1000, 32, 16)]
+        transfer.regions = [TransferRegion(1000, 32, 16)]
         request = msgspec.structs.replace(
-            request, block_lengths=[32], requests={"x": ("d-x", [[2, 3]])}
+            request,
+            block_lens=[32],
+            kv_block_lens=[16],
+            req_blocks={"d-x": ("x", [[2, 3]])},
         )
         self.assertEqual(
-            transfer._build_request_transfer_params("x", source, request)[2], [16, 16]
+            transfer._build_request_transfer_params("d-x", source, request)[2], [16, 16]
         )
-        transfer.regions = [TransferRegion("layer.0", 0, 0, 1000, 32, 32)]
+        transfer.regions = [TransferRegion(1000, 32, 32)]
         request = msgspec.structs.replace(
-            request, tp_size=2, tp_rank=1, block_lengths=[16]
+            request,
+            remote_tp_size=2,
+            remote_tp_rank=1,
+            block_lens=[16],
+            kv_block_lens=[16],
         )
         self.assertEqual(
-            transfer._build_request_transfer_params("x", source, request)[2], [16, 16]
+            transfer._build_request_transfer_params("d-x", source, request)[2], [16, 16]
         )
 
     async def test_cancel_one_source_fences_shared_batch_and_preserves_sibling(self):
@@ -266,13 +267,14 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
         transfer.send(SendEvent("p-x", "x", ((1,),)))
         source = transfer._sources["x"]
         original_request = msgspec.structs.replace(
-            _request(transfer), requests={"x": ("d-x", [[4]])}
+            _request(transfer), req_blocks={"d-x": ("x", [[4]])}
         )
         transfer.prepare("p-y", "y")
-        transfer._sources["y"].peer = ("another-engine", 3, 1, 1)
+        transfer._sources["y"].peer = 2
         requests = {"x": ("d-x", [[4]]), "y": ("d-y", [[5]]), "z": ("d-z", [[3]])}
         malformed_request = msgspec.structs.replace(
-            original_request, requests={tid: requests[tid] for tid in order}
+            original_request,
+            req_blocks={requests[tid][0]: (tid, requests[tid][1]) for tid in order},
         )
         original_socket, malformed_socket = _Socket(), _Socket()
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -302,11 +304,9 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(asyncio.gather(original, malformed), 1)
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(source.terminal, 1)
+                self.assertEqual(original_socket.messages[0].ok_reqs, ["d-x"])
                 self.assertEqual(
-                    original_socket.messages[0].completed_transfer_ids, ["x"]
-                )
-                self.assertEqual(
-                    malformed_socket.messages[0].status, KVTransferStatus.FAILED
+                    malformed_socket.messages[0].status, KVTransferStatus.ERROR
                 )
                 if "z" in order:
                     owned = transfer._sources["z"]
@@ -349,17 +349,17 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
                         peer_one_ready.set()
                     else:
                         await peer_two_ready.wait()
-                    response = KVTransferResponse(KVTransferStatus.IN_PROGRESS, ["x"])
+                    response = KVTransferResponse(KVTransferStatus.CONTINUE, ["d-x"])
                 else:
                     await finish_y.wait()
-                    response = KVTransferResponse(KVTransferStatus.COMPLETE, ["y"])
+                    response = KVTransferResponse(KVTransferStatus.FINISH, ["d-y"])
                 return msgspec.msgpack.encode(response)
 
             def close(self, **kwargs):
                 pass
 
         async def query(*args):
-            return {0: {0: "p0", 1: "p1"}}
+            return {0: {0: "p0"}, 1: {0: "p1"}}
 
         transfer = _transfer()
         transfer.hostname, transfer.rpc_port = "d", 123
@@ -382,7 +382,7 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(receiving.done())
             self.assertEqual(len(payloads), 2)
             self.assertTrue(
-                all(set(request.requests) == {"x", "y"} for request in payloads)
+                all(set(request.req_blocks) == {"d-x", "d-y"} for request in payloads)
             )
             finish_y.set()
             await asyncio.wait_for(receiving, 1)
@@ -410,7 +410,7 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
             async def recv(self):
                 return msgspec.msgpack.encode(
                     KVTransferResponse(
-                        KVTransferStatus.COMPLETE, list(self.request.requests)
+                        KVTransferStatus.FINISH, list(self.request.req_blocks)
                     )
                 )
 
@@ -446,8 +446,8 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(payloads), 2)
         self.assertEqual(
-            {request.remote_dp_rank: set(request.requests) for request in payloads},
-            {2: {"x", "y"}, 3: {"z"}},
+            {frozenset(request.req_blocks) for request in payloads},
+            {frozenset({"d-x", "d-y"}), frozenset({"d-z"})},
         )
         self.assertEqual(
             {result.request_id for result in transfer.poll().recvs},
@@ -470,18 +470,19 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
 
             async def send(self, payload):
                 request = msgspec.msgpack.decode(payload, type=KVTransferRequest)
-                self.request_ids = set(request.requests)
+                self.request_ids = set(request.req_blocks)
 
             async def recv(self):
                 self.round += 1
                 if self.round == 1:
                     response = KVTransferResponse(
-                        KVTransferStatus.IN_PROGRESS, ["x"], covered_regions={"x": [0]}
+                        KVTransferStatus.CONTINUE,
+                        ["d-x"],
                     )
                 else:
                     await release.wait()
                     response = KVTransferResponse(
-                        KVTransferStatus.COMPLETE, failed_transfer_ids=["y"]
+                        KVTransferStatus.FINISH, err_reqs=["d-y"]
                     )
                 return msgspec.msgpack.encode(response)
 
@@ -494,7 +495,8 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
         transfer = _transfer()
         transfer._loop = asyncio.get_running_loop()
         transfer.hostname, transfer.rpc_port = "d", 123
-        transfer.regions = [TransferRegion("layer.0", 0, 0, 2000, 16, 16)]
+        transfer.regions = [TransferRegion(2000, 16, 16)]
+        transfer.kv_caches_base_addr, transfer.block_lens = [2000], [16]
         client = Client()
         transfer._ctx = SimpleNamespace(socket=lambda kind: client)
         transfer._query_workers = query
@@ -525,7 +527,7 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([result.request_id for result in results], ["d-y"])
             self.assertIsNotNone(results[0].error)
             self.assertEqual(transfer.take_errors(), {5})
-            self.assertEqual(client.request_ids, {"x", "y"})
+            self.assertEqual(client.request_ids, {"d-x", "d-y"})
         finally:
             release.set()
             await asyncio.wrap_future(second)
@@ -640,7 +642,7 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
                 response = msgspec.msgpack.decode(
                     await asyncio.wait_for(client.recv(), 1), type=KVTransferResponse
                 )
-                self.assertEqual(set(response.completed_transfer_ids), {"x", "y"})
+                self.assertEqual(set(response.ok_reqs), {"d-x", "d-y"})
                 await asyncio.wait_for(listener, 1)
                 self.assertTrue(all(source.active_writes == 0 for source in sources))
                 self.assertTrue(all(source.terminal == 1 for source in sources))
@@ -666,7 +668,8 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
 
         producer = self._sender(write)
         producer.hostname = "127.0.0.1"
-        producer.regions = [TransferRegion("layer.0", 0, 0, source.data_ptr(), 16, 16)]
+        producer.regions = [TransferRegion(source.data_ptr(), 16, 16)]
+        producer.kv_caches_base_addr, producer.block_lens = [source.data_ptr()], [16]
         producer._serve_tasks = set()
         producer._ctx = zmq.asyncio.Context()
         producer.send(SendEvent("p-x", "x", ((1,),)))
@@ -683,9 +686,11 @@ class BatchedTransferTest(unittest.IsolatedAsyncioTestCase):
         consumer._loop = asyncio.get_running_loop()
         consumer.hostname, consumer.rpc_port = "d", 456
         consumer.engine_id, consumer.dp_rank = "d", 3
-        consumer.regions = [
-            TransferRegion("layer.0", 0, 0, destination.data_ptr(), 16, 16)
-        ]
+        consumer.kv_caches_base_addr, consumer.block_lens = (
+            [destination.data_ptr()],
+            [16],
+        )
+        consumer.regions = [TransferRegion(destination.data_ptr(), 16, 16)]
         consumer._ctx = zmq.asyncio.Context()
         consumer._query_workers = query
         consumer._response_decoder = msgspec.msgpack.Decoder(KVTransferResponse)

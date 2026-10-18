@@ -4,12 +4,10 @@
 """Remote KV cache contract and Mooncake Store implementation."""
 
 from __future__ import annotations
-import logging
 
-import dataclasses
-import hashlib
 import inspect
 import json
+import logging
 import math
 import os
 import socket
@@ -19,7 +17,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from types import SimpleNamespace
 from typing import Any, Protocol, cast
 
 import torch
@@ -35,7 +32,6 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_socket
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -55,10 +51,8 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from .utils import (
     BlockIds,
-    KVLayoutAdapter,
     cache_tensors,
     is_npu_platform,
-    npu_kv_nz_enabled,
     npu_registration_regions,
 )
 
@@ -840,31 +834,6 @@ def _parse_size(value: Any) -> int:
     return int(text)
 
 
-def _key_prefix(
-    metadata: KeyMetadata,
-    namespace: str,
-    *,
-    tp_rank: int | None = None,
-    pcp_rank: int | None = None,
-    dcp_rank: int | None = None,
-    pp_rank: int | None = None,
-) -> str:
-    """Build a Store key prefix without relying on version-specific helpers."""
-    base = (
-        f"{metadata.model_name}"
-        f"@tp_rank:{metadata.tp_rank if tp_rank is None else tp_rank}"
-        f"@pcp{metadata.pcp_rank if pcp_rank is None else pcp_rank}"
-        f"@dcp{metadata.dcp_rank if dcp_rank is None else dcp_rank}"
-        f"@pp_rank:{metadata.pp_rank if pp_rank is None else pp_rank}"
-        f"@group:{metadata.group_id}"
-    )
-    return f"{namespace}@{base}" if namespace else base
-
-
-def _key_string(prefix: str, block_hash: BlockHash) -> str:
-    return f"{prefix}@{block_hash.hex()}"
-
-
 def _make_external_cached_pool(
     hash_block_size: int, present: set[tuple[int, bytes]]
 ) -> ExternalCachedBlockPool:
@@ -872,115 +841,6 @@ def _make_external_cached_pool(
     if "hash_block_size" in parameters:
         return ExternalCachedBlockPool(hash_block_size, present)
     return ExternalCachedBlockPool(present)
-
-
-def store_tp_layout(
-    *,
-    use_mla: bool,
-    total_num_kv_heads: int,
-    tp_size: int,
-    dcp_size: int,
-    tp_rank: int,
-) -> tuple[int, int, int]:
-    """Return ``(key_heads, put_step, key_tp_rank)`` for Store I/O.
-
-    MLA KV is replicated across TP ranks, so it is represented as one KV head
-    in Store.  TP ranks share one key and take turns writing chunks; every rank
-    can subsequently load that key into its own replicated cache.
-    """
-    num_kv_heads = 1 if use_mla else total_num_kv_heads
-    if num_kv_heads <= 0 or tp_size <= 0 or not 0 <= tp_rank < tp_size:
-        raise ValueError("invalid KV head count or TP topology")
-    if num_kv_heads < tp_size and dcp_size <= 1:
-        if tp_size % num_kv_heads:
-            raise ValueError("TP size must be divisible by the KV head count")
-        put_step = tp_size // num_kv_heads
-        return num_kv_heads, put_step, tp_rank // put_step
-    return num_kv_heads, 1, tp_rank
-
-
-def store_topology_namespace(
-    vllm_config: VllmConfig,
-    groups: Sequence[Any],
-    *,
-    tp_size: int,
-    pp_size: int,
-    pcp_size: int,
-    dcp_size: int,
-    block_size: int,
-    hash_block_size: int,
-) -> str:
-    """Build a stable namespace that excludes incompatible Store objects."""
-    model = vllm_config.model_config
-    cache = vllm_config.cache_config
-
-    def spec_signature(spec: Any) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "type": f"{type(spec).__module__}.{type(spec).__qualname__}"
-        }
-        for name in (
-            "block_size",
-            "page_size_bytes",
-            "sliding_window",
-            "num_kv_heads",
-            "head_size",
-            "dtype",
-        ):
-            value = getattr(spec, name, None)
-            if value is not None:
-                result[name] = str(value)
-        nested = getattr(spec, "kv_cache_specs", None)
-        if nested:
-            unique = {
-                json.dumps(spec_signature(item), sort_keys=True, separators=(",", ":"))
-                for item in nested.values()
-            }
-            result["nested"] = sorted(unique)
-        return result
-
-    if is_npu_platform():
-        layout = "npu-nz" if npu_kv_nz_enabled(vllm_config) else "npu-normal"
-    else:
-        layout = str(get_kv_cache_layout())
-    
-    # MLA with PCP=1 and DCP=1 shares Store objects across TP sizes.
-    # All TP ranks use tp_rank:0 keys and stripe chunks; namespace unification
-    # allows P (TP=8) and D (TP=1) to share cached prefixes without D needing
-    # to re-save prompt KV. Other topologies remain isolated.
-    share_mla_tp = bool(model.use_mla) and pcp_size == 1 and dcp_size == 1
-    namespace_tp_size = 1 if share_mla_tp else tp_size
-    
-    payload = {
-        "version": 1,
-        "model_id": str(model.model),
-        "model_revision": str(getattr(model, "revision", None) or ""),
-        "tp_size": namespace_tp_size,
-        "pp_size": pp_size,
-        "pcp_size": pcp_size,
-        "dcp_size": dcp_size,
-        "block_size": block_size,
-        "hash_block_size": hash_block_size,
-        "kv_layout": layout,
-        "kv_cache_dtype": str(
-            model.dtype if cache.cache_dtype == "auto" else cache.cache_dtype
-        ),
-        "is_mla": bool(model.use_mla),
-        "group_schema": [spec_signature(group.kv_cache_spec) for group in groups],
-    }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    signature = hashlib.sha256(canonical.encode()).hexdigest()[:24]
-    assert vllm_config.kv_transfer_config is not None
-    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
-    user_prefix = str(extra.get("cache_prefix", ""))
-    enabled = extra.get("mtsc_store_topology_namespace", True)
-    if enabled is None:
-        enabled = True
-    if isinstance(enabled, str):
-        enabled = enabled.strip().lower() not in {"0", "false", "no", "off"}
-    if not enabled:
-        return user_prefix
-    namespace = f"mtsc-v1-{signature}"
-    return f"{user_prefix}:{namespace}" if user_prefix else namespace
 
 
 @dataclass(frozen=True)
@@ -1223,7 +1083,7 @@ class _LoadState:
     timed_out: bool = False
 
 
-class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
+class MooncakeKVCachePool(KVCachePool):
     """Own Mooncake memory registration, lookup and fenced load/save tasks."""
 
     def __init__(self, config, kv_cache_config) -> None:
@@ -1238,8 +1098,8 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             raise ImportError("Mooncake Python store bindings are required") from exc
 
         assert config.kv_transfer_config is not None
-        model = config.model_config
-        parallel = config.parallel_config
+        model_config = config.model_config
+        parallel_config = config.parallel_config
         extra = config.kv_transfer_config.kv_connector_extra_config
         recv_workers = max(1, int(extra.get("mtsc_store_load_workers", 2)))
         self.load_timeout = float(extra.get("mtsc_store_get_timeout_seconds", 180.0))
@@ -1249,40 +1109,55 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             )
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-        pp_size = parallel.pipeline_parallel_size
-        pp_rank = (parallel.rank // self.tp_size) % pp_size
-        pcp = get_pcp_group()
-        dcp = get_dcp_group()
-        pcp_size, pcp_rank = (
-            pcp.world_size,
-            pcp.rank_in_group if pcp.world_size > 1 else 0,
-        )
-        dcp_size, dcp_rank = (
-            dcp.world_size,
-            dcp.rank_in_group if dcp.world_size > 1 else 0,
-        )
-        block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
+        self.pp_size = parallel_config.pipeline_parallel_size
+        self.pp_rank = (parallel_config.rank // self.tp_size) % self.pp_size
+        self.pcp_size = get_pcp_group().world_size
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
+        self.dcp_size = get_dcp_group().world_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, config
         )
         self.num_blocks = config.cache_config.num_gpu_blocks
         self._num_blocks_resolved = config.cache_config.num_gpu_blocks is not None
-        self._config_ref = config
-        num_kv_heads, self.put_step, key_tp_rank = store_tp_layout(
-            use_mla=model.use_mla,
-            total_num_kv_heads=model.get_total_num_kv_heads(),
-            tp_size=self.tp_size,
-            dcp_size=dcp_size,
-            tp_rank=self.tp_rank,
+        self.use_mla = (
+            isinstance(getattr(model_config, "use_mla", None), bool)
+            and model_config.use_mla
+        )
+        self.num_kv_head = 1 if self.use_mla else model_config.get_total_num_kv_heads()
+        if (
+            self.num_kv_head <= 0
+            or self.tp_size <= 0
+            or not 0 <= self.tp_rank < self.tp_size
+        ):
+            raise ValueError("invalid KV head count or TP topology")
+        # DCP ranks may hold different token shards, so they must not share
+        # the TP-replica PUT striping used for full replicated KV caches.
+        if self.num_kv_head < self.tp_size and self.dcp_size == 1:
+            if self.tp_size % self.num_kv_head:
+                raise ValueError("TP size must be divisible by the KV head count")
+            self.put_step = self.tp_size // self.num_kv_head
+            self.head_or_tp_rank = self.tp_rank // self.put_step
+        else:
+            self.head_or_tp_rank = self.tp_rank
+            self.put_step = 1
+
+        self.metadata = KeyMetadata(
+            model_name=model_config.model.rstrip("/").split("/")[-1],
+            tp_rank=self.head_or_tp_rank,
+            pcp_rank=self.pcp_rank,
+            dcp_rank=self.dcp_rank,
+            pp_rank=self.pp_rank,
         )
 
         groups = list(kv_cache_config.kv_cache_groups)
-        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != block_size:
+        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
             group = groups[0]
             groups = [
-                dataclasses.replace(
+                replace(
                     group,
-                    kv_cache_spec=dataclasses.replace(
-                        group.kv_cache_spec, block_size=block_size
+                    kv_cache_spec=replace(
+                        group.kv_cache_spec, block_size=self.block_size
                     ),
                 )
             ]
@@ -1294,7 +1169,7 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             else False
         )
         coordinator_kwargs: dict[str, Any] = {
-            "scheduler_block_size": block_size,
+            "scheduler_block_size": self.block_size,
             "hash_block_size": self.hash_block_size,
             "use_eagle": use_eagle,
         }
@@ -1306,34 +1181,15 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                 envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL
             )
         self.coordinator = MooncakeStoreCoordinator(groups, **coordinator_kwargs)
-        self.cache_namespace = store_topology_namespace(
-            config,
-            groups,
-            tp_size=self.tp_size,
-            pp_size=pp_size,
-            pcp_size=pcp_size,
-            dcp_size=dcp_size,
-            block_size=block_size,
-            hash_block_size=self.hash_block_size,
-        )
-        metadata = KeyMetadata(
-            model_name=model.model.rstrip("/").split("/")[-1],
-            tp_rank=key_tp_rank,
-            pcp_rank=pcp_rank,
-            dcp_rank=dcp_rank,
-            pp_rank=pp_rank,
-        )
         self.databases = [
             ChunkedTokenDatabase(
-                dataclasses.replace(metadata, group_id=i),
+                replace(self.metadata, group_id=i),
                 group.kv_cache_spec.block_size,
                 self.hash_block_size,
             )
             for i, group in enumerate(groups)
         ]
-        self._init_lookup_prefixes(
-            num_kv_heads, pp_size=pp_size, pcp_size=pcp_size, dcp_size=dcp_size
-        )
+        self._init_lookup_metadata()
 
         # 必须在 store 的 TE 初始化前设置 ASCEND_LOCAL_COMM_RES，
         # 否则 HIXL 缺机内 UB 拓扑 -> rank_table 格式错 -> 103900。
@@ -1355,8 +1211,7 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             raise RuntimeError(f"Mooncake Store setup failed: {ret}")
         self.replicate_config = ReplicateConfig()
         self.replicate_config.model_name = (
-            os.getenv("MOONCAKE_MODEL_NAME")
-            or model.model.rstrip("/").split("/")[-1]
+            os.getenv("MOONCAKE_MODEL_NAME") or self.metadata.model_name
         )
         preferred = get_configured_preferred_segment(extra)
         if preferred is not None:
@@ -1372,23 +1227,9 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         )
         self._loads: dict[str, _LoadState] = {}
         self._lookup_server = (
-            StoreLookupServer(self, config) if parallel.rank == 0 else None
+            StoreLookupServer(self, config) if parallel_config.rank == 0 else None
         )
-        self.device_id = torch.accelerator.current_device_index()
         self.kv_caches = {}
-        self.npu_kv_nz = npu_kv_nz_enabled(config)
-        self.topology = SimpleNamespace(
-            block_size=block_size,
-            is_mla=config.model_config.use_mla,
-            total_num_kv_heads=config.model_config.get_total_num_kv_heads(),
-        )
-        self.layer_groups = {}
-        self.layer_specs = {}
-        for index, group in enumerate(kv_cache_config.kv_cache_groups):
-            specs = getattr(group.kv_cache_spec, "kv_cache_specs", {})
-            for layer in group.layer_names:
-                self.layer_groups[layer] = index
-                self.layer_specs[layer] = specs.get(layer, group.kv_cache_spec)
 
     def _check_open(self) -> None:
         if self._closed:
@@ -1413,7 +1254,10 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                 raise ValueError(
                     "num_gpu_blocks must be initialized before MooncakeKVCachePool"
                 )
-            logger.info("MTSC Store inferred num_blocks=%d from KV cache tensors", self.num_blocks)
+            logger.info(
+                "MTSC Store inferred num_blocks=%d from KV cache tensors",
+                self.num_blocks,
+            )
         seen: set[int] = set()
         addresses: list[int] = []
         block_lengths: list[int] = []
@@ -1485,8 +1329,8 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                     continue
                 block_hash = group_hashes[index]
                 keys.extend(
-                    _key_string(prefix, block_hash)
-                    for prefix in self._lookup_prefixes[group_index]
+                    PoolKey(metadata, block_hash.hex()).to_string()
+                    for metadata in self._lookup_metadata[group_index]
                 )
                 candidates.append((group_index, bytes(block_hash)))
         if not keys:
@@ -1538,16 +1382,8 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             failed = self._request_load_blocks(event)
             error = str(exc)
         actual = self._loaded_prefix(event, failed)
-        try:
-            # Conversion is part of the aggregate I/O future. poll() never
-            # waits for device conversion; success fences its writes too.
-            self.reformat_npu_blocks(
-                self._range_blocks(event, event.start_load, actual),
-                self.tp_size,
-            )
-        except Exception as exc:  # noqa: BLE001 - device conversion result boundary
-            actual = event.start_load
-            error = str(exc)
+        # Store objects preserve this topology's physical bytes. Unlike a PD
+        # head gather, GET needs no device-side layout conversion.
         invalid = {
             block
             for group in self._range_blocks(event, actual, event.end_load)
@@ -1725,7 +1561,9 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         if not devices:
             return
         # 用当前进程绑定的 NPU device（P: TP=8 rank 0-7；D: DP=8 每 worker 一卡）
-        current_dev = int(torch.npu.current_device()) if hasattr(torch, "npu") else self.tp_rank
+        current_dev = (
+            int(torch.npu.current_device()) if hasattr(torch, "npu") else self.tp_rank
+        )
         if current_dev not in devices:
             return
         endpoint_file = os.path.join(res_path, f"ub_endpoint_npu_{current_dev}.json")
@@ -1760,28 +1598,25 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         self._invalid.clear()
         self.kv_caches.clear()
 
-    def _init_lookup_prefixes(
-        self, num_kv_heads: int, *, pp_size: int, pcp_size: int, dcp_size: int
-    ) -> None:
-        if dcp_size > 1:
+    def _init_lookup_metadata(self) -> None:
+        if self.dcp_size > 1:
             ranks = tuple(
-                (tp, pcp, tp % dcp_size, pp)
-                for pcp in range(pcp_size)
+                (tp, pcp, tp % self.dcp_size, pp)
+                for pcp in range(self.pcp_size)
                 for tp in range(self.tp_size)
-                for pp in range(pp_size)
+                for pp in range(self.pp_size)
             )
         else:
             ranks = tuple(
                 (tp, pcp, 0, pp)
-                for pcp in range(pcp_size)
-                for tp in range(min(self.tp_size, num_kv_heads))
-                for pp in range(pp_size)
+                for pcp in range(self.pcp_size)
+                for tp in range(min(self.tp_size, self.num_kv_head))
+                for pp in range(self.pp_size)
             )
-        self._lookup_prefixes = tuple(
+        self._lookup_metadata = tuple(
             tuple(
-                _key_prefix(
+                replace(
                     db.metadata,
-                    self.cache_namespace,
                     tp_rank=tp,
                     pcp_rank=pcp,
                     dcp_rank=dcp,
@@ -1816,16 +1651,6 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
             for mask, database in zip(masks, self.databases, strict=True)
         )
 
-    def _database_key(self, database: ChunkedTokenDatabase, value: Any) -> str:
-        # vLLM 0.23 process_tokens yields PoolKey; newer versions yield
-        # BlockHash and expose key_for(). Namespace locally in both cases so
-        # topology isolation does not depend on KeyMetadata.cache_prefix.
-        if hasattr(value, "to_string"):
-            base = value.to_string()
-        else:
-            base = database.key_for(value)
-        return f"{self.cache_namespace}@{base}" if self.cache_namespace else base
-
     def _process_tokens(
         self,
         database: ChunkedTokenDatabase,
@@ -1836,8 +1661,8 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
         chunk_mask: list[bool] | None = None,
         put_step: int = 1,
         put_step_rank: int = 0,
-    ) -> Iterator[tuple[int, int, str]]:
-        """Normalize vLLM 0.23 and newer ChunkedTokenDatabase APIs."""
+    ) -> Iterator[tuple[int, int, PoolKey]]:
+        """Apply chunk masks and PUT striping without changing database keys."""
         if put_step <= 0:
             raise ValueError("put_step must be positive")
         start_chunk = cdiv(start_token, database.block_size)
@@ -1852,7 +1677,7 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                 continue
             if chunk % put_step != put_step_rank:
                 continue
-            yield start, end, self._database_key(database, value)
+            yield start, end, value
 
     def _request_load_blocks(self, event: LoadEvent) -> set[int]:
         result: set[int] = set()
@@ -1882,7 +1707,7 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                 address, size, block_id = database.prepare_value(
                     start, end, event.block_ids[group_index]
                 )
-                keys.append(key)
+                keys.append(key.to_string())
                 addresses.append(address)
                 sizes.append(size)
                 block_ids.append(block_id)
@@ -1930,7 +1755,7 @@ class MooncakeKVCachePool(KVLayoutAdapter, KVCachePool):
                 address, size, _ = database.prepare_value(
                     start, end, event.block_ids[group_index]
                 )
-                keys.append(key)
+                keys.append(key.to_string())
                 addresses.append(address)
                 sizes.append(size)
         if not keys:

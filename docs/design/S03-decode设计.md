@@ -7,6 +7,10 @@
 
 > 实现边界：只复用底层 `MooncakeDistributedStore`、`TransferEngine` 和无状态 helper；不创建原生 Mooncake Connector/Scheduler/Worker 实例。
 
+> Transfer 当前实现已对齐官方 Mooncake：PP=1、物理 TP 比例切片、按注册顺序匹配 region；
+> `req_blocks` 和响应列表以 D request ID 为键，保留 transfer ID 进行 P/D 匹配。
+> 不再使用自定义 schema、layer/group 匹配或 region coverage 协议。具体契约见 [S05](./S05-pool&transfe.md#43-transfer-tpppdp)。
+
 ## 1. 背景
 
 MTSC 不为 Prefill 和 Decode 实现两套 Connector。P/D 共用同一套 `connector.py`、`scheduler.py`、`worker.py` 和 metadata protocol，内部根据进程侧 role、引擎侧 role 和 request params 选择逻辑。
@@ -54,7 +58,7 @@ local APC [0,L)
 1. 在同一次 external-load 生命周期内完成 Store-first 两阶段加载，两阶段都终止后才解除 D waiting；
 2. 一次性为 `[L,T)` 分配 destination blocks，不在 Store 和 PD 之间重新分配或退出 waiting；
 3. 根据 Store GET 的实际结果固化 `A`，由 P 补齐 `[A,T)`，使 Store 部分失败可被 PD 路径覆盖；
-4. 在兼容的异构 TP/PP 之间完成 region mapping，并对每个 rank/group/layer 做 coverage 校验；
+4. 在 PP=1 的整数倍异构 TP 之间按 region 顺序映射，汇总所有必要 P rank 的终态；
 5. Store 或 PD 不能完整覆盖时 fail closed，同时返回 `finished_recving` 和 invalid blocks，交给 vLLM 从首个无效 block 重算。
 
 D 侧不负责选择 P，不允许 Store 和 P 并发写同一 destination block，也不把控制面 timeout 等价为 DMA 已停止。一旦 destination addresses 已发给 P，block 回收必须以 terminal response/fence 为准。
@@ -77,7 +81,7 @@ D 先完成 Store GET `[L,H)`，再根据成功的连续 blocks 确定 `A`，最
 
 #### 2.1.4 异构 Topology 与 Coverage Fail-closed
 
-PD 路径允许 P/D TP size 互为整数倍，并根据 TP fan-in/fan-out、PP layer ownership、KV group 和 region layout 计算写入计划。D 只在所有必需 response 和 region coverage 完整时报告成功；不支持的 topology 不做隐式重分片。
+PD 路径要求 PP=1 且 P/D TP size 互为整数倍，按官方 TP 切片规则和注册 region 顺序生成写入计划。D 收到所有必要 P rank 的成功 response 后报告完成；group/layout 和 PCP/DCP 配置须由部署保持兼容。
 
 #### 2.1.5 零长度握手
 
@@ -129,8 +133,8 @@ flowchart LR
 | `KVTransferPlan` | 保存两阶段计划、block 映射、group size 和 P 连接参数 | 不保存可变运行状态 |
 | `MTSCWorker` | 消费 plan，严格串行 Store/PD，维护 `_TransferState`，收集 invalid blocks | 不直接修改 vLLM request status |
 | `StoreLookupClient/Server` | 返回所有必需 Store shards 都存在的最长连续前缀 `H` | 不代表 GET 必然成功 |
-| `MooncakeKVCachePool` | topology-aware namespace、异步 GET/PUT、timeout fence 和 block 级错误 | 不转换不同 Store topology |
-| `MooncakeKVTransfer` | P worker 发现、TP/PP mapping、request/response、region coverage 校验 | 不在 `A` 固化前发送 suffix |
+| `MooncakeKVCachePool` | 官方 Store key、异步 GET/PUT、timeout fence 和 block 级错误 | 不转换不同 Store topology |
+| `MooncakeKVTransfer` | P worker 发现、TP mapping、request/response、完成汇总 | 不在 `A` 固化前发送 suffix |
 | `_TransferState` | 保存当前 stage、PD 启动时间和 suffix blocks | 不跨 request 共享状态 |
 | `KVTransferSchema/Request/Response` | 定义 P/D layout 不变式、D destination metadata 和 P terminal result | 不承载 KV bytes |
 
@@ -220,14 +224,12 @@ classDiagram
         +close()
     }
     class MooncakeKVTransfer {
-        +schema: KVTransferSchema
         +regions: TransferRegion[]
         +recv(event)
         +preempt(request_id)
         +poll()
         +reformat_npu_blocks(blocks, remote_tp_size)
         -_query_workers(address, engine_id, dp_rank)
-        -_validate_coverage(request_id, blocks, responses, expected)
         +close()
     }
     class MTSCConnectorMetadata {
@@ -271,7 +273,6 @@ classDiagram
     MTSCConnectorMetadata o-- KVPoolSaveRequest
     MTSCConnectorMetadata o-- KVTransferPlan
     MTSCConnectorMetadata o-- KVTransferSourceState
-    MooncakeKVTransfer *-- KVTransferSchema
     MooncakeKVTransfer o-- TransferRegion
 ```
 
@@ -287,8 +288,8 @@ classDiagram
 | `MooncakeKVCachePool._loaded_prefix()` | 从 GET 的 block 结果计算实际连续终点，以 `LoadResult.loaded_tokens` 返回 `A` |
 | `MTSCWorker._suffix_blocks()` | 将 token 边界 `[A,T)` 投影为每个 KV group 的 destination block list |
 | `MTSCWorker._start_transfer()` | 在 Store 终止后启动 `MooncakeKVTransfer.recv()`；无有效 P 时将 suffix 标记为 load error |
-| `MooncakeKVTransfer.recv()` / `_receive()` | 精确查询 P workers，建立 TP/PP request set，发送 metadata 并聚合 responses |
-| `MooncakeKVTransfer._validate_coverage()` | 校验所有必需 region 的 fan-in coverage，拒绝缺失、重复或越界写入 |
+| `MooncakeKVTransfer.recv()` / `_receive()` | 精确查询 P workers，建立 TP request set（PP=1），发送 metadata 并聚合 responses |
+| `MooncakeKVTransfer._receive_batch()` | 按 D request ID 统计所有必要 P rank 的结果，任一失败则回退 |
 | `MTSCWorker.get_finished()` | 推进 `STORE_PENDING/STORE_DONE -> TRANSFER_PENDING -> terminal`；终态后移除 `_TransferState`，返回 `finished_recving` 与 invalid blocks |
 
 ### 2.6 E2E 时序图
@@ -497,7 +498,7 @@ MTSCConnectorMetadata(
 - `all_block_ids/external_block_ids` 共同描述完整 `[L,T)` 的物理绑定，不是只覆盖 Store 候选区间；
 - `pool_tokens` 表示 `H`，不是实际完成边界 `A`；metadata 中不伪造 `A`；
 - P engine/bootstrap/DP 信息保存在计划的 `transfer_params`；`remote_bootstrap_addr` 只用于发现 P listener，不是 TE endpoint；
-- Store topology signature 体现在 `MooncakeKVCachePool` 生成的 cache namespace/key 中，不是 `KVTransferPlan` 字段；PD topology version 体现在后续 `KVTransferSchema`中；
+- Store key 直接使用 `database.process_tokens()` 返回的 `PoolKey`，不增加 topology signature；Store 布局兼容性由部署保证；
 - D 侧不生成 `transfer_states`；PD receive 由 worker 在 Store 终止并固化 `A` 后启动；
 - scheduler 构建 metadata 后清空 `_batch_transfers`；worker 以 `_on_transfer` 中是否已存在 request ID 避免重复建立状态，当前没有单独的 sequence 字段；
 - 同一 schedule step 可携带多个 plans，各 request 通过独立 `_TransferState` 推进。
@@ -510,19 +511,19 @@ MTSC 必须区分 PD data plane topology 和 Store object topology：
 
 ```text
 PD data plane
-  -> 支持 P/D 使用不同 TP/PP
+  -> 支持 P/D 使用整数倍 TP（PP=1）
   -> 根据 TP ratio 对 KV region 切片或聚合
   -> MLA 按 replicated KV 处理
 
 Store object namespace
-  -> MVP 只读取与 D 同构的 Store objects
+  -> 由部署保证所共享 Store objects 的物理布局兼容
   -> 不在 Store GET 中做 TP shard 的切片、聚合或重排
   -> MLA 使用单 KV-head namespace 和 replicated load
 ```
 
 两者不能共用一个简单的 `rank == rank` 判断。PD 的 P worker 是当前 request 动态选择的远端数据源；Store key 则是跨请求、跨 engine 共享的持久对象 namespace。
 
-Store topology 不兼容时按 Store miss 处理：
+Store key 不存在时按 Store miss 处理：
 
 ```text
 H = L
@@ -542,13 +543,9 @@ classDiagram
         +tp_size: int
         +pp_rank: int
         +pp_size: int
-        +schema: KVTransferSchema
         +regions: TransferRegion[]
         -_query_workers(address, engine_id, dp_rank)
-        -_aligned_regions(request)
-        -_validate_region_plan(...)
-        -_validate_coverage(...)
-        -_write_one(decode_id, source, request)
+        -_write_batch(sources, request)
     }
     class BootstrapServer {
         +workers: dict
@@ -560,10 +557,8 @@ classDiagram
         +engine_id: str
         +dp_rank: int
         +tp_rank: int
-        +tp_size: int
         +pp_rank: int
-        +pp_size: int
-        +address: str
+        +addr: str
     }
     class TransferTopology {
         <<vLLM>>
@@ -578,47 +573,30 @@ classDiagram
         +handshake_target_ranks(remote_tp_size)
     }
     class TransferRegion {
-        +layer_name: str
-        +layer_index: int
-        +group_index: int
-        +base_address: int
-        +block_length: int
-        +kv_block_length: int
-    }
-    class KVTransferSchema {
-        +topology_version: int
-        +model_id: str
-        +model_revision: str
-        +cache_dtype: str
-        +cache_layout: str
-        +block_size: int
-        +is_mla: bool
+        +base_addr: int
+        +block_len: int
+        +kv_block_len: int
     }
     class KVTransferRequest {
-        +hostname: str
-        +rpc_port: int
-        +tp_size: int
-        +tp_rank: int
-        +pp_size: int
-        +pp_rank: int
-        +schema: KVTransferSchema
-        +requests: dict
-        +region_base_addresses: list
-        +block_lengths: list
-        +kv_block_lengths: list
+        +remote_hostname: str
+        +remote_port: int
+        +remote_tp_size: int
+        +remote_tp_rank: int
+        +req_blocks: dict
+        +kv_caches_base_addr: list
+        +block_lens: list
     }
     class KVTransferResponse {
         +status: KVTransferStatus
-        +completed_transfer_ids: list
-        +failed_transfer_ids: list
-        +error_message: str
-        +covered_regions: dict
+        +ok_reqs: list
+        +err_reqs: list
+        +err_msg: str
     }
     class KVTransferStatus {
         <<enumeration>>
-        COMPLETE
-        IN_PROGRESS
-        FAILED
+        FINISH
+        CONTINUE
+        ERROR
     }
     class MooncakeKVCachePool {
         +tp_size: int
@@ -627,10 +605,9 @@ classDiagram
         +dcp_size: int
         +block_size: int
         +hash_block_size: int
-        -_lookup_prefixes: tuple
+        -_lookup_metadata: tuple
     }
 
-    MooncakeKVTransfer *-- KVTransferSchema
     MooncakeKVTransfer o-- TransferRegion
     MooncakeKVTransfer --> TransferTopology : CUDA path
     MooncakeKVTransfer --> _NPUTransferTopology : Ascend path
@@ -638,13 +615,15 @@ classDiagram
     BootstrapServer o-- WorkerRegistration
     MooncakeKVTransfer ..> KVTransferRequest : D sends
     MooncakeKVTransfer ..> KVTransferResponse : P replies
-    KVTransferRequest *-- KVTransferSchema
     KVTransferResponse --> KVTransferStatus
 ```
 
-代码中没有独立的 `TransferTopologyManager`、`PDTransferTopology`、`StoreTopologyPolicy` 或 `RegionPlan` 类。PD 拓扑入口就是 `MooncakeKVTransfer`：CUDA 路径复用 vLLM `TransferTopology`，Ascend 路径使用 MTSC `_NPUTransferTopology`；region 对齐、slice 长度校验和 coverage 校验分别由其私有方法完成。
+代码中没有独立的 `TransferTopologyManager`、`PDTransferTopology`、`StoreTopologyPolicy` 或 `RegionPlan` 类。PD 拓扑入口就是 `MooncakeKVTransfer`：CUDA 路径复用 vLLM `TransferTopology`，Ascend 路径使用 MTSC `_NPUTransferTopology`；region 按注册顺序配对，byte slice 由官方算法计算，接收完成按 P rank 计数汇总。
 
-Store 兼容性也没有单独的 policy 对象。`store_topology_namespace()` 是纯函数，根据 model/revision、TP/PP/PCP/DCP、block/hash size、KV layout/dtype、MLA 和 group schema 生成稳定 namespace；`store_tp_layout()` 是 MLA/普通 KV 的 Store rank 映射纯函数。`MooncakeKVCachePool` 在构造 database/key prefix 时调用它们。不能因为 PD 已支持异构 TP/PP，就让 Store 路径未经 namespace 隔离地读取不同 topology 的对象。
+Store key 生成采用所指定 vLLM Store 的原生方式。Pool 初始化时直接设置各并行维度的 rank/size、
+`use_mla`、`num_kv_head`、`put_step` 和 `head_or_tp_rank`，以 `self.metadata` 构造各 group 的数据库。
+`database.process_tokens()` 返回 `PoolKey`，lookup/GET/PUT 统一通过 `PoolKey.to_string()` 生成字符串。
+不再使用 `store_topology_namespace()`；共享 Store 的实例须由部署保证物理布局兼容。
 
 #### 3.4.3 Bootstrap Worker Directory
 
@@ -721,7 +700,7 @@ P % D == 0
 
 不互为整数倍时，MVP 不执行隐式 all-to-all 或临时重分片，直接判定 PD topology unsupported。
 
-本阶段的“异构并行”明确指 TP/PP。Proxy 已选定唯一 P DP engine；PCP/DCP 的 KV 语义和 block ownership 必须一致，MVP 不在 PD transfer 中转换不同的 PCP/DCP 配置。
+本阶段 Transfer 的“异构并行”指整数倍 TP，PP=1。Proxy 已选定唯一 P DP engine；PCP/DCP 的 KV 语义和 block ownership 必须一致，MVP 不在 PD transfer 中转换不同的 PCP/DCP 配置。
 
 当 `D >= P`：
 
@@ -861,59 +840,24 @@ transfer_length = full MLA page_size_bytes
 
 P/D 必须同时声明 `is_mla=true`，并且 MLA page size、cache dtype、layer/group schema 一致。任一不一致都不能退化为普通 TP slice。
 
-#### 3.4.7 Store Topology：MVP 只支持同构并行
+#### 3.4.7 Store Key 与布局兼容性
 
-Mooncake Store object 是已完成布局的数据对象，GET API 不负责把一个 TP shard 动态切片、聚合或重排成另一个 TP layout。因此 Store 阶段 MVP 要求 producer object topology 与当前 D 完全兼容：
+Store GET 不执行 TP shard 的切片、聚合或重排。共享对象的 model、dtype、block/hash size、
+物理 KV layout、layer/group 以及并行分片语义须由部署保证兼容。
 
-```text
-store_tp_size == d_tp_size
-store_pp_size == d_pp_size
-store_pcp_size == d_pcp_size
-store_dcp_size == d_dcp_size
-store_block_size == d_block_size
-store_hash_block_size == d_hash_block_size
-store_kv_layout == d_kv_layout
-store_kv_cache_dtype == d_kv_cache_dtype
-store_layer_group_schema == d_layer_group_schema
-```
-
-DP rank 不进入兼容判断，因为 Store 的目标就是让不同 DP replicas 共享同一份 KV objects。
-
-为避免不同 topology 产生相同表面 key，MTSC 为 Store namespace 计算稳定签名：
-
-```json
-{
-  "model_id": "<model-and-revision>",
-  "tp_size": 2,
-  "pp_size": 1,
-  "pcp_size": 1,
-  "dcp_size": 1,
-  "block_size": 16,
-  "hash_block_size": 16,
-  "kv_layout": "HND",
-  "kv_cache_dtype": "auto",
-  "is_mla": false,
-  "layer_group_schema_hash": "<hash>"
-}
-```
-
-其 canonical serialization 的 hash 作为 `store_topology_signature`，并进入 `cache_prefix` 或 object key namespace。lookup 和 GET 只能访问当前 D signature 下的 keys。
-
-如果发现签名不匹配：
+key 格式与指定 vLLM Store 一致：
 
 ```text
-do not issue Store GET
-H = L
-continue with PD load [L,T)
+model@tp_rank:N@pcpN@dcpN@pp_rank:N@group:N@block_hash
 ```
 
-不得尝试读取后再根据 byte length 猜测是否兼容。
-
-因此当 P/D 使用不同 TP/PP 时，它们保存到不同 Store namespaces：P 保存的 objects 只供与 P topology 兼容的实例复用，D 保存的 objects 只供与 D topology 兼容的实例复用。D 不会直接 GET P 的异构 Store shards；当前请求的跨 topology 补齐始终走 PD Transfer Engine。P/D topology 相同时，两侧才自然共享同一 Store namespace。
+`database.process_tokens()` 生成的 `PoolKey` 原样传递给 GET/PUT，仅在 Mooncake API 边界调用
+`to_string()`。lookup 使用对应 rank/group 的 `KeyMetadata` 与相同序列化方法。
+不再生成额外 topology signature 或 `cache_prefix`；DP rank 不进入 key，兼容副本可共享对象。
 
 #### 3.4.8 MLA 的 Store 特殊处理
 
-Store 仍不支持不同并行度，但在同构 topology 内复用 Mooncake Store Connector 的 MLA 去重方式。
+Store 不进行并行布局转换；MLA latent KV 在 TP 间复制，物理布局兼容时可跨 TP size 复用相同 key。
 
 在默认 `DCP=1` 时，MLA 设置：
 
@@ -939,7 +883,7 @@ owner 写入共享的 `tp_rank:0` namespace；其他 replicated ranks 跳过该 
 
 Store load 时，每个 D TP worker 从相同 `tp_rank:0` key 读取完整 MLA object，写入自己的 rank-local destination block。注册 region 使用 blocks-first 单 region，单 block 长度为 MLA `page_size_bytes`，不拆成 K/V 两个 regions。
 
-该优化只减少重复 Store objects，不放宽 MVP 的 topology compatibility：即使 MLA bytes 在 TP 上复制，不同 TP/PP 配置写出的 objects 在本阶段仍使用不同 `store_topology_signature`。
+MLA 不再添加额外 topology signature；物理布局兼容性仍须由部署保证。
 
 当 `DCP>1` 时，MVP 沿用 Mooncake Store Connector 的保守策略，不做上述 TP 去重：每个 `(tp_rank,dcp_rank)` 使用独立 namespace，`put_step=1`，lookup 必须检查全部必需 namespaces。这避免 DCP 切分后把语义不同的 objects 错当成 MLA replicas。
 
@@ -1005,8 +949,8 @@ vLLM 的 worker output aggregator 最终聚合所有 D workers 的 `finished_rec
 - MLA P TP=4、D TP=2 时每组只有一个 P rank 发送 full page；
 - MLA P TP=2、D TP=4 时 replicated P rank 可服务多个 D ranks；
 - MLA/non-MLA 或 page size 不一致时拒绝 transfer；
-- Store topology 完全相同时允许 lookup/GET；
-- Store topology 不同时跳过 Store，并由 PD 补齐 `[L,T)`；
+- lookup/PUT/GET 使用相同的原生 Store key；
+- Store miss 时由 PD 补齐 `[L,T)`；
 - MLA Store key 使用 `tp_rank:0`，lookup 不要求重复 TP namespaces；
 - MLA Store save 对同一 chunk 只有一个 TP owner PUT；
 - bootstrap 缺 rank、重复注册或 session 中变化时 fail closed；
@@ -1079,39 +1023,17 @@ remote_engine_id + remote_bootstrap_addr
   -> send KVTransferRequest to P listeners
 ```
 
-MTSC `KVTransferRequest` 包含：
-
-请求映射、`completed_transfer_ids`、`failed_transfer_ids` 和 `covered_regions` 均使用 `transfer_id`；Worker 的终态结果仍通过 `request_id` 关联 vLLM request。RPC schema 版本为 4（TCP 为 5），P/D 必须同步升级。
+`KVTransferRequest` 与官方 `MooncakeXferMetadata` 字段一致：
 
 ```json
 {
-  "hostname": "<d-te-host>",
-  "rpc_port": 0,
-  "tp_size": 2,
-  "tp_rank": 0,
-  "pp_size": 1,
-  "pp_rank": 0,
-  "schema": {
-    "topology_version": 4,
-    "model_id": "<model-id>",
-    "model_revision": "<revision>",
-    "cache_dtype": "<dtype>",
-    "cache_layout": "<layout>",
-    "block_size": 16,
-    "is_mla": false
-  },
-  "requests": {
-    "xfer-<request-id>": [
-      "<d-request-id>",
-      [[25, 26, 27, 28]]
-    ]
-  },
-  "region_base_addresses": [0],
-  "block_lengths": [0],
-  "kv_block_lengths": [0],
-  "layer_names": [],
-  "layer_indices": [],
-  "group_indices": []
+  "remote_hostname": "<d-te-host>",
+  "remote_port": 0,
+  "remote_tp_size": 2,
+  "remote_tp_rank": 0,
+  "req_blocks": {"<d-request-id>": ["xfer-<request-id>", [[25, 26, 27, 28]]]},
+  "kv_caches_base_addr": [0],
+  "block_lens": [0]
 }
 ```
 
@@ -1130,11 +1052,11 @@ P batch_transfer_sync_write(
 )
 ```
 
-P 通过原 ZMQ channel 返回 MTSC `KVTransferResponse`，其中包含本次实际写入的 D region indices。D 只有在所有必需 P TP/PP worker 都返回终态成功、且每个需要数据的 D region 的 TP fan-in coverage 恰好满足预期后，才把 PD coverage 标记为完成。P source 的释放计数同时包含 TP fan-out 和异构 PP fan-out，不能在部分 D PP worker 尚未到达时提前释放。
+P 通过原 ZMQ channel 返回 `KVTransferResponse(status, ok_reqs, err_reqs, err_msg)`，列表项为 D request IDs。D 为每个请求统计必要 P TP workers 的终态，全部成功后报告完成。P 等所有配对 D TP ranks 终止后才释放 source；PP 必须为 1。
 
 #### 3.6.3 零长度握手
 
-当 `A == T` 时，D 已从 local/Store 获得全部 KV，但仍向 P 发送 `requests` 中 block list 为空的请求并等待 ACK。
+当 `A == T` 时，D 已从 local/Store 获得全部 KV，但仍向 P 发送 `req_blocks` 中 block list 为空的请求并等待 ACK。
 
 该握手用于：
 
@@ -1292,8 +1214,8 @@ MTSCWorker.close()
 mtsc/connector.py   MTSCConnector：vLLM KV Connector hooks 与 load-error 出口
 mtsc/scheduler.py   MTSCScheduler：Store lookup、L/H/T 决策、block 绑定和 plan 生成
 mtsc/worker.py      MTSCWorker：_TransferState 两阶段状态机与 completion 聚合
-mtsc/kv_cache_pool.py  KVCachePool、MooncakeKVCachePool、lookup RPC、namespace 与 GET/PUT
-mtsc/kv_transfer.py    KVTransfer、MooncakeKVTransfer、bootstrap、并行映射与 coverage
+mtsc/kv_cache_pool.py  KVCachePool、MooncakeKVCachePool、lookup RPC、原生 key 与 GET/PUT
+mtsc/kv_transfer.py    KVTransfer、MooncakeKVTransfer、bootstrap、TP 映射与完成汇总
 mtsc/protocol.py    KVTransferPlan、KVTransferSchema/Request/Response
 mtsc/utils.py      CUDA/Ascend event、tensor layout 和 memory registration helpers
 tests/test_mtsc.py  Store fallback、topology、coverage、timeout、preemption 与平台测试
@@ -1321,7 +1243,7 @@ Proxy D request
            -> MooncakeKVTransfer.recv()
               -> _query_workers()
               -> _receive()
-              -> _validate_coverage()
+              -> aggregate required P TP completions
         -> collect invalid blocks and finished_recving
   -> MTSCConnector.get_block_ids_with_load_errors()
      -> MTSCWorker.get_block_ids_with_load_errors()

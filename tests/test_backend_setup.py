@@ -10,6 +10,7 @@ import torch
 
 from mtsc.kv_cache_pool import (
     MooncakeKVCachePool,
+    PoolKey,
     StoreConfig,
     StoreLookupClient,
     lookup_rpc_path,
@@ -53,6 +54,95 @@ def _caches():
 
 
 class BackendSetupTest(unittest.TestCase):
+    def test_pool_setup_maps_replicated_kv_to_shared_keys(self):
+        store = Mock()
+        store.setup.return_value = 0
+        binding = SimpleNamespace(
+            MooncakeDistributedStore=lambda: store, ReplicateConfig=Mock
+        )
+        rank = Mock()
+        world_size = Mock()
+        dcp_group = Mock()
+        cases = [
+            (True, 128, 1, tp_size, tp_rank, 1, tp_size, 0)
+            for tp_size in (1, 2, 4, 8)
+            for tp_rank in range(tp_size)
+        ]
+        cases += [(False, 2, 1, 8, tp_rank, 2, 4, tp_rank // 4) for tp_rank in range(8)]
+        cases += [(False, 8, 1, 4, tp_rank, 8, 1, tp_rank) for tp_rank in range(4)]
+        cases += [(value, 8, 1, 4, 1, 8, 1, 1) for value in (None, 1, "true")]
+        cases += [(True, 128, 2, 8, tp_rank, 1, 1, tp_rank) for tp_rank in range(8)]
+        cases += [(False, 2, 2, 8, tp_rank, 2, 1, tp_rank) for tp_rank in range(8)]
+        with (
+            patch.dict(sys.modules, {"mooncake.store": binding}),
+            patch("torch.accelerator.current_device_index", return_value=0),
+            patch.multiple(
+                "mtsc.kv_cache_pool",
+                get_tensor_model_parallel_rank=rank,
+                get_tensor_model_parallel_world_size=world_size,
+                get_pcp_group=Mock(
+                    return_value=SimpleNamespace(world_size=1, rank_in_group=0)
+                ),
+                get_dcp_group=dcp_group,
+                resolve_kv_cache_block_sizes=Mock(return_value=(16, 16)),
+                MooncakeStoreCoordinator=Mock(),
+                StoreLookupServer=Mock(),
+                get_requester_local_hostname=Mock(return_value="host"),
+                get_configured_preferred_segment=Mock(return_value=None),
+            ),
+            patch(
+                "mtsc.kv_cache_pool.StoreConfig.load",
+                return_value=StoreConfig("metadata", "master"),
+            ),
+        ):
+            for mla, heads, dcp, tp, local_rank, key_heads, step, key_rank in cases:
+                with self.subTest(mla=mla, dcp=dcp, tp=tp, rank=local_rank):
+                    rank.return_value = local_rank
+                    world_size.return_value = tp
+                    dcp_group.return_value = SimpleNamespace(
+                        world_size=dcp, rank_in_group=local_rank % dcp
+                    )
+                    config = _config()
+                    config.model_config.use_mla = mla
+                    config.model_config.get_total_num_kv_heads = lambda heads=heads: (
+                        heads
+                    )
+                    pool = MooncakeKVCachePool(config, _caches())
+                    try:
+                        self.assertEqual(pool.use_mla, mla is True)
+                        self.assertEqual(pool.num_kv_head, key_heads)
+                        self.assertEqual(pool.tp_rank, local_rank)
+                        self.assertEqual(pool.tp_size, tp)
+                        self.assertEqual(pool.pp_size, 2)
+                        self.assertEqual(pool.pp_rank, (5 // tp) % 2)
+                        self.assertEqual(pool.pcp_size, 1)
+                        self.assertEqual(pool.pcp_rank, 0)
+                        self.assertEqual(pool.dcp_size, dcp)
+                        self.assertEqual(pool.dcp_rank, local_rank % dcp)
+                        self.assertEqual(pool.block_size, 16)
+                        self.assertEqual(pool.put_step, step)
+                        self.assertEqual(pool.head_or_tp_rank, key_rank)
+                        self.assertEqual(pool.metadata.tp_rank, key_rank)
+                        self.assertEqual(pool.metadata.pp_rank, pool.pp_rank)
+                        self.assertEqual(pool.metadata.pcp_rank, pool.pcp_rank)
+                        self.assertEqual(pool.metadata.dcp_rank, pool.dcp_rank)
+                        self.assertEqual(pool.databases[0].metadata.tp_rank, key_rank)
+                        # GET/PUT and lookup must address the same logical rank.
+                        keys = {
+                            PoolKey(metadata, "61").to_string()
+                            for metadata in pool._lookup_metadata[0]
+                        }
+                        self.assertIn(
+                            pool.databases[0]._make_key_by_hash("61").to_string(),
+                            keys,
+                        )
+                        self.assertEqual(
+                            len(keys),
+                            (tp if dcp > 1 else min(tp, key_heads)) * pool.pp_size,
+                        )
+                    finally:
+                        pool.close()
+
     def test_invalid_store_timeout_fails_before_store_initialization(self):
         factory = Mock()
         binding = SimpleNamespace(
@@ -101,6 +191,7 @@ class BackendSetupTest(unittest.TestCase):
             ):
                 with self.subTest(value=value):
                     config = _config()
+                    config.parallel_config.pipeline_parallel_size = 1
                     config.kv_transfer_config.kv_connector_extra_config[
                         "mtsc_pd_timeout_seconds"
                     ] = value
@@ -182,6 +273,7 @@ class BackendSetupTest(unittest.TestCase):
         )
         with (
             patch.dict(sys.modules, {"mooncake.store": binding}),
+            patch("torch.accelerator.current_device_index", return_value=0),
             patch("mtsc.kv_cache_pool.get_tensor_model_parallel_rank", return_value=1),
             patch(
                 "mtsc.kv_cache_pool.get_tensor_model_parallel_world_size",
@@ -202,15 +294,6 @@ class BackendSetupTest(unittest.TestCase):
                 "mtsc.kv_cache_pool.MooncakeStoreCoordinator", return_value=coordinator
             ),
             patch(
-                "mtsc.kv_cache_pool.ChunkedTokenDatabase",
-                side_effect=lambda metadata, size, hash_size: SimpleNamespace(
-                    metadata=metadata, block_size=size
-                ),
-            ),
-            patch(
-                "mtsc.kv_cache_pool.store_topology_namespace", return_value="namespace"
-            ),
-            patch(
                 "mtsc.kv_cache_pool.StoreConfig.load",
                 return_value=StoreConfig("metadata", "master"),
             ),
@@ -222,7 +305,6 @@ class BackendSetupTest(unittest.TestCase):
                 "mtsc.kv_cache_pool.get_configured_preferred_segment",
                 return_value=None,
             ),
-            patch("mtsc.kv_cache_pool.npu_kv_nz_enabled", return_value=False),
             patch("torch.accelerator.current_device_index", return_value=0),
         ):
             pool = MooncakeKVCachePool(_config(), _caches())
@@ -237,15 +319,47 @@ class BackendSetupTest(unittest.TestCase):
                 self.assertEqual(override._load_pool._max_workers, 1)
             finally:
                 override.close()
-        with patch("mtsc.kv_cache_pool._make_external_cached_pool"):
+        with patch("mtsc.kv_cache_pool._make_external_cached_pool") as cached_pool:
             self.assertEqual(pool.lookup(32, [b"a", b"b"]), 32)
+            self.assertEqual(cached_pool.call_args.args[1], {(0, b"a"), (0, b"b")})
         keys = store.batch_is_exist.call_args.args[0]
         # Each hash must exist on all TP/PP/PCP/DCP participants.
         self.assertEqual(len(keys), 32)
-        self.assertIn("namespace@model@tp_rank:3@pcp1@dcp1@pp_rank:1@group:0@62", keys)
+        missing = "model@tp_rank:3@pcp1@dcp1@pp_rank:1@group:0@62"
+        self.assertIn(missing, keys)
+
+        # One missing participant must exclude the whole candidate block.
+        store.batch_is_exist.side_effect = lambda keys: [
+            int(key != missing) for key in keys
+        ]
+        with patch("mtsc.kv_cache_pool._make_external_cached_pool") as cached_pool:
+            pool.lookup(32, [b"a", b"b"])
+            self.assertEqual(cached_pool.call_args.args[1], {(0, b"a")})
+
+        # A serializer change must affect lookup and GET/PUT identically.
+        serialize = PoolKey.to_string
+        with (
+            patch.object(PoolKey, "to_string", lambda key: f"shared@{serialize(key)}"),
+            patch("mtsc.kv_cache_pool._make_external_cached_pool"),
+        ):
+            pool.lookup(32, [b"a", b"b"])
+            lookup_keys = set(store.batch_is_exist.call_args.args[0])
+            io_keys = {
+                key.to_string()
+                for _, _, key in pool._process_tokens(
+                    pool.databases[0], 32, [b"a", b"b"], 0
+                )
+            }
+            self.assertTrue(io_keys)
+            self.assertTrue(io_keys <= lookup_keys)
+            self.assertTrue(all(key.startswith("shared@") for key in lookup_keys))
+
         self.assertEqual(pool.databases[0].metadata.pp_rank, 1)
         self.assertEqual(pool.databases[0].metadata.pcp_rank, 1)
         self.assertEqual(pool.databases[0].metadata.dcp_rank, 1)
+        self.assertEqual((pool.pcp_size, pool.pcp_rank), (2, 1))
+        self.assertEqual((pool.dcp_size, pool.dcp_rank), (2, 1))
+        self.assertEqual((pool.pp_size, pool.pp_rank), (2, 1))
         self.assertEqual(pool.load_timeout, 180)
         self.assertEqual(pool._load_pool._max_workers, 2)
 
@@ -267,7 +381,6 @@ class BackendSetupTest(unittest.TestCase):
                 return_value=SimpleNamespace(rank_in_group=0),
             ),
             patch("mtsc.kv_transfer.is_npu_platform", return_value=True),
-            patch("mtsc.kv_transfer.npu_kv_nz_enabled", return_value=False),
             patch("mtsc.kv_transfer.current_platform"),
             patch(
                 "mtsc.kv_transfer._bootstrap_address", return_value=("127.0.0.1", 8998)
@@ -276,12 +389,15 @@ class BackendSetupTest(unittest.TestCase):
             patch("mtsc.kv_transfer.envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", 37.5),
             patch("torch.accelerator.current_device_index", return_value=0),
         ):
-            transfer = MooncakeKVTransfer(_config(), _caches())
+            config = _config()
+            config.parallel_config.pipeline_parallel_size = 1
+            transfer = MooncakeKVTransfer(config, _caches())
             self.addCleanup(transfer.close)
             self.assertEqual(transfer.timeout, 37.5)
             self.assertEqual(transfer._send_pool._max_workers, 10)
             self.assertEqual(transfer.num_sender_tasks, 20)
             config = _config()
+            config.parallel_config.pipeline_parallel_size = 1
             config.kv_transfer_config.kv_connector_extra_config.update(
                 mtsc_pd_timeout_seconds="12.5", num_workers=0
             )
@@ -302,7 +418,7 @@ class BackendSetupTest(unittest.TestCase):
         payload = client.post.call_args.kwargs["json"]
         self.assertEqual(url, "http://127.0.0.1:8998/register")
         self.assertEqual(payload["engine_id"], "producer")
-        self.assertTrue(payload["address"].endswith(":12345"))
+        self.assertTrue(payload["addr"].endswith(":12345"))
         transfer.close()
         self.assertFalse(transfer._loop_thread.is_alive())
         self.assertTrue(transfer._loop.is_closed())

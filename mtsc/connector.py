@@ -1,8 +1,8 @@
 """vLLM external connector entry point for the self-owned MTSC stack."""
 
 from __future__ import annotations
-import logging
 
+import logging
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -22,7 +22,7 @@ from vllm.v1.outputs import KVConnectorOutput
 
 from .protocol import MTSCConnectorMetadata
 from .scheduler import MTSCScheduler
-from .utils import is_npu_platform, npu_kv_nz_enabled
+from .utils import is_npu_platform
 from .worker import MTSCWorker
 
 if TYPE_CHECKING:
@@ -71,25 +71,12 @@ class MTSCConnector(KVConnectorBase_V1, SupportsHMA):
         }:
             raise ValueError("MTSC MVP requires kv_role=kv_producer or kv_consumer")
 
-        extra = vllm_config.kv_transfer_config.kv_connector_extra_config
-        if not _config_bool(extra.get("load_async"), True):
-            raise ValueError("MTSC requires kv_connector_extra_config.load_async=true")
-        if not _config_bool(extra.get("mtsc_store_topology_namespace"), True):
-            logger.warning(
-                "MTSC Store topology namespace is disabled; incompatible "
-                "deployments must use distinct cache_prefix values"
-            )
-
         self.scheduler: MTSCScheduler | None = None
         self.worker: MTSCWorker | None = None
 
         if role == KVConnectorRole.SCHEDULER:
+            extra = vllm_config.kv_transfer_config.kv_connector_extra_config
             decode_save = _config_bool(extra.get("mtsc_decode_save"), True)
-            if decode_save and npu_kv_nz_enabled(vllm_config):
-                decode_save = False
-                logger.warning(
-                    "MTSC disables Decode Store save for Ascend NZ cache layout"
-                )
             self.scheduler = MTSCScheduler(vllm_config, kv_cache_config, decode_save)
         else:
             self.worker = MTSCWorker(vllm_config, kv_cache_config)
