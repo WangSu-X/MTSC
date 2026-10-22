@@ -205,7 +205,7 @@ classDiagram
     JsonlMetricsWriter ..> RequestMetrics : writes record
 ```
 
-该图描述当前代码，而不是 S04 的目标态：connector 路径目前通过模块级 `vllm.logger` 直接打关键 INFO/WARNING/exception；Proxy 使用标准 `logging`，并已通过 `RequestMetrics + JsonlMetricsWriter` 输出每请求 JSONL。`MTSCConnectorStats` 已定义，但 `MTSCConnector.get_kv_connector_stats()` 当前仍返回 `None`，尚未接入运行路径。
+该图描述当前代码，而不是 S04 的目标态：connector 路径目前通过模块级 `vllm.logger` 直接打关键 INFO/WARNING/exception；Proxy 使用标准 `logging`，并已通过 `RequestMetrics + JsonlMetricsWriter` 输出每请求 JSONL。Connector 当前不采集传输统计，`get_kv_connector_stats()` 沿用 vLLM 基类实现并返回 `None`。
 
 `FlowMode`、`TraceContext`、`TraceEvent`、`RequestTraceState` 和 `FlowLogger` 尚未实现，因此不再作为当前核心类出现在类图中。后续实现 S04 时，这些对象仍可作为目标抽象：`TraceContext` 应是异步 task 可安全复制的不可变 correlation context，`RequestTraceState` 只保存时间点和 once guard，不参与 vLLM 调度状态机。
 

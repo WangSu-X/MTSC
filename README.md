@@ -37,8 +37,8 @@ mtsc/
 - `mtsc.scheduler.MTSCScheduler`：执行 Store lookup、KV block 分配和请求生命周期管理。
 - `mtsc.worker.MTSCWorker`：驱动两阶段加载状态机：Store `[L,A)`，然后 PD `[A,T)`。
 - `mtsc.protocol`：Scheduler/Worker 共用的 metadata，以及 P/D 请求与响应协议。
-- `mtsc.kv_cache_pool`：`KVCachePool` 接口及 `MooncakeKVCachePool` 实现，包含 lookup RPC、官方 Store key、内存注册、异步 load/save 和 pending save 合并。
-- `mtsc.kv_transfer`：`KVTransfer` 接口及 `MooncakeKVTransfer` 实现，包含 bootstrap、TP/DP 映射、MLA 支持、源会话管理和 TE WRITE。
+- `mtsc.kv_cache_pool`：`MooncakeKVCachePool` 具体实现，包含 lookup RPC、官方 Store key、内存注册、异步 load/save 和 pending save 合并。
+- `mtsc.kv_transfer`：`MooncakeKVTransfer` 具体实现，包含 bootstrap、TP/DP 映射、MLA 支持、源会话管理和 TE WRITE。
 - `mtsc.utils`：共享设备事件、内存区域和 KV 布局转换工具。
 - `proxy.pd_proxy`：同时向 Prefill 和 Decode 发起请求，并向两侧传递同一个 `transfer_id`。
 
@@ -118,3 +118,7 @@ python -m proxy.pd_proxy \
 
 `--prefill` 格式为 `API_URL,ENGINE_ID,BOOTSTRAP_ADDR[,DP_RANK]`，与 Prefill 的配置一致。
 启动后通过 `http://127.0.0.1:8000/v1` 访问。
+
+MTSC 支持 `kv_producer`、`kv_consumer` 和 `kv_both`。`kv_both` 按请求参数分别执行
+Prefill 发送和 Decode 的 Store→PD 两阶段加载，并同时创建发送、接收事件循环。
+直传使用原生 Mooncake 基础协议和注册顺序；非 MLA 异构 TP 要求 HND 布局。

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Includes components adapted from vLLM (Copyright contributors to the vLLM project)
 # and vllm-project/vllm-ascend. See LICENSE-vllm.
-"""Remote KV cache contract and Mooncake Store implementation."""
+"""Mooncake Store implementation for remote KV caching."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ import os
 import socket
 import threading
 import time
-from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -146,160 +145,6 @@ class SaveResult:
 class PoolPollResult:
     loads: list[LoadResult] = field(default_factory=list)
     saves: list[SaveResult] = field(default_factory=list)
-
-
-class KVCachePool(ABC):
-    """Remote KV cache wrapper with pluggable storage backends.
-
-    Backends may include Mooncake Store, MongoDB, FileSystem or memory.
-    The pool owns storage lookup and I/O; the connector owns request
-    scheduling, block allocation and P-D fallback. The pool tracks pending
-    work by request_id, with one result per load and aggregated save results.
-
-    load/save submit work without waiting for I/O. A queue or worker thread
-    is an implementation choice, not part of this contract. Results,
-    including immediate completions, are collected through poll().
-    Normally a request has one logical load in an allocation lifecycle,
-    rather than one load per decode step. It may have multiple incremental
-    saves as prefill/decode produces more tokens. At most one uncollected
-    load is allowed; duplicate loads raise ValueError. Repeated saves are
-    accepted, ordered per request and coalesced where safe. A retry requires
-    the previous load and block errors to be consumed or preempt() to fence
-    and clear them before resubmission.
-
-    Internal tracking is an implementation choice. A typical layout is
-    request_id -> one load future (aggregating any load subtasks), and
-    request_id -> save state containing running work, pending events and
-    accumulated errors. A list of save futures is also valid, but its
-    completion check must include pending events not yet submitted to I/O.
-    In the common contiguous-save case, one running save and one merged
-    pending event suffice; incompatible snapshots remain separate.
-    Events are immutable metadata snapshots; no KV tensor copy is required.
-    The caller keeps registered tensors and task blocks alive until terminal
-    completion or preempt() returns. Public calls are serialized by the
-    caller; implementations synchronize their own background workers.
-    Request IDs must not be reused while work, results or block errors remain
-    outstanding. Error block IDs must be consumed before their blocks are reused;
-    preempt() fences old work and clears results before resubmission.
-    """
-
-    @abstractmethod
-    def register(
-        self,
-        kv_caches: dict[
-            str, torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
-        ],
-    ) -> None:
-        """Register local KV memory before load/save.
-
-        Layout information comes from pool configuration. Registered tensors
-        remain alive until close(); re-registration with pending tasks is
-        unsupported.
-        """
-
-    @abstractmethod
-    def lookup(self, token_count: int, hashes: Sequence[BlockHash]) -> int:
-        """Return the remotely available contiguous prefix length in tokens.
-
-        Synchronous metadata query, without copying KV or allocating blocks.
-        Returns 0 on a miss, at most token_count, aligned to usable cache
-        chunks across all groups. Backend failures raise an exception.
-        The caller may schedule this query asynchronously if needed.
-        A hit is advisory: data can be evicted before load(), whose result
-        remains authoritative. Lookup does not require registered KV memory.
-        """
-
-    @abstractmethod
-    def load(self, load_event: LoadEvent) -> None:
-        """Submit KV loading into the event's destination blocks.
-
-        Non-blocking; misses and I/O failures are reported through poll().
-        If split into multiple I/O subtasks, collect and fence all of them
-        before reporting the request's LoadResult, even if one fails early.
-        The connector decides whether to recompute or use P-D fallback.
-        """
-
-    @abstractmethod
-    def save(self, save_event: SaveEvent) -> None:
-        """Submit KV saving; completion is reported through poll().
-
-        Non-blocking. Wait for ready_event before reading source KV memory.
-        Save only complete chunks; do not persist an unfinished token tail.
-        Keep an executing save's snapshot unchanged. Pending adjacent or
-        overlapping ranges may be merged using their union and the newest
-        block/hash snapshot, only if it covers the union and preserves each
-        token position's source mapping. Wait for readiness covering all merged
-        data; replacing older events is safe only if the newer signal fences
-        their writes too. Otherwise retain separate pending snapshots.
-        For example, while [0, 64) runs, pending [64, 96) and [96, 128)
-        can become [64, 128). Never merge across block reuse after preemption.
-        A new submission before a save result is collected extends the work
-        covered by that result; do not emit stale completion for earlier work.
-        """
-
-    @abstractmethod
-    def poll(self) -> PoolPollResult:
-        """Drain completed load/save operations without waiting for I/O.
-
-        Each result is returned once. LoadResult fences that load's writes;
-        SaveResult fences all accepted saves for that request and is returned
-        only when no running or pending save remains. Save completion must be
-        rechecked when polled, since new submissions can extend pending work.
-        Checking all existing futures is insufficient if a pending event
-        has not been submitted yet. Completion means all related work is
-        terminal, not necessarily successful; collect errors without returning
-        early while other I/O can still access local memory.
-        Operation bookkeeping is released when results and block errors are
-        consumed; the pool needs no request-end signal. If a block is shared
-        by load and save work, both must finish before the caller reuses it.
-        Publishing a LoadResult also publishes its invalid block IDs for
-        take_errors(); the caller drains those in the same polling cycle.
-        SaveResult while the request is still running only updates the
-        connector's save status; it must not directly become finished_sending.
-        A later save submission makes that request's save status pending again.
-        After request_finished(), the connector aggregates block-release
-        requirements: request ended, no outstanding saves, and any required
-        P-D send terminal. This applies to Store-only Decode saves too;
-        send requirements describe block-release dependencies, not only PD.
-        """
-
-    @abstractmethod
-    def take_errors(self) -> set[int]:
-        """Drain invalid local destination block IDs from polled loads.
-
-        Non-blocking; returns an empty set when no errors are pending. Include
-        blocks whose requested KV is unusable after a miss, partial load or
-        I/O failure, even when LoadResult.error is None. Exclude the existing
-        local prefix and all save failures: failed persistence does not
-        invalidate valid local KV. IDs are physical local block IDs, not
-        hashes or per-request block indices.
-
-        The connector may recover these blocks through P-D fallback before
-        reporting remaining failures via get_block_ids_with_load_errors().
-        The worker output carries them as invalid_block_ids for scheduler
-        recovery. This set carries no additional completion notification;
-        local memory access is fenced by the corresponding LoadResult.
-        """
-
-    @abstractmethod
-    def preempt(self, request_id: str) -> None:
-        """Cancel and fence all load/save work for a request before block reuse.
-
-        May block if backend I/O cannot safely be cancelled. On return the
-        request's work no longer reads or writes local KV memory, uncollected
-        results, pending block errors and request bookkeeping are cleared,
-        and resubmission is safe.
-        Calls with no tracked request are harmless. Already persisted valid
-        KV need not be rolled back.
-        """
-
-    @abstractmethod
-    def close(self) -> None:
-        """Stop accepting work, cancel queued tasks and fence running I/O.
-
-        Release registered memory/resources only after workers stop accessing
-        them. Idempotent; subsequent submissions raise RuntimeError.
-        """
 
 
 class _CompatBlobBlockHashes(Sequence[BlockHash]):
@@ -1083,7 +928,7 @@ class _LoadState:
     timed_out: bool = False
 
 
-class MooncakeKVCachePool(KVCachePool):
+class MooncakeKVCachePool:
     """Own Mooncake memory registration, lookup and fenced load/save tasks."""
 
     def __init__(self, config, kv_cache_config) -> None:

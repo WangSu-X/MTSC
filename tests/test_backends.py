@@ -18,7 +18,6 @@ import zmq.asyncio
 
 from mtsc.kv_cache_pool import (
     KeyMetadata,
-    KVCachePool,
     LoadEvent,
     MooncakeKVCachePool,
     PoolKey,
@@ -27,15 +26,14 @@ from mtsc.kv_cache_pool import (
     SaveResult,
 )
 from mtsc.kv_transfer import (
-    KVTransfer,
     MooncakeKVTransfer,
+    PullReqMeta,
     RecvEvent,
+    SendBlockMeta,
     SendEvent,
     TransferPollResult,
-    TransferRegion,
     _NPUTransferTopology,
     _require_tcp_write_ack,
-    _Session,
 )
 from mtsc.kv_transfer import (
     _compute_sender_transfer_plan as local_sender_plan,
@@ -155,11 +153,6 @@ class PoolBackendTest(unittest.TestCase):
     def setUp(self):
         self.pool = _pool()
         self.addCleanup(self.pool.close)
-
-    def test_implements_published_abc(self):
-        self.assertIsInstance(self.pool, KVCachePool)
-        self.assertTrue(issubclass(MooncakeKVTransfer, KVTransfer))
-        self.assertFalse(MooncakeKVTransfer.__abstractmethods__)
 
     def test_pending_ranges_merge_and_wait_for_all_ready_signals(self):
         first, second, third = _Ready(), _Ready(), _Ready()
@@ -384,12 +377,16 @@ class KVTopologyTest(unittest.TestCase):
 def _transfer():
     transfer = object.__new__(MooncakeKVTransfer)
     transfer._remote_layouts = OrderedDict()
-    transfer.layer_groups = {}
-    transfer.has_mamba = False
     transfer._closed = False
     transfer._receive_error = None
     transfer._registered = True
     transfer.is_producer = True
+    transfer.is_consumer = False
+    transfer.sender_loop = None
+    transfer.receiver_loop = None
+    transfer._sender_listener_t = None
+    transfer._receiver_t = None
+    transfer._sender_executor = None
     transfer.engine_id = "p"
     transfer.dp_rank = 2
     transfer.tp_size = transfer.pp_size = 1
@@ -399,27 +396,50 @@ def _transfer():
     transfer.tp_rank = transfer.pp_rank = 0
     transfer.timeout = 1
     transfer.protocol = "rdma"
-    transfer.kv_caches_base_addr = []
-    transfer.block_lens = []
-    transfer.regions = [TransferRegion(1000, 16, 16)]
-    transfer.topology = _NPUTransferTopology(0, 1, 16, False, 8)
-    transfer._source_lock = threading.Lock()
-    transfer._source_changed = threading.Condition(transfer._source_lock)
-    transfer._result_lock = threading.Lock()
-    transfer._receive_lock = threading.Lock()
-    transfer._sources = {}
-    transfer._prepared = {}
-    transfer._pending_sends = set()
-    transfer._recv_events = {}
-    transfer._send_failures = {}
-    transfer._invalid = {}
-    transfer._retired = set()
-    transfer._finished_send = set()
+    transfer.kv_caches_base_addr = [1000]
+    transfer.block_len_per_layer = [16]
+    transfer.kv_caches_base_addr = [1000]
+    transfer.block_len_per_layer = [16]
+    transfer.transfer_topo = _NPUTransferTopology(0, 1, 16, False, 8)
 
+    transfer.reqs_need_send = {}
+    transfer._recv_events = {}
+    transfer._invalid = {}
+    transfer._retired_recvs = set()
+    transfer.finished_sending_reqs = set()
+
+    transfer._remote_agents = {}
+    transfer._remote_tp_size = {}
+    transfer._pending_bootstrap_queries = {}
     transfer._failed_recv = set()
     transfer._receive_futures = {}
+    transfer.finished_recving_reqs = set()
     transfer._request_decoder = msgspec.msgpack.Decoder(KVTransferRequest)
     transfer._encoder = msgspec.msgpack.Encoder()
+
+    async def receive_events(events, futures=None):
+        transfer.is_producer, transfer.is_consumer = False, True
+        transfer.receiver_loop = asyncio.get_running_loop()
+        futures = futures or {
+            event.request_id: asyncio.get_running_loop().create_future()
+            for event in events
+        }
+        transfer._recv_events.update((event.request_id, event) for event in events)
+        transfer._receive_futures.update(futures)
+        metas = {
+            e.request_id: PullReqMeta(
+                e.request_id,
+                e.transfer_id,
+                [list(g) for g in e.block_ids],
+                e.remote_engine_id,
+                e.bootstrap_addr,
+            )
+            for e in events
+        }
+        await transfer._start_load_kv({events[0].remote_engine_id: metas})
+        await asyncio.gather(*futures.values())
+
+    transfer._test_receive_events = receive_events
     return transfer
 
 
@@ -463,31 +483,61 @@ class TCPCompletionRequirementTest(unittest.TestCase):
 
 
 class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
-    def test_duplicate_send_is_rejected_until_terminal_result_is_collected(self):
+    def test_producer_rejects_receive_without_receiver_loop(self):
         transfer = _transfer()
-        event = SendEvent("p-r", "x", ((1,),))
-        transfer.send(event)
-        source = transfer._sources["x"]
-        source.completed = source.expected = source.terminal = 1
-        with transfer._source_lock:
-            transfer._retire_locked(source)
-        with self.assertRaisesRegex(ValueError, "Uncollected send"):
-            transfer.send(event)
-        self.assertEqual(
-            [result.request_id for result in transfer.poll().sends], ["p-r"]
+        with self.assertRaisesRegex(ValueError, "Only D can receive"):
+            transfer.recv([RecvEvent("d-r", "x", ((4,),), "bootstrap", "p", 2)])
+        self.assertEqual(transfer._receive_futures, {})
+
+    async def test_close_waits_for_receiver_fence_before_stopping_loop(self):
+        transfer = _transfer()
+        transfer.is_producer, transfer.is_consumer = False, True
+        transfer.receiver_loop = asyncio.new_event_loop()
+        started = threading.Event()
+        transfer.receiver_loop.call_soon(started.set)
+        transfer._receiver_t = threading.Thread(
+            target=transfer.receiver_loop.run_forever
         )
-        transfer.send(replace(event, transfer_id="next"))
-        self.assertEqual(transfer._sources["next"].request_id, "p-r")
+        transfer._receiver_t.start()
+        self.assertTrue(await asyncio.to_thread(started.wait, 1))
+        transfer._ctx = zmq.asyncio.Context()
+        transfer._bootstrap = None
+        transfer._registered_storage = []
+        transfer.kv_caches = {}
+
+        async def register_pending():
+            pending = asyncio.get_running_loop().create_future()
+            transfer._receive_futures["d-r"] = pending
+            return pending
+
+        pending = asyncio.run_coroutine_threadsafe(
+            register_pending(), transfer.receiver_loop
+        ).result()
+        closing = asyncio.create_task(asyncio.to_thread(transfer.close))
+        try:
+            await asyncio.sleep(0.01)
+            self.assertFalse(closing.done())
+            self.assertTrue(transfer.receiver_loop.is_running())
+            transfer.receiver_loop.call_soon_threadsafe(pending.set_result, None)
+            await asyncio.wait_for(closing, 2)
+            self.assertTrue(transfer.receiver_loop.is_closed())
+            self.assertFalse(transfer._receiver_t.is_alive())
+            self.assertTrue(transfer._ctx.closed)
+            transfer.close()
+        finally:
+            if not pending.done():
+                transfer.receiver_loop.call_soon_threadsafe(pending.set_result, None)
+            await closing
 
     async def test_native_write_receives_whole_batch(self):
         transfer = _transfer()
-        transfer._loop = asyncio.get_running_loop()
+        transfer.sender_loop = asyncio.get_running_loop()
         calls = []
         transfer.engine = SimpleNamespace(
             batch_transfer_sync_write=lambda *args: calls.append(args) or 0
         )
         with ThreadPoolExecutor(max_workers=1) as pool:
-            transfer._send_pool = pool
+            transfer._sender_executor = pool
             self.assertEqual(
                 await transfer._write_buffers(
                     "peer", list(range(600)), [0] * 600, [1] * 600
@@ -499,28 +549,31 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_region_mismatch_is_rejected_before_write(self):
         transfer = _transfer()
-        transfer.regions = [TransferRegion(1000, 16, 16)]
+        transfer.kv_caches_base_addr = [1000]
+        transfer.block_len_per_layer = [16]
         request = msgspec.structs.replace(_request(transfer), block_lens=[32])
         socket = _Socket()
-        await transfer._serve(b"peer", msgspec.msgpack.encode(request), socket)
+        await transfer.send_kv_to_decode(
+            b"peer", msgspec.msgpack.encode(request), socket
+        )
         self.assertEqual(socket.messages[0].status, KVTransferStatus.ERROR)
         self.assertIn("length mismatch", socket.messages[0].err_msg)
-        self.assertEqual(transfer._sources, {})
+        self.assertEqual(transfer.reqs_need_send, {})
 
-    async def test_replicated_gqa_uses_head_counts_when_building_the_plan(self):
+    async def test_replicated_gqa_uses_native_sender_selection(self):
         transfer = _transfer()
         transfer.tp_size = 8
-        transfer.topology = _NPUTransferTopology(0, 8, 16, False, 2)
+        transfer.transfer_topo = _NPUTransferTopology(0, 8, 16, False, 2)
         request = msgspec.structs.replace(_request(transfer), block_lens=[32])
         src, dst, sizes = transfer._build_request_transfer_params(
-            "d-r", _Session("p-r", "x", block_ids=((1,),)), request
+            "d-r", SendBlockMeta("p-r", "x", local_block_ids=((1,),)), request
         )
         self.assertEqual((src, dst, sizes), ([1016], [2128], [16]))
         transfer.tp_rank = 4
         src, dst, sizes = transfer._build_request_transfer_params(
-            "d-r", _Session("p-r", "x", block_ids=((1,),)), request
+            "d-r", SendBlockMeta("p-r", "x", local_block_ids=((1,),)), request
         )
-        self.assertEqual((src, dst, sizes), ([1016], [2144], [16]))
+        self.assertEqual((src, dst, sizes), ([], [], []))
 
     async def test_blocks_first_write_copies_k_and_v_with_tp_slicing(self):
         class CopyEngine:
@@ -537,19 +590,20 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             transfer._registered = False
             transfer.is_producer = False
             transfer.tp_size, transfer.tp_rank = tp_size, tp_rank
-            transfer.topology = SimpleNamespace(
+            transfer.transfer_topo = SimpleNamespace(
                 virtually_split_kv_in_blocks=True,
                 total_num_kv_heads=2,
                 local_replicates_kv_cache=False,
                 is_mla=False,
                 get_transfer_cache_regions=lambda raw, spec: [raw],
+                split_k_and_v=False,
             )
             transfer.layer_specs = {"layer.0": SimpleNamespace()}
-            transfer.layer_groups = {"layer.0": 0}
-            transfer.regions = []
+            transfer.kv_caches_base_addr = []
+            transfer.block_len_per_layer = []
             transfer.engine = CopyEngine()
-            transfer._loop = asyncio.get_running_loop()
-            transfer._send_pool = None
+            transfer.sender_loop = asyncio.get_running_loop()
+            transfer._sender_executor = None
             transfer.register({"layer.0": cache})
             return transfer
 
@@ -567,23 +621,21 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                     remote_tp_size=tp_size,
                     remote_tp_rank=tp_rank,
                     kv_caches_base_addr=receiver.kv_caches_base_addr,
-                    block_lens=receiver.block_lens,
-                    kv_block_lens=[r.kv_block_len for r in receiver.regions],
-                    registered_layer_names=[r.layer_name for r in receiver.regions],
-                    registered_layer_indices=[r.layer_index for r in receiver.regions],
-                    registered_group_indices=[r.group_index for r in receiver.regions],
+                    block_lens=receiver.block_len_per_layer,
                 )
-                ok = (
-                    await sender._write_batch(
-                        {"d-r": SimpleNamespace(block_ids=[[2]])}, request
-                    )
-                )["d-r"]
+                src, dst, lengths, errors, _ = await sender._build_transfer_params(
+                    [("d-r", SendBlockMeta("p-r", "x", local_block_ids=((2,),)))],
+                    request,
+                    sender._prepare_transfer_regions(request),
+                )
+                self.assertEqual(errors, [])
+                ret = await sender._write_buffers("peer", src, dst, lengths)
                 expected = (
                     source[2]
                     if tp_size == 1
                     else source[2, :, :, tp_rank : tp_rank + 1, :]
                 )
-                self.assertTrue(ok)
+                self.assertEqual(ret, 0)
                 self.assertTrue(torch.equal(target[4], expected))
                 self.assertTrue(torch.all(target[:4] == -1))
                 self.assertTrue(torch.all(target[5] == -1))
@@ -602,21 +654,24 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             transfer.side_port = port
 
         transfer.engine = SimpleNamespace(batch_transfer_sync_write=write)
-        transfer.regions = [TransferRegion(1000, 16, 16)]
+        transfer.kv_caches_base_addr = [1000]
+        transfer.block_len_per_layer = [16]
         transfer.hostname = "127.0.0.1"
         transfer._register_worker = register
         transfer._ctx = zmq.asyncio.Context()
-        transfer._loop = asyncio.new_event_loop()
-        transfer._loop_thread = threading.Thread(target=transfer._loop.run_forever)
-        transfer._loop_thread.start()
-        transfer._serve_tasks = set()
-        transfer._send_pool = ThreadPoolExecutor(max_workers=1)
+        transfer.sender_loop = asyncio.new_event_loop()
+        transfer._sender_listener_t = threading.Thread(
+            target=transfer.sender_loop.run_forever
+        )
+        transfer._sender_listener_t.start()
+        transfer.sender_tasks = []
+        transfer._sender_executor = ThreadPoolExecutor(max_workers=1)
         transfer._bootstrap = None
         transfer._registered_storage = []
         transfer.kv_caches = {}
         ready = threading.Event()
-        transfer._listener_future = asyncio.run_coroutine_threadsafe(
-            transfer._listen(ready), transfer._loop
+        transfer._sender_listener_future = asyncio.run_coroutine_threadsafe(
+            transfer._sender_listener(ready), transfer.sender_loop
         )
         self.assertTrue(await asyncio.to_thread(ready.wait, 1))
         transfer.send(SendEvent("p-r", "x", ((1,),)))
@@ -635,8 +690,8 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(response.ok_reqs, ["d-r"])
             await asyncio.wait_for(closing, 2)
-            self.assertFalse(transfer._loop_thread.is_alive())
-            self.assertTrue(transfer._loop.is_closed())
+            self.assertFalse(transfer._sender_listener_t.is_alive())
+            self.assertTrue(transfer.sender_loop.is_closed())
             transfer.close()
             with self.assertRaises(RuntimeError):
                 transfer.send(SendEvent("p-r", "new", ((1,),)))
@@ -649,17 +704,18 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_fences_active_write_and_suppresses_completion(self):
         transfer = _transfer()
+        transfer.sender_loop = asyncio.get_running_loop()
         entered, release = asyncio.Event(), asyncio.Event()
 
         async def write(*args):
             entered.set()
             await release.wait()
-            return dict.fromkeys(args[0], True)
+            return 0
 
-        transfer._write_batch = write
-        transfer.send(SendEvent("p-r", "x", ((1,),)))
+        transfer._write_buffers = write
+        (await transfer._publish_send(SendEvent("p-r", "x", ((1,),))))
         request = asyncio.create_task(
-            transfer._serve(
+            transfer.send_kv_to_decode(
                 b"a",
                 msgspec.msgpack.encode(_request(transfer)),
                 _Socket(),
@@ -671,24 +727,26 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(fence.done())
         release.set()
         await asyncio.gather(request, fence)
-        self.assertEqual(transfer.poll().sends, [])
-        self.assertIn("x", transfer._retired)
+        self.assertEqual((await transfer.fetch_finished_sending_reqs()), [])
+        self.assertNotIn("x", transfer.reqs_need_send)
 
     async def test_recv_preemption_waits_for_remote_terminal(self):
         transfer = _transfer()
         transfer._recv_events["d-r"] = RecvEvent(
             "d-r", "x", ((4,),), "bootstrap", "p", 2
         )
-        future = Future()
+        transfer.is_producer, transfer.is_consumer = False, True
+        transfer.receiver_loop = asyncio.get_running_loop()
+        future = asyncio.get_running_loop().create_future()
         transfer._receive_futures["d-r"] = future
         fence = asyncio.create_task(asyncio.to_thread(transfer.preempt, "d-r"))
         await asyncio.sleep(0.01)
         self.assertFalse(fence.done())
         future.set_result(None)
         await asyncio.wait_for(fence, 1)
-        self.assertEqual(transfer.poll().recvs, [])
+        self.assertEqual((await asyncio.to_thread(transfer.poll)).recvs, [])
         self.assertEqual(transfer._recv_events, {})
-        self.assertIn("x", transfer._retired)
+        self.assertIn("x", transfer._retired_recvs)
 
     async def test_peer_failure_waits_for_other_published_destination(self):
         transfer = _transfer()
@@ -722,21 +780,22 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             def close(self, **kwargs):
                 pass
 
-        async def query(*args):
-            return {0: {0: "fail"}, 1: {0: "wait"}}
-
         transfer._ctx = SimpleNamespace(socket=lambda kind: Client())
-        transfer._query_workers = query
-        transfer.regions = []
+        transfer._remote_agents["p"] = {0: {0: "fail"}, 1: {0: "wait"}}
+        transfer._remote_tp_size["p"] = 2
+        transfer.kv_caches_base_addr = []
+        transfer.block_len_per_layer = []
         transfer.hostname, transfer.rpc_port = "host", 123
         transfer._response_decoder = msgspec.msgpack.Decoder(KVTransferResponse)
         transfer.reformat_npu_blocks = lambda *args: None
         receive = asyncio.create_task(
-            transfer._receive("d-r", "x", [[]], "p", "bootstrap", 2)
+            transfer._test_receive_events(
+                [RecvEvent("d-r", "x", ((),), "bootstrap", "p", 2)]
+            )
         )
         await asyncio.wait_for(waiting.wait(), 1)
         self.assertFalse(receive.done())
-        self.assertEqual(transfer._failed_recv, set())
+        self.assertFalse(transfer._receive_futures["d-r"].done())
         release.set()
         await receive
         self.assertEqual(transfer._failed_recv, {"d-r"})
@@ -773,9 +832,12 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             for p_rank in range(p_size // d_size):  # Peers for D rank 0; PP=1.
                 transfer = _transfer()
                 transfer.tp_size, transfer.tp_rank = p_size, p_rank
-                transfer.topology = _NPUTransferTopology(p_rank, p_size, 16, mla, 8)
+                transfer.transfer_topo = _NPUTransferTopology(
+                    p_rank, p_size, 16, mla, 8
+                )
                 p_page = 64 if mla else 64 // p_size
-                transfer.regions = []
+                transfer.kv_caches_base_addr = []
+                transfer.block_len_per_layer = []
                 for layer in range(2):
                     base = 1000 + p_rank * 2000 + layer * 500
                     shard_start = 0 if mla else p_rank * p_page
@@ -784,10 +846,11 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                         for block in range(3)
                         for offset in range(p_page)
                     )
-                    transfer.regions.append(TransferRegion(base, p_page, p_page))
+                    transfer.kv_caches_base_addr.append(base)
+                    transfer.block_len_per_layer.append(p_page)
                 transfer.engine = SimpleNamespace(batch_transfer_sync_write=write)
-                transfer._loop = asyncio.get_running_loop()
-                transfer.send(SendEvent("p-r", "x", ((0, 1, 2),)))
+                transfer.sender_loop = asyncio.get_running_loop()
+                (await transfer._publish_send(SendEvent("p-r", "x", ((0, 1, 2),))))
                 request = msgspec.structs.replace(
                     _request(transfer),
                     remote_tp_size=d_size,
@@ -797,10 +860,14 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                 )
                 socket = _Socket()
                 with ThreadPoolExecutor(max_workers=1) as executor:
-                    transfer._send_pool = executor
-                    await transfer._serve(b"a", msgspec.msgpack.encode(request), socket)
+                    transfer._sender_executor = executor
+                    await transfer.send_kv_to_decode(
+                        b"a", msgspec.msgpack.encode(request), socket
+                    )
                 self.assertEqual(socket.messages[0].ok_reqs, ["d-r"])
-                self.assertIsNone(transfer.poll().sends[0].error)
+                self.assertIsNone(
+                    (await transfer.fetch_finished_sending_reqs())[0].error
+                )
             for layer in range(2):
                 data = memory[20000 + layer * 1000]
                 for dest, source in ((4, 1), (5, 2)):
@@ -809,7 +876,7 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
                         bytearray(range(source * 64, source * 64 + d_page)),
                     )
 
-    async def test_early_recv_and_duplicate_pull_write_once(self):
+    async def test_early_recv_waits_until_source_is_ready(self):
         transfer = _transfer()
         entered, release = asyncio.Event(), asyncio.Event()
         calls = []
@@ -818,80 +885,78 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
             calls.append(args)
             entered.set()
             await release.wait()
-            return dict.fromkeys(args[0], True)
+            return 0
 
-        transfer._write_batch = write
+        transfer._write_buffers = write
         socket = _Socket()
         payload = msgspec.msgpack.encode(_request(transfer))
-        first = asyncio.create_task(transfer._serve(b"a", payload, socket))
+        task = asyncio.create_task(transfer.send_kv_to_decode(b"a", payload, socket))
         await asyncio.sleep(0)
-        transfer.prepare("p-r", "x")
-        transfer.send(SendEvent("p-r", "x", ((1,),)))
+        self.assertEqual(calls, [])
+        (await transfer._prepare_send("p-r", "x"))
+        (await transfer._publish_send(SendEvent("p-r", "x", ((1,),))))
         await asyncio.wait_for(entered.wait(), 1)
-        duplicate = asyncio.create_task(transfer._serve(b"b", payload, socket))
-        await asyncio.sleep(0)
-        self.assertEqual(transfer.poll().sends, [])
+        self.assertEqual((await transfer.fetch_finished_sending_reqs()), [])
         release.set()
-        await asyncio.gather(first, duplicate)
+        await task
         self.assertEqual(len(calls), 1)
-        self.assertEqual(len(transfer.poll().sends), 1)
-        self.assertEqual(transfer.poll().sends, [])
-        late = _Socket()
-        await transfer._serve(b"c", payload, late)
-        self.assertEqual(late.messages[0].err_reqs, ["d-r"])
+        self.assertEqual(socket.messages[0].ok_reqs, ["d-r"])
+        self.assertEqual(len(await transfer.fetch_finished_sending_reqs()), 1)
+        self.assertEqual((await transfer.fetch_finished_sending_reqs()), [])
 
     async def test_cancel_unpublished_session_wakes_early_receiver(self):
         transfer = _transfer()
         socket = _Socket()
         task = asyncio.create_task(
-            transfer._serve(b"a", msgspec.msgpack.encode(_request(transfer)), socket)
+            transfer.send_kv_to_decode(
+                b"a", msgspec.msgpack.encode(_request(transfer)), socket
+            )
         )
         await asyncio.sleep(0)
-        transfer.cancel("p-r", "x")
+        (await transfer._cancel_send("p-r", "x"))
         await asyncio.wait_for(task, 1)
         self.assertEqual(socket.messages[0].err_reqs, ["d-r"])
-        self.assertEqual(transfer.poll().sends, [])
-        with self.assertRaises(ValueError):
-            transfer.prepare("p-r", "x")
+        self.assertEqual((await transfer.fetch_finished_sending_reqs()), [])
+        self.assertNotIn("x", transfer.reqs_need_send)
 
     async def test_preempt_unready_source_keeps_receiver_for_resume(self):
         transfer = _transfer()
-        transfer.prepare("p-r", "x")
-        transfer.preempt("p-r")
-        transfer.send(SendEvent("p-r", "x", ((1,),)))
-        self.assertNotIn("x", transfer._retired)
+        (await transfer._prepare_send("p-r", "x"))
+        (await transfer._preempt_send("p-r"))
+        (await transfer._publish_send(SendEvent("p-r", "x", ((1,),))))
+        self.assertTrue(transfer.reqs_need_send["x"].ready.is_set())
 
     async def test_unpaired_tp_rejected_before_source_access(self):
         transfer = _transfer()
         socket = _Socket()
         request = msgspec.structs.replace(_request(transfer), remote_tp_rank=1)
-        await transfer._serve(b"a", msgspec.msgpack.encode(request), socket)
+        await transfer.send_kv_to_decode(b"a", msgspec.msgpack.encode(request), socket)
         self.assertEqual(
             socket.messages[0].err_msg, "D TP rank is not paired with this P rank"
         )
-        self.assertEqual(transfer._sources, {})
+        self.assertEqual(transfer.reqs_need_send, {})
 
-    async def test_source_timeout_retires_attempt_and_reports_error(self):
+    async def test_source_timeout_removes_metadata_and_reports_error(self):
         transfer = _transfer()
-        transfer.send(SendEvent("p-r", "x", ((1,),)))
-        source = transfer._sources["x"]
-        source.expires_at = 0
-        source.active_writes = 1
-        self.assertEqual(transfer.poll().sends, [])
-        source.active_writes = 0
-        self.assertIsNotNone(transfer.poll().sends[0].error)
-        self.assertIn("x", transfer._retired)
+        (await transfer._publish_send(SendEvent("p-r", "x", ((1,),))))
+        source = transfer.reqs_need_send["x"]
+        source.expire_time = 0
+        source.sending = 1
+        self.assertEqual((await transfer.fetch_finished_sending_reqs()), [])
+        source.sending = 0
+        self.assertIsNotNone((await transfer.fetch_finished_sending_reqs())[0].error)
+        self.assertNotIn("x", transfer.reqs_need_send)
 
     async def test_empty_recv_still_confirms_send(self):
         transfer = _transfer()
-        transfer.send(SendEvent("p-r", "x", ((1,),)))
+        (await transfer._publish_send(SendEvent("p-r", "x", ((1,),))))
         request = msgspec.structs.replace(
             _request(transfer), req_blocks={"d-r": ("x", [[]])}
         )
         socket = _Socket()
-        await transfer._serve(b"a", msgspec.msgpack.encode(request), socket)
+        await transfer.send_kv_to_decode(b"a", msgspec.msgpack.encode(request), socket)
         self.assertEqual(socket.messages[0].ok_reqs, ["d-r"])
-        self.assertIsNone(transfer.poll().sends[0].error)
+        self.assertIsNone((await transfer.fetch_finished_sending_reqs())[0].error)
 
     async def test_recv_result_waits_for_future_terminal_and_invalidates_only_targets(
         self,
@@ -899,13 +964,14 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
         transfer = _transfer()
         event = RecvEvent("d-r", "x", ((4, 5),), "bootstrap", "p", 2)
         transfer._recv_events["d-r"] = event
-        future = Future()
+        transfer.is_producer, transfer.is_consumer = False, True
+        transfer.receiver_loop = asyncio.get_running_loop()
+        future = asyncio.get_running_loop().create_future()
         transfer._receive_futures["d-r"] = future
-        transfer._failed_recv.add("d-r")
-        self.assertEqual(transfer.poll().recvs, [])
-        future.set_result(None)
-        self.assertIsNotNone(transfer.poll().recvs[0].error)
-        self.assertEqual(transfer.take_errors(), {4, 5})
+        self.assertEqual((await asyncio.to_thread(transfer.poll)).recvs, [])
+        transfer._finish_receive(event, True, future)
+        self.assertIsNotNone((await asyncio.to_thread(transfer.poll)).recvs[0].error)
+        self.assertEqual((await asyncio.to_thread(transfer.take_errors)), {4, 5})
 
 
 class WorkerReleaseTest(unittest.TestCase):
@@ -917,7 +983,7 @@ class WorkerReleaseTest(unittest.TestCase):
         worker.transfer = SimpleNamespace(
             poll=lambda: TransferPollResult(),
             take_errors=lambda: set(),
-            recv_batch=lambda events: None,
+            recv=lambda event: None,
         )
         worker._on_save_requests = {}
         worker._finished_waits = {}

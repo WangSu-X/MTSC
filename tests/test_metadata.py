@@ -3,10 +3,11 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 import msgspec
-from vllm.v1.request import RequestStatus
+from vllm.sampling_params import SamplingParams
+from vllm.v1.request import Request, RequestStatus
 
 from mtsc.kv_cache_pool import LoadResult, PoolPollResult, SaveResult
 from mtsc.kv_transfer import TransferPollResult, TransferResult
@@ -23,10 +24,10 @@ from mtsc.scheduler import MTSCScheduler
 from mtsc.worker import MTSCWorker
 
 
-def _scheduler(*, consumer=True, hit=80, extra=None):
+def _scheduler(*, consumer=True, hit=80, extra=None, role=None):
     config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
-            kv_role="kv_consumer" if consumer else "kv_producer",
+            kv_role=role or ("kv_consumer" if consumer else "kv_producer"),
             kv_connector_extra_config=extra if extra is not None else {},
         )
     )
@@ -76,6 +77,7 @@ def _output(**kwargs):
             req_ids=[], new_block_ids=[], num_computed_tokens=[]
         ),
         "num_scheduled_tokens": {},
+        "scheduled_spec_decode_tokens": {},
         "finished_req_ids": set(),
         "preempted_req_ids": set(),
     }
@@ -97,20 +99,46 @@ def _worker(config):
 
 
 class MetadataFlowTest(unittest.TestCase):
-    def test_worker_submits_ready_transfers_in_one_batch(self):
+    def test_kv_both_routes_prefill_and_decode_requests_independently(self):
+        scheduler, config = _scheduler(role="kv_both")
+        self.assertTrue(scheduler.is_producer and scheduler.is_consumer)
+        decode = _request()
+        decode.request_id = "decode-request"
+        prefill = _request(
+            params={"do_remote_decode": True, "transfer_id": "prefill-transfer"}
+        )
+        prefill.request_id = "prefill-request"
+        for request in (decode, prefill):
+            external, _ = scheduler.get_num_new_matched_tokens(request, 32)
+            scheduler.update_state_after_alloc(request, _blocks(), external)
+        metadata = scheduler.build_connector_meta(_output())
+        self.assertEqual(
+            [p.request_id for p in metadata.transfer_plans], [decode.request_id]
+        )
+        self.assertEqual(
+            [s.request_id for s in metadata.transfer_states], [prefill.request_id]
+        )
+        self.assertTrue(scheduler._tracked_requests[decode.request_id].is_decode)
+        self.assertFalse(scheduler._tracked_requests[prefill.request_id].is_decode)
+        delayed, _ = scheduler.request_finished(prefill, _blocks().get_block_ids())
+        self.assertTrue(delayed)
+        finished = scheduler.build_connector_meta(_output())
+        self.assertTrue(finished.transfer_states[0].ready)
+
+    def test_worker_submits_ready_transfers_as_one_batch(self):
         _, config, metadata = self._decode_metadata()
         first = metadata.transfer_plans[0]
         second = replace(first, request_id="request-2", transfer_id="transfer-2")
         metadata.transfer_plans = [first, second]
         worker = _worker(config)
         worker.get_finished(set(), metadata)
-        worker.transfer.recv_batch.assert_called_once_with([])
+        worker.transfer.recv.assert_not_called()
         worker.pool.poll.return_value = PoolPollResult(
             loads=[LoadResult(first.request_id, 48), LoadResult(second.request_id, 64)]
         )
         worker.get_finished(set(), MTSCConnectorMetadata())
-        self.assertEqual(worker.transfer.recv_batch.call_count, 2)
-        events = worker.transfer.recv_batch.call_args.args[0]
+        worker.transfer.recv.assert_called_once()
+        events = worker.transfer.recv.call_args.args[0]
         self.assertEqual(
             [event.request_id for event in events],
             [first.request_id, second.request_id],
@@ -200,7 +228,7 @@ class MetadataFlowTest(unittest.TestCase):
         load = worker.pool.load.call_args.args[0]
         self.assertEqual((load.start_load, load.end_load), (32, 80))
         self.assertIs(worker._on_load_requests[load.request_id], metadata.pool_loads[0])
-        worker.transfer.recv_batch.assert_called_once_with([])
+        worker.transfer.recv.assert_not_called()
 
         worker.pool.poll.return_value = PoolPollResult(
             loads=[LoadResult(load.request_id, 48, "partial miss")]
@@ -210,7 +238,7 @@ class MetadataFlowTest(unittest.TestCase):
             worker.get_finished(set(), MTSCConnectorMetadata()), (None, None)
         )
         self.assertEqual(worker._on_load_requests, {})
-        recv = worker.transfer.recv_batch.call_args.args[0][0]
+        (recv,) = worker.transfer.recv.call_args.args[0]
         self.assertEqual(recv.block_ids, ((13, 14, 15, 16),))
         self.assertEqual(recv.transfer_id, "transfer-1")
         self.assertEqual(worker.get_block_ids_with_load_errors(), set())
@@ -243,9 +271,7 @@ class MetadataFlowTest(unittest.TestCase):
             worker.get_finished(set(), MTSCConnectorMetadata()),
             (None, {request.request_id}),
         )
-        self.assertEqual(
-            worker.transfer.recv_batch.call_args_list, [call([]), call([])]
-        )
+        worker.transfer.recv.assert_not_called()
         self.assertEqual(worker._on_load_requests, {})
 
     def test_full_local_hit_still_notifies_transfer_source(self):
@@ -259,7 +285,7 @@ class MetadataFlowTest(unittest.TestCase):
         self.assertEqual(metadata.pool_loads, [])
         worker = _worker(config)
         worker.get_finished(set(), metadata)
-        recv = worker.transfer.recv_batch.call_args.args[0][0]
+        (recv,) = worker.transfer.recv.call_args.args[0]
         self.assertEqual(recv.block_ids, ((),))
         worker.transfer.poll.return_value = TransferPollResult(
             recvs=[TransferResult(request.request_id)]
@@ -283,7 +309,7 @@ class MetadataFlowTest(unittest.TestCase):
         worker.pool.take_errors.return_value = {13, 14}
         self.assertEqual(worker.get_finished(set(), metadata), (None, {"request-1"}))
         self.assertEqual(worker.get_block_ids_with_load_errors(), {13, 14})
-        worker.transfer.recv_batch.assert_called_once_with([])
+        worker.transfer.recv.assert_not_called()
 
     def test_lookup_retry_drops_stale_load_decision(self):
         scheduler, _ = _scheduler(consumer=False)
@@ -365,6 +391,114 @@ class MetadataFlowTest(unittest.TestCase):
         )
         next_save = scheduler.build_connector_meta(next_output).pool_saves[0]
         self.assertEqual((next_save.start_token, next_save.end_token), (80, 112))
+
+    def test_mtp_save_defers_drafts_and_later_saves_confirmed_prefix(self):
+        def block_hasher(request):
+            return [
+                bytes(request.all_token_ids[start : start + 16])
+                for start in range(
+                    len(request.block_hashes) * 16, request.num_tokens - 15, 16
+                )
+            ]
+
+        for accepted in range(5):
+            with self.subTest(accepted=accepted):
+                scheduler, config = _scheduler(hit=0)
+                request = Request(
+                    "mtp-request",
+                    list(range(64)),
+                    SamplingParams(max_tokens=256),
+                    pooling_params=None,
+                    block_hasher=block_hasher,
+                )
+                request.append_output_token_ids(list(range(64, 127)))
+                blocks = SimpleNamespace(get_block_ids=lambda: (list(range(9)),))
+                scheduler.update_state_after_alloc(request, blocks, 0)
+                warmup = scheduler.build_connector_meta(
+                    _output(
+                        scheduled_new_reqs=[
+                            SimpleNamespace(
+                                req_id=request.request_id,
+                                block_ids=blocks.get_block_ids(),
+                                num_computed_tokens=0,
+                            )
+                        ],
+                        num_scheduled_tokens={request.request_id: 126},
+                    )
+                )
+                self.assertEqual(warmup.pool_saves[0].end_token, 112)
+
+                request.num_computed_tokens = 126
+                drafts = [127, 128, 129, 130]
+                request.spec_token_ids = drafts
+                output = _output(
+                    scheduled_cached_reqs=SimpleNamespace(
+                        req_ids=[request.request_id],
+                        new_block_ids=[None],
+                        num_computed_tokens=[126],
+                    ),
+                    num_scheduled_tokens={request.request_id: 5},
+                    scheduled_spec_decode_tokens={request.request_id: drafts},
+                )
+                metadata = scheduler.build_connector_meta(output)
+                self.assertEqual(metadata.pool_saves, [])
+                self.assertEqual(
+                    scheduler._tracked_requests[request.request_id].saved_tokens, 112
+                )
+                worker = _worker(config)
+                worker.get_finished(set(), metadata)
+                worker.pool.save.assert_not_called()
+
+                # Match update_from_output: rejected drafts do not enter the
+                # real sequence; accepted drafts plus the sampled token do.
+                request.append_output_token_ids(drafts[:accepted] + [200])
+                request.num_computed_tokens = 127 + accepted
+                request.spec_token_ids = [210, 211, 212, 213]
+                output.scheduled_cached_reqs.num_computed_tokens = [
+                    request.num_computed_tokens
+                ]
+                output.scheduled_spec_decode_tokens = {
+                    request.request_id: request.spec_token_ids
+                }
+                metadata = scheduler.build_connector_meta(output)
+                save = metadata.pool_saves[0]
+                self.assertEqual((save.start_token, save.end_token), (112, 128))
+                self.assertEqual(save.block_hashes, request.block_hashes)
+                self.assertEqual(len(save.block_hashes), 8)
+                with patch("mtsc.worker.new_device_event", return_value=Mock()):
+                    worker.get_finished(set(), metadata)
+                event = worker.pool.save.call_args.args[0]
+                self.assertEqual((event.start_save, event.end_save), (112, 128))
+
+    def test_async_spec_save_excludes_optimistic_computed_tokens(self):
+        scheduler, _ = _scheduler(hit=0)
+        request = Request(
+            "async-mtp",
+            list(range(64)),
+            SamplingParams(max_tokens=256),
+            pooling_params=None,
+        )
+        request.append_output_token_ids(list(range(64, 79)))
+        request.num_computed_tokens = 83
+        request.num_output_placeholders = 5
+        request.spec_token_ids = [-1] * 4
+        scheduler.update_state_after_alloc(request, _blocks(), 0)
+        metadata = scheduler.build_connector_meta(
+            _output(
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=[request.request_id],
+                    new_block_ids=[None],
+                    num_computed_tokens=[83],
+                ),
+                num_scheduled_tokens={request.request_id: 5},
+                scheduled_spec_decode_tokens={request.request_id: [-1] * 4},
+            )
+        )
+        self.assertEqual(metadata.pool_saves, [])
+        self.assertEqual(
+            scheduler._tracked_requests[request.request_id].saved_tokens, 0
+        )
+        self.assertNotIn(request.request_id, scheduler._saving_requests)
 
     def test_preemption_discards_queued_operations_and_all_request_state(self):
         scheduler, _ = _scheduler()

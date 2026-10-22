@@ -34,12 +34,12 @@ from mtsc.kv_cache_pool import (
 )
 from mtsc.kv_transfer import (
     MooncakeKVTransfer,
+    SendBlockMeta,
     SendEvent,
     TransferPollResult,
     TransferRegion,
     TransferResult,
     _NPUTransferTopology,
-    _Session,
     _validate_asymmetric_region_lengths,
 )
 from mtsc.kv_transfer import (
@@ -122,7 +122,7 @@ class TwoStageBoundaryTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.requests = []
 
-            def recv_batch(self, events) -> None:
+            def recv(self, events) -> None:
                 self.requests.extend(events)
 
         worker = object.__new__(MTSCWorker)
@@ -186,12 +186,8 @@ class FailureFallbackTest(unittest.TestCase):
             self.reformatted: list[tuple[list[list[int]], int]] = []
             self.tp_size = 1
 
-        def recv(self, event) -> None:
-            self.receives.append(event)
-
-        def recv_batch(self, events) -> None:
-            for event in events:
-                self.recv(event)
+        def recv(self, events) -> None:
+            self.receives.extend(events)
 
         def poll(self) -> TransferPollResult:
             return TransferPollResult(
@@ -241,7 +237,7 @@ class FailureFallbackTest(unittest.TestCase):
         worker._on_transfer["d-1"] = state
         receives = []
         worker._start_transfer(state, 80, receives)
-        pd.recv_batch(receives)
+        pd.recv(receives)
         self.assertEqual(len(pd.receives), 1)
         self.assertEqual(pd.receives[0].block_ids, ((15, 16),))
         self.assertEqual(state.stage, "TRANSFER_LOADING")
@@ -452,11 +448,10 @@ class NPUDataPathTest(unittest.TestCase):
         pd._closed = pd._registered = False
         pd._receive_error = None
         pd.layer_specs = {"model.layers.0.self_attn": spec}
-        pd.layer_groups = {"model.layers.0.self_attn": 0}
         pd.engine = Engine()
         pd.regions = []
-        pd.kv_caches_base_addr, pd.block_lens = [], []
-        pd.topology = _NPUTransferTopology(0, 1, 16, True, 1)
+        pd.kv_caches_base_addr, pd.block_len_per_layer = [], []
+        pd.transfer_topo = _NPUTransferTopology(0, 1, 16, True, 1)
         pd._registered_storage = []
         pd.is_producer = False
         pd.kv_caches = {}
@@ -464,9 +459,9 @@ class NPUDataPathTest(unittest.TestCase):
         with patch("mtsc.kv_transfer.is_npu_platform", return_value=True):
             pd.register({"model.layers.0.self_attn": (k_cache, v_cache)})
 
-        self.assertEqual(len(pd.regions), 2)
+        self.assertEqual(len(pd.kv_caches_base_addr), 2)
         self.assertEqual(
-            [region.kv_block_len for region in pd.regions],
+            pd.block_len_per_layer,
             [
                 k_cache.stride(0) * k_cache.element_size(),
                 v_cache.stride(0) * v_cache.element_size(),
@@ -591,18 +586,20 @@ class MLALayoutTest(unittest.TestCase):
         pd._closed = pd._registered = False
         pd._receive_error = None
         pd.layer_specs = {"model.layers.0.self_attn": spec}
-        pd.layer_groups = {"model.layers.0.self_attn": 0}
-        pd.topology = Topology()
+        pd.transfer_topo = Topology()
+        pd.transfer_topo.split_k_and_v = False
         pd.engine = Engine()
         pd.regions = []
-        pd.kv_caches_base_addr, pd.block_lens = [], []
+        pd.kv_caches_base_addr, pd.block_len_per_layer = [], []
         pd._registered_storage = []
         pd.is_producer = False
 
         pd.register({"model.layers.0.self_attn": cache})
 
-        self.assertEqual(len(pd.regions), 1)
-        region = pd.regions[0]
+        self.assertEqual(len(pd.kv_caches_base_addr), 1)
+        region = pd._get_transfer_regions(
+            pd.kv_caches_base_addr, pd.block_len_per_layer
+        )[0]
         self.assertEqual(region.block_len, cache.stride(0) * cache.element_size())
         self.assertEqual(region.kv_block_len, cache.stride(0) * cache.element_size())
         self.assertGreater(region.kv_block_len, spec.page_size_bytes)
@@ -646,7 +643,7 @@ class PreemptionLifecycleTest(unittest.TestCase):
 
         class PD:
             def __init__(self) -> None:
-                self.source = _Session("r1", "x1")
+                self.source = SendBlockMeta("r1", "x1")
 
             @staticmethod
             def preempt(_request_id) -> None:
@@ -667,110 +664,115 @@ class PreemptionLifecycleTest(unittest.TestCase):
         self.assertEqual(worker.transfer.source.transfer_id, "x1")
 
     @staticmethod
-    def _polling_pd(source: _Session) -> MooncakeKVTransfer:
+    def _polling_pd(source: SendBlockMeta) -> MooncakeKVTransfer:
         pd = object.__new__(MooncakeKVTransfer)
-        pd._closed = False
-        pd._receive_error = None
-        pd._registered = True
-        pd._source_lock = threading.Lock()
-        pd._source_changed = threading.Condition(pd._source_lock)
-        pd._result_lock = threading.Lock()
-        pd._receive_lock = threading.Lock()
-        pd._sources = {source.transfer_id: source}
-        pd._finished_send = set()
+        from test_backends import _transfer
 
-        pd._failed_recv = set()
-        pd._receive_futures = {}
-        pd._retired = set()
-        pd._prepared = {}
-        pd._pending_sends = set()
-        pd._recv_events = {}
-        pd._send_failures = {}
-        pd._invalid = {}
+        pd = _transfer()
+        pd.reqs_need_send = {source.transfer_id: source}
         return pd
 
     def test_partial_fanout_expires_after_active_writes_finish(self) -> None:
-        source = _Session(
-            "r1", "x1", published=True, expected=2, completed=1, terminal=1
-        )
+        source = SendBlockMeta("r1", "x1", expire_time=1e20, need_send=2, sent=1)
         source.ready.set()
-        source.expires_at = 0
+        source.expire_time = 0
         pd = self._polling_pd(source)
 
-        sent = {result.request_id for result in pd.poll().sends}
+        sent = {
+            result.request_id
+            for result in asyncio.run(pd.fetch_finished_sending_reqs())
+        }
 
         self.assertEqual(sent, {"r1"})
-        self.assertNotIn("x1", pd._sources)
+        self.assertNotIn("x1", pd.reqs_need_send)
 
     def test_source_timeout_does_not_release_active_write(self) -> None:
-        source = _Session("r1", "x1", expected=1, active_writes=1)
+        source = SendBlockMeta("r1", "x1", need_send=1, sending=1)
         source.ready.set()
-        source.expires_at = 0
+        source.expire_time = 0
         pd = self._polling_pd(source)
 
-        sent = {result.request_id for result in pd.poll().sends}
+        sent = {
+            result.request_id
+            for result in asyncio.run(pd.fetch_finished_sending_reqs())
+        }
 
         self.assertEqual(sent, set())
-        self.assertIn("x1", pd._sources)
+        self.assertIn("x1", pd.reqs_need_send)
 
     def test_abort_without_decode_request_is_cleaned_without_completion(self) -> None:
-        source = _Session("r1", "x1", abort=True, expires_at=0)
+        source = SendBlockMeta("r1", "x1", expire_time=0)
         source.ready.set()
         pd = self._polling_pd(source)
 
-        pd.cancel("r1", "x1")
+        asyncio.run(pd._cancel_send("r1", "x1"))
 
-        self.assertEqual(pd.poll().sends, [])
-        self.assertNotIn("x1", pd._sources)
-        self.assertIn("x1", pd._retired)
+        self.assertEqual(asyncio.run(pd.fetch_finished_sending_reqs()), [])
+        self.assertNotIn("x1", pd.reqs_need_send)
 
-    def test_active_write_completion_is_accounted_atomically(self) -> None:
-        source = _Session("r1", "x1", published=True, expected=1)
+    def test_failed_write_keeps_source_until_expiration(self) -> None:
+        import msgspec
+        from test_backends import _request, _Socket
+
+        source = SendBlockMeta("r1", "x1", local_block_ids=[[1]], expire_time=1e20)
         source.ready.set()
         pd = self._polling_pd(source)
-        pd.timeout = 1
 
         async def failed_write(*_args):
-            self.assertEqual(source.active_writes, 1)
-            return dict.fromkeys(_args[0], False)
+            self.assertEqual(source.sending, 1)
+            return -1
 
-        pd._write_batch = failed_write
-        asyncio.run(pd._write_ready_targets({"d1": source}, None))
-
-        self.assertEqual(source.active_writes, 0)
-        self.assertEqual(source.terminal, 1)
-        self.assertNotIn("x1", pd._sources)
-        self.assertEqual(pd._finished_send, {"r1"})
+        pd._write_buffers = failed_write
+        request = msgspec.structs.replace(
+            _request(pd), req_blocks={"d1": ("x1", [[4]])}
+        )
+        socket = _Socket()
+        asyncio.run(pd.send_kv_to_decode(b"d", msgspec.msgpack.encode(request), socket))
+        self.assertEqual(socket.messages[0].err_reqs, ["d1"])
+        self.assertEqual(source.sending, 0)
+        self.assertEqual(source.sent, 0)
+        self.assertIn("x1", pd.reqs_need_send)
+        self.assertEqual(asyncio.run(pd.fetch_finished_sending_reqs()), [])
+        source.expire_time = 0
+        self.assertIsNotNone(asyncio.run(pd.fetch_finished_sending_reqs())[0].error)
+        self.assertNotIn("x1", pd.reqs_need_send)
 
     def test_early_decode_timeout_waits_for_prefill_terminal(self) -> None:
         import msgspec
         from test_backends import _request, _Socket, _transfer
 
-        source = _Session("r1", "x1", expected=1)
+        source = SendBlockMeta("r1", "x1", need_send=1)
         pd = _transfer()
-        pd._sources["x1"] = source
+        pd.reqs_need_send["x1"] = source
         pd.timeout = 0.001
         request = msgspec.structs.replace(
             _request(pd), req_blocks={"d1": ("x1", [[4]])}
         )
-        asyncio.run(pd._serve(b"d", msgspec.msgpack.encode(request), _Socket()))
+        asyncio.run(
+            pd.send_kv_to_decode(b"d", msgspec.msgpack.encode(request), _Socket())
+        )
 
-        self.assertIn("x1", pd._sources)
-        self.assertEqual(pd._finished_send, set())
-        pd.send(SendEvent("r1", "x1", ((1,),)))
-        self.assertNotIn("x1", pd._sources)
-        self.assertEqual(pd._finished_send, {"r1"})
-        self.assertIsNotNone(pd.poll().sends[0].error)
+        self.assertIn("x1", pd.reqs_need_send)
+        self.assertEqual(pd.finished_sending_reqs, set())
+        asyncio.run(pd._publish_send(SendEvent("r1", "x1", ((1,),))))
+        self.assertIn("x1", pd.reqs_need_send)
+        self.assertEqual(pd.finished_sending_reqs, set())
+        self.assertEqual(asyncio.run(pd.fetch_finished_sending_reqs()), [])
+        source.expire_time = 0
+        self.assertIsNotNone(asyncio.run(pd.fetch_finished_sending_reqs())[0].error)
 
     def test_published_source_without_decode_expires(self) -> None:
-        source = _Session("r1", "x1", published=True, expires_at=0)
+        source = SendBlockMeta("r1", "x1", expire_time=0)
         source.ready.set()
         pd = self._polling_pd(source)
 
-        sent = {result.request_id for result in pd.poll().sends}
+        sent = {
+            result.request_id
+            for result in asyncio.run(pd.fetch_finished_sending_reqs())
+        }
 
         self.assertEqual(sent, {"r1"})
-        self.assertNotIn("x1", pd._sources)
+        self.assertNotIn("x1", pd.reqs_need_send)
 
     def test_timed_out_store_get_is_fenced_then_invalidated(self) -> None:
         future: Future[_LoadOutcome] = Future()
@@ -877,7 +879,7 @@ class ProxySpecTest(unittest.TestCase):
 
 
 class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
-    async def test_bootstrap_query_selects_exact_dp_and_engine(self) -> None:
+    async def test_bootstrap_query_caches_each_engine_by_its_identity(self) -> None:
         class Response:
             @staticmethod
             def raise_for_status() -> None:
@@ -911,13 +913,20 @@ class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
                 return Response()
 
         pd = object.__new__(MooncakeKVTransfer)
-        pd._remote_workers = {}
-        pd._pending_bootstrap_queries = {}
+        pd._remote_agents = {}
+        pd._remote_tp_size = {}
+        pd._pending_bootstrap_queries = {"http://bootstrap": asyncio.Event()}
         with patch("mtsc.kv_transfer.httpx.AsyncClient", return_value=Client()):
-            workers = await pd._query_workers("http://bootstrap", "p1", 1)
-            self.assertEqual(workers, {0: {0: "tcp://p1"}})
-            with self.assertRaisesRegex(KeyError, "not 'p0'"):
-                await pd._query_workers("http://bootstrap", "p0", 1)
+            await pd._connect_to_prefiller_bootstrap("http://bootstrap")
+        self.assertEqual(
+            pd._remote_agents,
+            {
+                "p0": {0: {0: "tcp://p0"}},
+                "p1": {0: {0: "tcp://p1"}},
+            },
+        )
+        self.assertEqual(pd._remote_tp_size, {"p0": 1, "p1": 1})
+        self.assertEqual(pd._pending_bootstrap_queries, {})
 
     async def test_prefill_error_wins_while_decode_headers_are_pending(self) -> None:
         class RawRequest:

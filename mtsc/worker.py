@@ -11,8 +11,8 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 
-from .kv_cache_pool import KVCachePool, LoadEvent, LoadResult, SaveEvent
-from .kv_transfer import KVTransfer, RecvEvent, SendEvent, TransferResult
+from .kv_cache_pool import LoadEvent, LoadResult, MooncakeKVCachePool, SaveEvent
+from .kv_transfer import MooncakeKVTransfer, RecvEvent, SendEvent, TransferResult
 from .protocol import (
     FinishedWait,
     KVPoolLoadRequest,
@@ -37,17 +37,13 @@ def _backend(config, key: str) -> str:
     return backend
 
 
-def _create_pool(config, kv_cache_config) -> KVCachePool:
+def _create_pool(config, kv_cache_config) -> MooncakeKVCachePool:
     _backend(config, "mtsc_pool_backend")
-    from .kv_cache_pool import MooncakeKVCachePool
-
     return MooncakeKVCachePool(config, kv_cache_config)
 
 
-def _create_transfer(config, kv_cache_config) -> KVTransfer:
+def _create_transfer(config, kv_cache_config) -> MooncakeKVTransfer:
     _backend(config, "mtsc_transfer_backend")
-    from .kv_transfer import MooncakeKVTransfer
-
     return MooncakeKVTransfer(config, kv_cache_config)
 
 
@@ -79,9 +75,9 @@ class MTSCWorker:
     """Executes batch operations and advances pool + transfer loading."""
 
     def __init__(self, config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
-        self.pool: KVCachePool = _create_pool(config, kv_cache_config)
+        self.pool = _create_pool(config, kv_cache_config)
         try:
-            self.transfer: KVTransfer = _create_transfer(config, kv_cache_config)
+            self.transfer = _create_transfer(config, kv_cache_config)
         except Exception:
             self.pool.close()
             raise
@@ -237,7 +233,8 @@ class MTSCWorker:
                 continue
             self._start_transfer(state, actual_pool_prefix, recv_events)
 
-        self.transfer.recv_batch(recv_events)
+        if recv_events:
+            self.transfer.recv(recv_events)
 
         for result in transfer_recv_result:
             request_id = result.request_id
@@ -352,7 +349,7 @@ class MTSCWorker:
     def get_finished(
         self, finished_req_ids: set[str], metadata: MTSCConnectorMetadata
     ) -> tuple[set[str] | None, set[str] | None]:
-        # step 1 update metadata
+        # step 1 update metadata & send or save
         self.update_load_metadata(metadata)
         self.update_save_metadata(metadata)
         self.update_finished_metadata(metadata)

@@ -41,7 +41,7 @@ class TransferSpec:
 
     computed_tokens: int  # Already computed tokens (local)
     pool_hit_tokens: int  # Tokens available in pool
-    target_tokens: int    # Target total tokens to load
+    target_tokens: int  # Target total tokens to load
 
 
 @dataclass
@@ -49,6 +49,7 @@ class _TrackedRequest:
     request: Request
     block_ids: tuple[list[int], ...]
     saved_tokens: int = 0
+    is_decode: bool = False
 
 
 def _groups(
@@ -73,8 +74,8 @@ class MTSCScheduler:
         assert vllm_config.kv_transfer_config is not None
         transfer = vllm_config.kv_transfer_config
         extra = transfer.kv_connector_extra_config
-        self.is_producer = transfer.kv_role == "kv_producer"
-        self.is_consumer = transfer.kv_role == "kv_consumer"
+        self.is_producer = transfer.kv_role != "kv_consumer"
+        self.is_consumer = transfer.kv_role != "kv_producer"
         self.decode_save = decode_save and self.is_consumer
         lookup_async = extra.get("lookup_async", False)
         if isinstance(lookup_async, str):
@@ -214,10 +215,14 @@ class MTSCScheduler:
         params = request.kv_transfer_params or {}
         if request.request_id in self._transfer_decisions:
             self._validate_transfer_params(request)
-        all_blocks = _groups(blocks.get_block_ids())
+        all_blocks = blocks.get_block_ids()
         tracked = self._tracked_requests.get(request.request_id)
         if tracked is None:
-            tracked = _TrackedRequest(request, all_blocks)
+            tracked = _TrackedRequest(
+                request,
+                all_blocks,
+                is_decode=self.is_consumer and not bool(params.get("do_remote_decode")),
+            )
             self._tracked_requests[request.request_id] = tracked
         elif all_blocks:
             tracked.block_ids = all_blocks
@@ -273,7 +278,9 @@ class MTSCScheduler:
                 )
 
     def _append_blocks(
-        self, tracked_req: _TrackedRequest, new_block_ids: tuple[list[int], ...] | list[int] | None
+        self,
+        tracked_req: _TrackedRequest,
+        new_block_ids: tuple[list[int], ...] | list[int] | None,
     ) -> None:
         if new_block_ids is None:
             return
@@ -289,6 +296,9 @@ class MTSCScheduler:
     def _build_save_meta(
         self, tracked_req: _TrackedRequest, token_count: int, *, decode: bool
     ) -> KVPoolSaveRequest | None:
+        # Like Mooncake Store's all_token_ids slice, only advance through
+        # known tokens, excluding unverified drafts and async placeholders.
+        token_count = min(token_count, tracked_req.request.num_tokens)
         complete = token_count // self.block_size * self.block_size
         start = tracked_req.saved_tokens
         if decode:
@@ -317,14 +327,18 @@ class MTSCScheduler:
             # 1. requests newly scheduled this step
             for req in output.scheduled_new_reqs:
                 tracked_req = self._tracked_requests.get(req.req_id)
-                if tracked_req is None or req.req_id in pool_loading_req_ids:
+                if (
+                    tracked_req is None
+                    or req.req_id in pool_loading_req_ids
+                    or (tracked_req.is_decode and not self.decode_save)
+                ):
                     continue
                 tracked_req.block_ids = _groups(req.block_ids)
                 token_count = (
                     req.num_computed_tokens + output.num_scheduled_tokens[req.req_id]
                 )
                 save_meta = self._build_save_meta(
-                    tracked_req, token_count, decode=self.is_consumer
+                    tracked_req, token_count, decode=tracked_req.is_decode
                 )
                 if save_meta is not None:
                     self._batch_pool_saves.append(save_meta)
@@ -332,7 +346,9 @@ class MTSCScheduler:
             cached = output.scheduled_cached_reqs
             for index, request_id in enumerate(cached.req_ids):
                 tracked_req = self._tracked_requests.get(request_id)
-                if tracked_req is None:
+                if tracked_req is None or (
+                    tracked_req.is_decode and not self.decode_save
+                ):
                     continue
                 self._append_blocks(tracked_req, cached.new_block_ids[index])
                 token_count = (
@@ -340,7 +356,7 @@ class MTSCScheduler:
                     + output.num_scheduled_tokens[request_id]
                 )
                 save_meta = self._build_save_meta(
-                    tracked_req, token_count, decode=self.is_consumer
+                    tracked_req, token_count, decode=tracked_req.is_decode
                 )
                 if save_meta is not None:
                     self._batch_pool_saves.append(save_meta)

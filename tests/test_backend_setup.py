@@ -381,6 +381,11 @@ class BackendSetupTest(unittest.TestCase):
                 return_value=SimpleNamespace(rank_in_group=0),
             ),
             patch("mtsc.kv_transfer.is_npu_platform", return_value=True),
+            patch("mtsc.kv_transfer.get_current_attn_backends", return_value=[]),
+            patch(
+                "mtsc.kv_transfer.select_common_block_size",
+                side_effect=lambda size, backends: size,
+            ),
             patch("mtsc.kv_transfer.current_platform"),
             patch(
                 "mtsc.kv_transfer._bootstrap_address", return_value=("127.0.0.1", 8998)
@@ -394,7 +399,7 @@ class BackendSetupTest(unittest.TestCase):
             transfer = MooncakeKVTransfer(config, _caches())
             self.addCleanup(transfer.close)
             self.assertEqual(transfer.timeout, 37.5)
-            self.assertEqual(transfer._send_pool._max_workers, 10)
+            self.assertEqual(transfer._sender_executor._max_workers, 10)
             self.assertEqual(transfer.num_sender_tasks, 20)
             config = _config()
             config.parallel_config.pipeline_parallel_size = 1
@@ -404,7 +409,7 @@ class BackendSetupTest(unittest.TestCase):
             override = MooncakeKVTransfer(config, _caches())
             try:
                 self.assertEqual(override.timeout, 12.5)
-                self.assertEqual(override._send_pool._max_workers, 1)
+                self.assertEqual(override._sender_executor._max_workers, 1)
                 self.assertEqual(override.num_sender_tasks, 2)
             finally:
                 override.close()
@@ -420,5 +425,5 @@ class BackendSetupTest(unittest.TestCase):
         self.assertEqual(payload["engine_id"], "producer")
         self.assertTrue(payload["addr"].endswith(":12345"))
         transfer.close()
-        self.assertFalse(transfer._loop_thread.is_alive())
-        self.assertTrue(transfer._loop.is_closed())
+        self.assertFalse(transfer._sender_listener_t.is_alive())
+        self.assertTrue(transfer.sender_loop.is_closed())

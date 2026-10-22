@@ -14,7 +14,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -22,7 +21,6 @@ from vllm.v1.outputs import KVConnectorOutput
 
 from .protocol import MTSCConnectorMetadata
 from .scheduler import MTSCScheduler
-from .utils import is_npu_platform
 from .worker import MTSCWorker
 
 if TYPE_CHECKING:
@@ -68,8 +66,11 @@ class MTSCConnector(KVConnectorBase_V1, SupportsHMA):
         if vllm_config.kv_transfer_config.kv_role not in {
             "kv_producer",
             "kv_consumer",
+            "kv_both",
         }:
-            raise ValueError("MTSC MVP requires kv_role=kv_producer or kv_consumer")
+            raise ValueError(
+                "MTSC requires kv_role=kv_producer, kv_consumer or kv_both"
+            )
 
         self.scheduler: MTSCScheduler | None = None
         self.worker: MTSCWorker | None = None
@@ -88,11 +89,7 @@ class MTSCConnector(KVConnectorBase_V1, SupportsHMA):
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
-        if (
-            is_npu_platform()
-            or vllm_config.model_config is None
-            or vllm_config.model_config.use_mla
-        ):
+        if vllm_config.model_config is None or vllm_config.model_config.use_mla:
             return None
         return "HND"
 
@@ -196,15 +193,6 @@ class MTSCConnector(KVConnectorBase_V1, SupportsHMA):
         return self.worker.get_block_ids_with_load_errors()
 
     def get_kv_connector_kv_cache_events(self):
-        return None
-
-    def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        return None
-
-    @classmethod
-    def build_kv_connector_stats(
-        cls, data: dict[str, Any] | None = None
-    ) -> KVConnectorStats | None:
         return None
 
     def shutdown(self) -> None:

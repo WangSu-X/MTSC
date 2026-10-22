@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import ctypes
 import json
-from concurrent.futures import Future
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import msgspec
 import pytest
 import torch
-from reference_mooncake import MooncakeXferMetadata, MooncakeXferResponse
 from test_backend_setup import _caches, _config
-from test_backends import _pool, _Socket, _transfer
+from test_backends import _pool, _transfer
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
@@ -21,29 +19,24 @@ from mtsc.connector import MTSCConnector
 from mtsc.kv_cache_pool import LoadEvent
 from mtsc.kv_transfer import (
     MooncakeKVTransfer,
-    RecvEvent,
-    SendEvent,
+    SendBlockMeta,
     _NPUTransferTopology,
     _resolve_transfer_transport,
-    _Session,
 )
-from mtsc.protocol import KVTransferRequest, KVTransferResponse, KVTransferStatus
+from mtsc.protocol import KVTransferRequest
 
 
-def _registered(
-    caches, *, tp=1, rank=0, heads=4, npu=False, groups=None, nz=False, topology=None
-):
+def _registered(caches, *, tp=1, rank=0, heads=4, npu=False, nz=False, topology=None):
     transfer = _transfer()
     transfer._registered = False
     transfer.is_producer = False
     transfer.npu_kv_nz = nz
     transfer._registered_storage = []
     transfer.tp_size, transfer.tp_rank = tp, rank
-    transfer.topology = topology or _NPUTransferTopology(rank, tp, 3, False, heads)
+    transfer.transfer_topo = topology or _NPUTransferTopology(rank, tp, 3, False, heads)
     if topology is None:
-        transfer.topology.get_transfer_cache_regions = lambda raw, spec: [raw]
+        transfer.transfer_topo.get_transfer_cache_regions = lambda raw, spec: [raw]
     transfer.layer_specs = {name: SimpleNamespace(block_size=3) for name in caches}
-    transfer.layer_groups = groups or dict.fromkeys(caches, 0)
     transfer.engine = Mock()
     transfer.engine.register_memory.return_value = 0
     transfer.engine.batch_register_memory.return_value = 0
@@ -53,22 +46,14 @@ def _registered(
 
 
 def _request(receiver, blocks, *, layout_id=0):
-    regions = receiver.regions
     return KVTransferRequest(
         "d",
         123,
         receiver.tp_size,
         receiver.tp_rank,
         {"d-r": ("x", blocks)},
-        [r.base_addr for r in regions],
-        [r.block_len for r in regions],
-        kv_block_lens=[r.kv_block_len for r in regions],
-        registered_layer_names=[r.layer_name for r in regions],
-        registered_layer_indices=[r.layer_index for r in regions],
-        registered_group_indices=[r.group_index for r in regions],
-        registered_shared_group_ids=[list(r.shared_group_ids) for r in regions],
-        registered_row_offsets=[r.row_offset for r in regions],
-        layout_id=layout_id,
+        receiver.kv_caches_base_addr,
+        receiver.block_len_per_layer,
     )
 
 
@@ -76,7 +61,7 @@ def _copy(sender, receiver, source_blocks, destination_blocks):
     request = _request(receiver, destination_blocks)
     src, dst, sizes = sender._build_request_transfer_params(
         "d-r",
-        _Session("p-r", "x", block_ids=source_blocks),
+        SendBlockMeta("p-r", "x", local_block_ids=source_blocks),
         request,
     )
     for source, target, size in zip(src, dst, sizes, strict=True):
@@ -116,89 +101,51 @@ def test_store_success_is_usable_without_a_layout_conversion_method():
 
 
 @pytest.mark.parametrize(
-    "p_size,d_size",
-    [(1, 1), (2, 1), (1, 2), (4, 2), (2, 4), (8, 1), (1, 8), (8, 2), (2, 8)],
+    "p_size,d_size", [(1, 1), (2, 1), (1, 2), (4, 2), (2, 4), (8, 1), (1, 8)]
 )
-@pytest.mark.parametrize("layout", ["NHD", "HND"])
-def test_npu_head_resharding_preserves_token_order(p_size, d_size, layout):
-    heads, tokens = 4, 3
-    full = torch.arange(tokens * heads * 2, dtype=torch.int32).reshape(tokens, heads, 2)
+def test_npu_hnd_head_resharding_matches_native_whole_block_plan(p_size, d_size):
+    from unittest.mock import patch
+
+    heads, tokens = 8, 3
+    full = torch.arange(heads * tokens * 2, dtype=torch.int32).reshape(heads, tokens, 2)
     for d_rank in range(d_size):
-        d_heads = max(heads // d_size, 1)
-        d_start = d_rank * heads // d_size
-        target = torch.full((6, tokens, d_heads, 2), -1, dtype=torch.int32)
-        if layout == "HND":
-            target = torch.full(
-                (6, d_heads, tokens, 2), -1, dtype=torch.int32
-            ).transpose(1, 2)
-        receiver = _registered({"layer.0": target}, tp=d_size, rank=d_rank, npu=True)
-        peers = receiver.topology.handshake_target_ranks(p_size)
-        for p_rank in peers:
-            p_heads = max(heads // p_size, 1)
-            p_start = p_rank * heads // p_size
-            source = torch.zeros((6, tokens, p_heads, 2), dtype=torch.int32)
-            if layout == "HND":
-                source = torch.zeros(
-                    (6, p_heads, tokens, 2), dtype=torch.int32
-                ).transpose(1, 2)
-            source[1] = full[:, p_start : p_start + p_heads]
-            sender = _registered({"layer.0": source}, tp=p_size, rank=p_rank, npu=True)
-            _copy(sender, receiver, ((1,),), [[4]])
-        assert torch.equal(target[4], full[:, d_start : d_start + d_heads])
-        assert torch.all(target[:4] == -1)
-        assert torch.all(target[5] == -1)
-
-
-def test_npu_separate_kv_tensors_preserve_both_payloads():
-    full = [
-        torch.arange(3 * 4 * dim, dtype=torch.int32).reshape(3, 4, dim) + offset
-        for dim, offset in ((2, 0), (3, 1000))
-    ]
-    target = [torch.full((6, 3, 4, dim), -1, dtype=torch.int32) for dim in (2, 3)]
-    receiver = _registered({"layer.0": target}, npu=True)
-    for rank in range(2):
-        source = [torch.zeros((6, 3, 2, dim), dtype=torch.int32) for dim in (2, 3)]
-        for cache, expected in zip(source, full, strict=True):
-            cache[1] = expected[:, rank * 2 : rank * 2 + 2]
-        sender = _registered({"layer.0": source}, tp=2, rank=rank, npu=True)
-        _copy(sender, receiver, ((1,),), [[4]])
-    for cache, expected in zip(target, full, strict=True):
-        assert torch.equal(cache[4], expected)
-        assert torch.all(cache[[0, 1, 2, 3, 5]] == -1)
-
-
-def test_mamba_null_placeholders_do_not_shift_the_source_suffix():
-    source = {
-        name: torch.arange(6 * 4, dtype=torch.int32).reshape(6, 4) + offset
-        for name, offset in (("layer.0", 0), ("layer.1", 1000))
-    }
-    target = {name: torch.full_like(cache, -1) for name, cache in source.items()}
-    groups = {"layer.0": 0, "layer.1": 1}
-    sender, receiver = (
-        _registered(caches, groups=groups) for caches in (source, target)
-    )
-    sender.mamba_groups = {1}
-    _copy(sender, receiver, ((1,), (0, 2, 0)), [[3], [0, 4]])
-    assert torch.equal(target["layer.1"][4], source["layer.1"][2])
-    assert torch.all(target["layer.1"][[0, 1, 2, 3, 5]] == -1)
-
-
-def test_mismatched_group_metadata_is_rejected_before_write():
-    cache = torch.zeros((6, 4), dtype=torch.int32)
-    sender = _registered({"layer.0": cache})
-    receiver = _registered({"layer.0": torch.full_like(cache, -1)})
-    request = msgspec.structs.replace(
-        _request(receiver, [[4]]), registered_group_indices=[1]
-    )
-    with pytest.raises(ValueError, match="group index mismatch"):
-        sender._build_request_transfer_params(
-            "d-r", _Session("p-r", "x", block_ids=((1,),)), request
+        target = torch.full((6, heads // d_size, tokens, 2), -1, dtype=torch.int32)
+        receiver = _registered(
+            {"layer.0": target}, tp=d_size, rank=d_rank, heads=heads, npu=True
         )
-    sender.engine.batch_transfer_sync_write.assert_not_called()
+        for p_rank in receiver.transfer_topo.handshake_target_ranks(p_size):
+            source = torch.zeros((6, heads // p_size, tokens, 2), dtype=torch.int32)
+            source[1] = full[p_rank * heads // p_size : (p_rank + 1) * heads // p_size]
+            sender = _registered(
+                {"layer.0": source}, tp=p_size, rank=p_rank, heads=heads, npu=True
+            )
+            with (
+                patch("mtsc.kv_transfer.get_kv_cache_layout", return_value="HND"),
+                patch("mtsc.kv_transfer.is_npu_platform", return_value=True),
+            ):
+                _copy(sender, receiver, ((1,),), [[4]])
+        assert torch.equal(
+            target[4], full[d_rank * heads // d_size : (d_rank + 1) * heads // d_size]
+        )
+        assert torch.all(target[[0, 1, 2, 3, 5]] == -1)
+
+
+def test_npu_nhd_heterogeneous_tp_is_rejected_without_token_regions():
+    source = torch.zeros((6, 3, 2, 2), dtype=torch.int32)
+    target = torch.full((6, 3, 4, 2), -1, dtype=torch.int32)
+    sender = _registered({"layer.0": source}, tp=2, npu=True)
+    receiver = _registered({"layer.0": target}, npu=True)
+    with (
+        patch("mtsc.kv_transfer.is_npu_platform", return_value=True),
+        patch("mtsc.kv_transfer.get_kv_cache_layout", return_value="NHD"),
+    ):
+        with pytest.raises(ValueError, match="requires HND"):
+            _copy(sender, receiver, ((1,),), [[4]])
+    assert torch.all(target == -1)
 
 
 @pytest.mark.parametrize("shared", [False, True])
-def test_each_region_uses_only_its_own_kv_groups(shared):
+def test_all_regions_use_the_flattened_group_block_table(shared):
     source = torch.arange(6 * 4, dtype=torch.int32).reshape(6, 4)
     target = torch.full_like(source, -1)
     sources = {"layer.0": source, "layer.1": source if shared else source + 1000}
@@ -206,111 +153,27 @@ def test_each_region_uses_only_its_own_kv_groups(shared):
         "layer.0": target,
         "layer.1": target if shared else torch.full_like(target, -1),
     }
-    groups = {"layer.0": 0, "layer.1": 1}
-    sender, receiver = (
-        _registered(values, groups=groups) for values in (sources, targets)
-    )
-    _copy(sender, receiver, ((1,), (2,)), [[3], [4]])
-    for layer, src_id, dst_id in (("layer.0", 1, 3), ("layer.1", 2, 4)):
-        assert torch.equal(targets[layer][dst_id], sources[layer][src_id])
-        untouched = [0, 1, 2, 5] if shared else [i for i in range(6) if i != dst_id]
-        assert torch.all(targets[layer][untouched] == -1)
-    assert len(sender.regions) == (1 if shared else 2)
-
-
-def test_packed_layer_payloads_do_not_copy_the_next_layer_or_the_next_row():
-    source = torch.arange(6 * 2 * 4, dtype=torch.int32).reshape(6, 2, 4)
-    target = torch.full_like(source, -1)
-    sources = {"layer.0": source[:, 0], "layer.1": source[:, 1]}
-    targets = {"layer.1": target[:, 1], "layer.0": target[:, 0]}
-    groups = {"layer.0": 0, "layer.1": 1}
-    sender, receiver = (
-        _registered(values, groups=groups) for values in (sources, targets)
-    )
-    _copy(sender, receiver, ((1,), (2,)), [[3], [4]])
-    assert torch.equal(target[3, 0], source[1, 0])
-    assert torch.equal(target[4, 1], source[2, 1])
-    assert torch.all(target[3, 1] == -1)
-    assert torch.all(target[4, 0] == -1)
-    assert torch.all(target[[0, 1, 2, 5]] == -1)
-
-
-def test_unsupported_npu_nz_resharding_is_rejected_before_memory_access():
-    source = torch.zeros((6, 3, 2, 2), dtype=torch.int32)
-    target = torch.full((6, 3, 4, 2), -1, dtype=torch.int32)
-    sender = _registered({"layer.0": source}, tp=2, npu=True, nz=True)
-    receiver = _registered({"layer.0": target}, npu=True, nz=True)
-    with pytest.raises(ValueError, match="NZ KV-head re-sharding"):
-        _copy(sender, receiver, ((1,),), [[4]])
-    assert torch.all(target == -1)
+    sender, receiver = (_registered(values) for values in (sources, targets))
+    _copy(sender, receiver, ((0, 1), (2,)), [[3], [4]])
+    for layer in sources:
+        assert torch.equal(targets[layer][3], sources[layer][1])
+        assert torch.equal(targets[layer][4], sources[layer][2])
+        assert torch.all(targets[layer][[0, 1, 2, 5]] == -1)
+    assert len(sender.kv_caches_base_addr) == (1 if shared else 2)
 
 
 @pytest.mark.asyncio
-async def test_upstream_layout_id_cache_and_layer_matching():
+async def test_native_metadata_contains_no_layout_extensions():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
+        MooncakeXferMetadata as NativeMeta,
+    )
+
     cache = torch.zeros((6, 4), dtype=torch.int32)
-    sender = _registered({"layer.0": cache})
-    sender.is_producer = True
-    sender.send(SendEvent("p-r", "x", ((1,),)))
-    receiver = _registered({"layer.0": torch.full_like(cache, -1)})
-    request = _request(receiver, [[4]], layout_id=123)
-    sender._write_batch = AsyncMock(return_value={"d-r": True})
-    socket = _Socket()
-    # Decode the actual request with the pinned upstream schema first.
-    upstream = msgspec.msgpack.decode(
-        msgspec.msgpack.encode(request), type=MooncakeXferMetadata
-    )
-    await sender._serve(b"peer", msgspec.msgpack.encode(upstream), socket)
-    assert socket.messages[0].ok_reqs == ["d-r"]
-    assert socket.messages[0].layout_id == 123
-    compact = msgspec.structs.replace(
-        request,
-        kv_caches_base_addr=[],
-        block_lens=[],
-        kv_block_lens=[],
-        registered_layer_names=[],
-        registered_layer_indices=[],
-    )
-    assert sender._prepare_transfer_regions(compact) is not None
-    missing = msgspec.structs.replace(compact, layout_id=456)
-    socket = _Socket()
-    await sender._serve(b"peer", msgspec.msgpack.encode(missing), socket)
-    assert socket.messages[0].status == KVTransferStatus.LAYOUT_MISS
-    assert socket.messages[0].layout_id == 456
-
-
-@pytest.mark.asyncio
-async def test_generated_decode_request_is_accepted_by_current_upstream_schema():
-    receiver = _registered({"layer.0": torch.zeros((6, 4), dtype=torch.int32)})
-    receiver.hostname, receiver.rpc_port = "d", 123
-    receiver._query_workers = AsyncMock(return_value={0: {0: "p"}})
-    receiver._response_decoder = msgspec.msgpack.Decoder(KVTransferResponse)
-    captured = []
-
-    class Client:
-        def setsockopt(self, *args):
-            pass
-
-        def connect(self, address):
-            pass
-
-        async def send(self, payload):
-            captured.append(msgspec.msgpack.decode(payload, type=MooncakeXferMetadata))
-
-        async def recv(self):
-            return msgspec.msgpack.encode(MooncakeXferResponse(0, ["d-r"]))
-
-        def close(self, **kwargs):
-            pass
-
-    receiver._ctx = SimpleNamespace(socket=lambda kind: Client())
-    future = Future()
-    await receiver._receive_batch(
-        [RecvEvent("d-r", "x", ((4,),), "bootstrap", "p", 0)], {"d-r": future}
-    )
-    assert future.result() is None
-    assert captured[0].kv_block_lens == [16]
-    assert captured[0].registered_layer_names == ["layer.0"]
-    assert captured[0].registered_group_indices == [0]
+    receiver = _registered({"layer.0": cache})
+    request = _request(receiver, [[4]])
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(request), type=NativeMeta)
+    assert decoded.req_blocks == request.req_blocks
+    assert set(msgspec.to_builtins(request)) == set(msgspec.to_builtins(decoded))
 
 
 @pytest.mark.parametrize(
@@ -349,8 +212,9 @@ async def test_generated_decode_request_is_accepted_by_current_upstream_schema()
         ({"mooncake_protocol": "ascend"}, None, ("ascend", "")),
     ],
 )
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer", "kv_both"])
 def test_direct_te_transport_precedence(
-    extra, store_json, expected, tmp_path, monkeypatch
+    extra, store_json, expected, role, tmp_path, monkeypatch
 ):
     monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
     if store_json is not None:
@@ -363,6 +227,7 @@ def test_direct_te_transport_precedence(
     engine.initialize.return_value = 0
     engine.get_rpc_port.return_value = 123
     config = _config()
+    config.kv_transfer_config.kv_role = role
     config.parallel_config.pipeline_parallel_size = 1
     config.kv_transfer_config.kv_connector_extra_config.update(extra)
     with (
@@ -377,6 +242,11 @@ def test_direct_te_transport_precedence(
             return_value=SimpleNamespace(rank_in_group=0),
         ),
         patch("mtsc.kv_transfer.is_npu_platform", return_value=True),
+        patch("mtsc.kv_transfer.get_current_attn_backends", return_value=[]),
+        patch(
+            "mtsc.kv_transfer.select_common_block_size",
+            side_effect=lambda size, backends: size,
+        ),
         patch("mtsc.kv_transfer.current_platform"),
         patch("mtsc.kv_transfer._launch_bootstrap", return_value=False),
         patch("mtsc.kv_transfer.version", return_value="0.3.13.post1"),
@@ -387,8 +257,31 @@ def test_direct_te_transport_precedence(
         try:
             assert transfer.protocol == expected[0]
             assert engine.initialize.call_args.args[1:] == ("P2PHANDSHAKE", *expected)
+            if role == "kv_producer":
+                loop, thread = transfer.sender_loop, transfer._sender_listener_t
+                assert transfer.receiver_loop is None
+                assert transfer._receiver_t is None
+                assert transfer._sender_executor is not None
+            elif role == "kv_consumer":
+                loop, thread = transfer.receiver_loop, transfer._receiver_t
+                assert transfer.sender_loop is None
+                assert transfer._sender_listener_t is None
+                assert transfer._sender_executor is None
+                assert not hasattr(transfer, "sender_worker_queue")
+            else:
+                loop, thread = transfer.receiver_loop, transfer._receiver_t
+                assert transfer.sender_loop.is_running()
+                assert transfer._sender_listener_t.is_alive()
+                assert transfer._sender_executor is not None
+            assert loop.is_running()
+            assert thread.is_alive()
         finally:
             transfer.close()
+        assert loop.is_closed()
+        assert not thread.is_alive()
+        if role == "kv_both":
+            assert transfer.sender_loop.is_closed()
+            assert not transfer._sender_listener_t.is_alive()
 
 
 @pytest.mark.parametrize("content", [None, "invalid JSON"])
@@ -436,6 +329,6 @@ def test_real_vllm_topology_splits_kv_first_cache_before_inferring_blocks():
     receiver = _registered({"layer.0": target}, topology=topology())
     _copy(sender, receiver, ((1,),), [[4]])
     assert sender.num_blocks == 6
-    assert len(sender.regions) == 2
+    assert len(sender.kv_caches_base_addr) == 2
     assert torch.equal(target[:, 4], source[:, 1])
     assert torch.all(target[:, [0, 1, 2, 3, 5]] == -1)

@@ -96,7 +96,6 @@ class KVTransferStatus(IntEnum):
     FINISH = 0
     CONTINUE = 1
     ERROR = 2
-    LAYOUT_MISS = 3
 
 
 class KVTransferRequest(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
@@ -109,16 +108,6 @@ class KVTransferRequest(msgspec.Struct, omit_defaults=True):  # type: ignore[cal
     req_blocks: dict[str, tuple[str, list[list[int]]]]
     kv_caches_base_addr: list[int]
     block_lens: list[int]
-    # vLLM da9134bc layout metadata. The default permits receiving v0.23
-    # requests; MTSC always sends explicit payload lengths and layer metadata.
-    kv_block_lens: list[int] = msgspec.field(default_factory=list)
-    registered_layer_names: list[str] = msgspec.field(default_factory=list)
-    registered_layer_indices: list[int] = msgspec.field(default_factory=list)
-    registered_group_indices: list[int] = msgspec.field(default_factory=list)
-    registered_shared_group_ids: list[list[int]] = msgspec.field(default_factory=list)
-    registered_row_offsets: list[int] = msgspec.field(default_factory=list)
-    remote_pp_size: int = 1
-    layout_id: int = 0
 
 
 class KVTransferResponse(msgspec.Struct, omit_defaults=True):  # type: ignore[call-arg]
@@ -128,4 +117,3 @@ class KVTransferResponse(msgspec.Struct, omit_defaults=True):  # type: ignore[ca
     ok_reqs: list[str] | None = None
     err_reqs: list[str] | None = None
     err_msg: str | None = None
-    layout_id: int = 0
