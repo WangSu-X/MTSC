@@ -1,0 +1,8 @@
+# Match the vLLM API baseline used by MTSC. This official CPU wheel works on
+# GitHub-hosted runners without CUDA and supports Python 3.10 through 3.12.
+vllm @ https://wheels.vllm.ai/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/vllm-0.23.0%2Bcpu-cp38-abi3-manylinux_2_34_x86_64.whl
+transformers==5.12.0
+pytest==8.4.2
+pytest-asyncio==1.4.0
+msgspec==0.21.1
+pyzmq==26.4.0

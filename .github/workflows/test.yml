@@ -9,7 +9,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
     
@@ -25,7 +27,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}-${{ matrix.python-version }}
+        key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', '.github/requirements-test.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-
     
@@ -33,14 +35,27 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         # Install PyTorch CPU version for lighter CI
-        pip install torch --index-url https://download.pytorch.org/whl/cpu
-        # Install vLLM (required for config types and KV cache interfaces)
-        pip install vllm
-        # Install test dependencies
-        pip install pytest pytest-asyncio msgspec pyzmq
+        python -m pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+          --index-url https://download.pytorch.org/whl/cpu
+        # Keep the tested connector API and use a CPU build on hosted runners.
+        python -m pip install -r .github/requirements-test.txt
         # Install MTSC in editable mode
-        pip install -e .
+        python -m pip install -e .
+
+    - name: Check dependency versions and connector import
+      run: |
+        python -m pip check
+        python - <<'PY'
+        import importlib.metadata
+        import torch
+        from mtsc.connector import MTSCConnector
+
+        print("vLLM:", importlib.metadata.version("vllm"))
+        print("PyTorch:", torch.__version__)
+        print("Transformers:", importlib.metadata.version("transformers"))
+        print("Connector:", MTSCConnector.__module__)
+        PY
     
     - name: Run unit tests
       run: |
-        pytest tests/ -v --tb=short
+        python -m pytest tests/ -v --tb=short
