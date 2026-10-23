@@ -19,7 +19,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.outputs import KVConnectorOutput
 
-from .protocol import MTSCConnectorMetadata
+from .protocol import MTSCConnectorMetadata, MTSCWorkerMetadata
 from .scheduler import MTSCScheduler
 from .worker import MTSCWorker
 
@@ -194,6 +194,10 @@ class MTSCConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_kv_connector_kv_cache_events(self):
         return None
+
+    def build_connector_worker_meta(self) -> MTSCWorkerMetadata | None:
+        assert self.worker is not None
+        return self.worker.build_connector_worker_meta()
 
     def shutdown(self) -> None:
         if self.worker is not None:

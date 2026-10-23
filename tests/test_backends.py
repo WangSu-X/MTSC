@@ -978,6 +978,8 @@ class TransferBackendTest(unittest.IsolatedAsyncioTestCase):
 class WorkerReleaseTest(unittest.TestCase):
     def _worker(self):
         worker = object.__new__(MTSCWorker)
+        worker._worker_rank = 0
+        worker._completed_load_reports = []
         worker.pool = SimpleNamespace(
             poll=lambda: PoolPollResult(), take_errors=lambda: set()
         )

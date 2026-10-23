@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vllm import envs
@@ -22,6 +22,8 @@ from .protocol import (
     KVTransferPlan,
     KVTransferSourceState,
     MTSCConnectorMetadata,
+    MTSCLoadReport,
+    MTSCWorkerMetadata,
 )
 
 if TYPE_CHECKING:
@@ -50,6 +52,16 @@ class _TrackedRequest:
     block_ids: tuple[list[int], ...]
     saved_tokens: int = 0
     is_decode: bool = False
+
+
+@dataclass
+class _LoadTrace:
+    load_id: int
+    role: str
+    prompt_tokens: int
+    target_tokens: int
+    transfer_id: str | None
+    reports: dict[int, MTSCLoadReport] = field(default_factory=dict)
 
 
 def _groups(
@@ -101,6 +113,9 @@ class MTSCScheduler:
 
         # Retained through execution and any delayed block release.
         self._tracked_requests: dict[str, _TrackedRequest] = {}
+        self._load_traces: dict[str, _LoadTrace] = {}
+        self._next_load_id = 0
+        self._expected_load_workers = vllm_config.parallel_config.world_size
         # Lookup decisions are consumed once local blocks are allocated.
         self._transfer_decisions: dict[str, TransferSpec] = {} # for requests that need to transfer blocks from a remote engine e.g. D side reqeust pull P kv cache
         self._load_decisions: dict[str, KVPoolLoadSpec] = {}
@@ -229,6 +244,22 @@ class MTSCScheduler:
             tracked.block_ids = all_blocks
 
         load_spec = self._load_decisions.pop(request.request_id, None)
+        transfer_spec = self._transfer_decisions.pop(request.request_id, None)
+        load_id = 0
+        if load_spec is not None or transfer_spec is not None:
+            self._next_load_id += 1
+            load_id = self._next_load_id
+            self._load_traces[request.request_id] = _LoadTrace(
+                load_id=load_id,
+                role="D" if tracked.is_decode else "P",
+                prompt_tokens=request.num_prompt_tokens,
+                target_tokens=(
+                    transfer_spec.target_tokens
+                    if transfer_spec is not None
+                    else request.num_prompt_tokens
+                ),
+                transfer_id=params.get("transfer_id"),
+            )
         if load_spec is not None:
             self._batch_pool_loads.append(
                 KVPoolLoadRequest(
@@ -237,16 +268,17 @@ class MTSCScheduler:
                     list(request.block_hashes),
                     load_spec.computed_tokens,
                     load_spec.pool_hit_tokens,
+                    load_id=load_id,
                 )
             )
         elif self.is_producer and params.get("do_remote_decode"):
             logger.info(
                 "[MTSC] store_load: role=P request_id=%s scope=decision "
-                "elapsed_ms=0.000 loaded_tokens=0 status=skipped",
+                "prompt_tokens=%d store_tokens=0 store_ms_max=0.000 status=skipped",
                 request.request_id,
+                request.num_prompt_tokens,
             )
 
-        transfer_spec = self._transfer_decisions.pop(request.request_id, None)
         if transfer_spec is not None:
             external_blocks = _groups(blocks.get_unhashed_block_ids_all_groups())
             transfer_id = str(params.get("transfer_id", request.request_id))
@@ -262,6 +294,7 @@ class MTSCScheduler:
                     group_block_sizes=self.group_block_sizes,
                     blocks_per_sliding_window=self.blocks_per_sliding_window,
                     transfer_params=dict(params),
+                    load_id=load_id,
                 )
             )
             params["do_remote_prefill"] = False
@@ -397,6 +430,7 @@ class MTSCScheduler:
             self._load_decisions.pop(request_id, None)
             self._transfer_decisions.pop(request_id, None)
         for request_id in preempted:
+            self._load_traces.pop(request_id, None)
             self._finished_waits.pop(request_id, None)
             self._delayed_releases.discard(request_id)
             self._tracked_requests.pop(request_id, None)
@@ -458,19 +492,67 @@ class MTSCScheduler:
             )
             self._delayed_releases.add(request.request_id)
         if not delay:
+            self._load_traces.pop(request.request_id, None)
             self._tracked_requests.pop(request.request_id, None)
             self._saving_requests.discard(request.request_id)
             self._transferring_requests.discard(request.request_id)
         return delay, None
 
     def update_connector_output(self, output: KVConnectorOutput) -> None:
+        metadata = output.kv_connector_worker_meta
+        if metadata is not None:
+            assert isinstance(metadata, MTSCWorkerMetadata)
+            for report in metadata.load_reports:
+                trace = self._load_traces.get(report.request_id)
+                if trace is None or trace.load_id != report.load_id:
+                    # A preempted/cancelled attempt may finish after a retry.
+                    continue
+                trace.reports[report.worker_rank] = report
+                if len(trace.reports) == self._expected_load_workers:
+                    self._log_load_complete(report.request_id, trace)
+                    del self._load_traces[report.request_id]
+
         completed = output.finished_sending or set()
         self._delayed_releases.difference_update(completed)
         for request_id in completed:
+            self._load_traces.pop(request_id, None)
             self._finished_waits.pop(request_id, None)
             self._tracked_requests.pop(request_id, None)
             self._saving_requests.discard(request_id)
             self._transferring_requests.discard(request_id)
+
+    def _log_load_complete(self, request_id: str, trace: _LoadTrace) -> None:
+        reports = list(trace.reports.values())
+
+        def token_range(name: str) -> str:
+            values = [getattr(report, name) for report in reports]
+            low, high = min(values), max(values)
+            return str(low) if low == high else f"{low}..{high}"
+
+        logger.info(
+            "[MTSC] %s: role=%s request_id=%s transfer_id=%s load_id=%d "
+            "prompt_tokens=%d target_tokens=%d local_tokens=%s "
+            "store_tokens=%s pd_tokens=%s store_ms_max=%.3f "
+            "pd_ms_max=%.3f total_ms_max=%.3f workers=%d/%d "
+            "store_status=%s status=%s",
+            "load_complete" if trace.role == "D" else "store_load",
+            trace.role,
+            request_id,
+            trace.transfer_id,
+            trace.load_id,
+            trace.prompt_tokens,
+            trace.target_tokens,
+            token_range("local_tokens"),
+            token_range("store_tokens"),
+            token_range("pd_tokens"),
+            max(report.store_ms for report in reports),
+            max(report.pd_ms for report in reports),
+            max(report.total_ms for report in reports),
+            len(reports),
+            self._expected_load_workers,
+            ",".join(sorted({report.store_status for report in reports})),
+            "error" if any(report.status == "error" for report in reports) else "ok",
+        )
 
     def has_pending_push_work(self) -> bool:
         return bool(self._delayed_releases)
@@ -479,4 +561,5 @@ class MTSCScheduler:
         return self.lookup_client.reset()
 
     def close(self) -> None:
+        self._load_traces.clear()
         self.lookup_client.close()

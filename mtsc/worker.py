@@ -20,6 +20,8 @@ from .protocol import (
     KVPoolSaveRequest,
     KVTransferPlan,
     MTSCConnectorMetadata,
+    MTSCLoadReport,
+    MTSCWorkerMetadata,
 )
 from .utils import new_device_event
 
@@ -59,6 +61,7 @@ class _TransferState:
     store_ms: float = 0.0
     store_status: str = "skipped"
     pd_started_at: float = 0.0
+    actual_pool_prefix: int = 0
 
 
 @dataclass
@@ -93,6 +96,8 @@ class MTSCWorker:
         self._on_transfer: dict[str, _TransferState] = {}
         self._finished_waits: dict[str, _FinishedWaitState] = {}
         self._load_errors: set[int] = set()
+        self._worker_rank = config.parallel_config.rank
+        self._completed_load_reports: list[MTSCLoadReport] = []
         self._closed = False
 
     def register_kv_caches(
@@ -167,6 +172,7 @@ class MTSCWorker:
         plan = state.plan
         suffix = self._suffix_blocks(plan, actual_pool_prefix)
         state.suffix_block_ids = suffix
+        state.actual_pool_prefix = actual_pool_prefix
         params = plan.transfer_params
         event = RecvEvent(
             plan.request_id,
@@ -217,9 +223,26 @@ class MTSCWorker:
             result.request_id: result for result in pool_load_results
         }
         finished_recv = set()
-        for request_id in pool_load_results_dict:
-            self._on_load_requests.pop(request_id, None)
+        for request_id, result in pool_load_results_dict.items():
+            load_meta = self._on_load_requests.pop(request_id, None)
             if request_id not in self._on_transfer:
+                if load_meta is not None:
+                    status = "error" if result.error else "ok"
+                    self._completed_load_reports.append(
+                        MTSCLoadReport(
+                            request_id=request_id,
+                            load_id=load_meta.load_id,
+                            worker_rank=self._worker_rank,
+                            local_tokens=load_meta.start_token,
+                            store_tokens=result.loaded_tokens - load_meta.start_token,
+                            pd_tokens=0,
+                            store_ms=result.elapsed_ms,
+                            pd_ms=0.0,
+                            total_ms=result.elapsed_ms,
+                            store_status=status,
+                            status=status,
+                        )
+                    )
                 finished_recv.add(request_id)
 
         recv_events: list[RecvEvent] = []
@@ -235,7 +258,7 @@ class MTSCWorker:
             elif state.stage == "POOL_LOADING" and request_id in pool_load_results_dict:
                 load_result = pool_load_results_dict[request_id]
                 actual_pool_prefix = load_result.loaded_tokens
-                state.store_ms = (time.monotonic() - state.load_started_at) * 1000
+                state.store_ms = load_result.elapsed_ms
                 state.store_status = "error" if load_result.error else "ok"
                 logger.debug(
                     "[MTSC] store_load_complete: request_id=%s L=%d H=%d A=%d",
@@ -256,19 +279,22 @@ class MTSCWorker:
             state = self._on_transfer.pop(request_id, None)
             if state is not None:
                 finished_at = time.monotonic()
-                logger.info(
-                    "[MTSC] load_complete: role=D request_id=%s transfer_id=%s "
-                    "tp_rank=%d store_ms=%.3f pd_ms=%.3f total_ms=%.3f "
-                    "store_status=%s suffix_blocks=%d status=%s",
-                    request_id,
-                    state.plan.transfer_id,
-                    self.transfer.tp_rank,
-                    state.store_ms,
-                    (finished_at - state.pd_started_at) * 1000,
-                    (finished_at - state.load_started_at) * 1000,
-                    state.store_status,
-                    sum(len(group) for group in state.suffix_block_ids),
-                    "error" if result.error else "ok",
+                self._completed_load_reports.append(
+                    MTSCLoadReport(
+                        request_id=request_id,
+                        load_id=state.plan.load_id,
+                        worker_rank=self._worker_rank,
+                        local_tokens=state.plan.computed_tokens,
+                        store_tokens=(
+                            state.actual_pool_prefix - state.plan.computed_tokens
+                        ),
+                        pd_tokens=state.plan.target_tokens - state.actual_pool_prefix,
+                        store_ms=state.store_ms,
+                        pd_ms=(finished_at - state.pd_started_at) * 1000,
+                        total_ms=(finished_at - state.load_started_at) * 1000,
+                        store_status=state.store_status,
+                        status="error" if result.error else "ok",
+                    )
                 )
                 if result.error is not None:
                     # Record suffix blocks as load errors when transfer fails
@@ -414,10 +440,18 @@ class MTSCWorker:
         errors, self._load_errors = self._load_errors, set()
         return errors
 
+    def build_connector_worker_meta(self) -> MTSCWorkerMetadata | None:
+        if not self._completed_load_reports:
+            return None
+        metadata = MTSCWorkerMetadata(self._completed_load_reports)
+        self._completed_load_reports = []
+        return metadata
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self._completed_load_reports.clear()
         try:
             self.transfer.close()
         finally:

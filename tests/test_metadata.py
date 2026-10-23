@@ -26,10 +26,11 @@ from mtsc.worker import MTSCWorker
 
 def _scheduler(*, consumer=True, hit=80, extra=None, role=None):
     config = SimpleNamespace(
+        parallel_config=SimpleNamespace(world_size=1, rank=0),
         kv_transfer_config=SimpleNamespace(
             kv_role=role or ("kv_consumer" if consumer else "kv_producer"),
             kv_connector_extra_config=extra if extra is not None else {},
-        )
+        ),
     )
     caches = SimpleNamespace(
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))],
@@ -579,7 +580,9 @@ class MetadataFlowTest(unittest.TestCase):
             ({request.request_id}, None),
         )
         scheduler.update_connector_output(
-            SimpleNamespace(finished_sending={request.request_id})
+            SimpleNamespace(
+                finished_sending={request.request_id}, kv_connector_worker_meta=None
+            )
         )
         self.assertFalse(scheduler.has_pending_push_work())
         self.assertEqual(scheduler._tracked_requests, {})

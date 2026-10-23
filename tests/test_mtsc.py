@@ -126,6 +126,8 @@ class TwoStageBoundaryTest(unittest.TestCase):
                 self.requests.extend(events)
 
         worker = object.__new__(MTSCWorker)
+        worker._worker_rank = 0
+        worker._completed_load_reports = []
         worker.transfer = PD()
         plan = replace(
             _plan(),
@@ -201,6 +203,8 @@ class FailureFallbackTest(unittest.TestCase):
     @staticmethod
     def _worker(store, pd) -> MTSCWorker:
         worker = object.__new__(MTSCWorker)
+        worker._worker_rank = 0
+        worker._completed_load_reports = []
         worker.pool = store
         worker.transfer = pd
         worker._on_save_requests = {}
@@ -610,6 +614,8 @@ class MLALayoutTest(unittest.TestCase):
 class CompletionAggregationTest(unittest.TestCase):
     def test_store_and_pd_are_both_required(self) -> None:
         worker = object.__new__(MTSCWorker)
+        worker._worker_rank = 0
+        worker._completed_load_reports = []
         worker._on_save_requests = {"p-1": KVPoolSaveRequest("p-1", ([1],), [], 0, 16)}
         worker._finished_waits = {
             "p-1": _FinishedWaitState(FinishedWait(store_save=True, kv_transfer=True))
@@ -651,6 +657,8 @@ class PreemptionLifecycleTest(unittest.TestCase):
                 return
 
         worker = object.__new__(MTSCWorker)
+        worker._worker_rank = 0
+        worker._completed_load_reports = []
         worker.pool = Store()
         worker.transfer = PD()
         worker._on_save_requests = {}

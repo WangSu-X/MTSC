@@ -9,7 +9,10 @@ from enum import IntEnum
 from typing import Any
 
 import msgspec
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
+)
 from vllm.v1.core.kv_cache_utils import BlockHash
 
 
@@ -30,6 +33,7 @@ class KVPoolLoadRequest:
     block_hashes: list[BlockHash]
     start_token: int
     end_token: int
+    load_id: int = 0
 
 
 @dataclass
@@ -58,6 +62,39 @@ class KVTransferPlan:
     group_block_sizes: tuple[int, ...]
     blocks_per_sliding_window: tuple[int, ...]
     transfer_params: dict[str, Any]
+    load_id: int = 0
+
+
+@dataclass(frozen=True)
+class MTSCLoadReport:
+    """One worker's terminal load record. Token counts are logical, not TP sums.
+
+    pd_tokens describes the requested suffix; only status=ok confirms that
+    the suffix is usable. Store tokens describe the actual usable prefix.
+    """
+
+    request_id: str
+    load_id: int
+    worker_rank: int
+    local_tokens: int
+    store_tokens: int
+    pd_tokens: int
+    store_ms: float
+    pd_ms: float
+    total_ms: float
+    store_status: str
+    status: str
+
+
+@dataclass
+class MTSCWorkerMetadata(KVConnectorWorkerMetadata):
+    """Completed load records, drained once per model-runner step."""
+
+    load_reports: list[MTSCLoadReport] = field(default_factory=list)
+
+    def aggregate(self, other: KVConnectorWorkerMetadata) -> MTSCWorkerMetadata:
+        assert isinstance(other, MTSCWorkerMetadata)
+        return MTSCWorkerMetadata(self.load_reports + other.load_reports)
 
 
 @dataclass(frozen=True)

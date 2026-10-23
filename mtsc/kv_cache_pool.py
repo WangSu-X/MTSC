@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import logging
 import math
 import os
 import socket
@@ -118,6 +117,7 @@ class LoadResult:
     request_id: str
     loaded_tokens: int
     error: str | None = None
+    elapsed_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1357,18 +1357,20 @@ class MooncakeKVCachePool:
                     )
                 if outcome.invalid:
                     self._invalid[request_id] = outcome.invalid
+                elapsed_ms = (time.monotonic() - state.started_at) * 1000
                 result.loads.append(
-                    LoadResult(request_id, outcome.loaded_tokens, outcome.error)
+                    LoadResult(
+                        request_id, outcome.loaded_tokens, outcome.error, elapsed_ms
+                    )
                 )
-                logger.log(
-                    logging.INFO if self.role != "D" else logging.DEBUG,
+                logger.debug(
                     "[MTSC] store_load: role=%s request_id=%s tp_rank=%d "
                     "elapsed_ms=%.3f start_token=%d end_token=%d "
                     "loaded_tokens=%d status=%s",
                     self.role,
                     request_id,
                     self.tp_rank,
-                    (time.monotonic() - state.started_at) * 1000,
+                    elapsed_ms,
                     event.start_load,
                     event.end_load,
                     outcome.loaded_tokens - event.start_load,
