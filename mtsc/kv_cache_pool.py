@@ -1066,9 +1066,6 @@ class MooncakeKVCachePool:
         if ret != 0:
             raise RuntimeError(f"Mooncake Store setup failed: {ret}")
         self.replicate_config = ReplicateConfig()
-        self.replicate_config.model_name = (
-            os.getenv("MOONCAKE_MODEL_NAME") or self.metadata.model_name
-        )
         preferred = get_configured_preferred_segment(extra)
         if preferred is not None:
             self.replicate_config.preferred_segment = preferred
