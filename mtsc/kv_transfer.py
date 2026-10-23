@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import math
 import os
 import threading
@@ -174,7 +173,7 @@ class _ReceiveFenceError(RuntimeError):
 
 
 logger = init_logger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(envs.VLLM_LOGGING_LEVEL)
 
 
 def _run_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -538,7 +537,9 @@ class MooncakeKVTransfer:
 
         # Share transport defaults with Store while retaining upstream's
         # explicit extra-config overrides and the PD metadata handshake.
-        logger.info("MTSC direct TE: protocol=%s device_name=%r", protocol, device_name)
+        logger.debug(
+            "[MTSC] transfer_init: protocol=%s device_name=%r", protocol, device_name
+        )
         self.protocol = protocol
         self.engine = TransferEngine()
         self.hostname = get_ip()
@@ -891,7 +892,8 @@ class MooncakeKVTransfer:
                 )
                 if not done:
                     logger.warning(
-                        "Timeout waiting for P side ready: %s", list(pending_reqs)
+                        "[MTSC] pd_send: request_ids=%s status=wait_ready_timeout",
+                        list(pending_reqs),
                     )
                     response = KVTransferResponse(
                         KVTransferStatus.FINISH,
@@ -993,7 +995,7 @@ class MooncakeKVTransfer:
                 and send_meta.sending == 0
             ):
                 logger.warning(
-                    "P request %s expired before sending completed", send_meta.p_req_id
+                    "[MTSC] pd_send: request_id=%s status=expired", send_meta.p_req_id
                 )
                 results.append(TransferResult(send_meta.p_req_id, "Transfer timed out"))
                 del self.reqs_need_send[transfer_id]
@@ -1155,15 +1157,17 @@ class MooncakeKVTransfer:
                         for pointer in self._registered_storage
                     ]
                     if any(result != 0 for result in results):
-                        logger.warning("MTSC TE memory unregistration partially failed")
+                        logger.warning(
+                            "[MTSC] transfer_unregister: status=partial_failure"
+                        )
                 else:
                     ret = self.engine.batch_unregister_memory(self._registered_storage)
                     if ret != 0:
                         logger.warning(
-                            "MTSC TE memory unregistration failed: ret=%s", ret
+                            "[MTSC] transfer_unregister: status=error ret=%s", ret
                         )
             except Exception as exc:  # noqa: BLE001 - binding teardown boundary
-                logger.warning("MTSC TE memory unregistration failed: error=%s", exc)
+                logger.warning("[MTSC] transfer_unregister: status=error error=%s", exc)
             finally:
                 self._registered_storage = []
         self.reqs_need_send.clear()
@@ -1228,7 +1232,7 @@ class MooncakeKVTransfer:
             try:
                 await self.send_kv_to_decode(identity, payload, socket)
             except Exception as exc:  # noqa: BLE001 - sender worker boundary
-                logger.warning("MTSC sender worker failed: error=%s", exc)
+                logger.warning("[MTSC] pd_send: status=worker_error error=%s", exc)
             finally:
                 self.sender_worker_queue.task_done()
 
@@ -1244,7 +1248,7 @@ class MooncakeKVTransfer:
                 )
             except Exception as exc:  # noqa: BLE001 - per-request validation
                 logger.warning(
-                    "MTSC transfer plan failed: request_id=%s error=%s", d_req_id, exc
+                    "[MTSC] pd_plan: request_id=%s status=error error=%s", d_req_id, exc
                 )
                 err_reqs.append(d_req_id)
                 if err_msg is None:
@@ -1367,7 +1371,7 @@ class MooncakeKVTransfer:
                     self._remote_tp_size[remote_engine_id] = len(workers)
         except Exception as exc:
             logger.error(
-                "Failed to connect to bootstrap server %s: %s",
+                "[MTSC] bootstrap_query: address=%s status=error error=%s",
                 remote_bootstrap_addr,
                 exc,
             )
@@ -1389,7 +1393,7 @@ class MooncakeKVTransfer:
 
         if remote_engine_id not in self._remote_agents:
             logger.error(
-                "Failed to find remote engine_id %s from bootstrap server %s",
+                "[MTSC] bootstrap_query: remote_engine_id=%s address=%s status=engine_not_found",
                 remote_engine_id,
                 remote_bootstrap_addr,
             )
@@ -1404,8 +1408,8 @@ class MooncakeKVTransfer:
         self.receive_kv(remote_engine_id, pull_metas)
 
     def _finish_receive(self, event, failed, future=None) -> None:
-        logger.info(
-            "MTSC D receive done: request_id=%s failed=%s", event.request_id, failed
+        logger.debug(
+            "[MTSC] pd_recv_ack: request_id=%s failed=%s", event.request_id, failed
         )
         if failed:
             self._failed_recv.add(event.request_id)
@@ -1473,7 +1477,9 @@ class MooncakeKVTransfer:
                     break
         except (Exception, asyncio.CancelledError) as exc:
             logger.warning(
-                "MTSC D peer pull failed: address=%s error=%s", worker_addr, exc
+                "[MTSC] pd_recv_peer: address=%s status=error error=%s",
+                worker_addr,
+                exc,
             )
             if published and remaining:
                 if self._receive_error is None:

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(envs.VLLM_LOGGING_LEVEL)
 
 
 @dataclass
@@ -176,7 +176,8 @@ class MTSCScheduler:
             )
             if pool_hit is None:
                 logger.debug(
-                    "MTSC pool lookup pending: request_id=%s", request.request_id
+                    "[MTSC] store_lookup: request_id=%s status=pending",
+                    request.request_id,
                 )
                 return None, False
 
@@ -200,7 +201,7 @@ class MTSCScheduler:
             target_tokens=target
         )
         logger.debug(
-            "MTSC transfer load planned: request_id=%s L=%d H=%d T=%d",
+            "[MTSC] pd_plan: request_id=%s L=%d H=%d T=%d",
             request.request_id,
             num_computed_tokens,
             pool_hit,
@@ -238,6 +239,12 @@ class MTSCScheduler:
                     load_spec.pool_hit_tokens,
                 )
             )
+        elif self.is_producer and params.get("do_remote_decode"):
+            logger.info(
+                "[MTSC] store_load: role=P request_id=%s scope=decision "
+                "elapsed_ms=0.000 loaded_tokens=0 status=skipped",
+                request.request_id,
+            )
 
         transfer_spec = self._transfer_decisions.pop(request.request_id, None)
         if transfer_spec is not None:
@@ -273,7 +280,7 @@ class MTSCScheduler:
                 self._transferring_requests.add(request.request_id)
             else:
                 logger.warning(
-                    "MTSC producer request lacks transfer_id: request_id=%s",
+                    "[MTSC] pd_prepare: request_id=%s status=missing_transfer_id",
                     request.request_id,
                 )
 

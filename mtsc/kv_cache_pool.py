@@ -172,7 +172,7 @@ class _CompatBlobBlockHashes(Sequence[BlockHash]):
 BlobBlockHashes = _CompatBlobBlockHashes
 
 logger = init_logger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(envs.VLLM_LOGGING_LEVEL)
 
 
 def normalize_string_override(value: Any) -> str | None:
@@ -204,8 +204,8 @@ def get_configured_preferred_segment(
 
     env_value = normalize_string_override(os.environ.get("MOONCAKE_PREFERRED_SEGMENT"))
     if env_value is not None:
-        logger.info(
-            "Mooncake preferred_segment from MOONCAKE_PREFERRED_SEGMENT: %s",
+        logger.debug(
+            "[MTSC] store_config: source=MOONCAKE_PREFERRED_SEGMENT preferred_segment=%s",
             env_value,
         )
         return env_value
@@ -803,7 +803,9 @@ class StoreLookupClient:
             return future.result()
         except Exception as exc:  # noqa: BLE001 - worker/RPC boundary
             logger.warning(
-                "MTSC Store lookup failed: request_id=%s error=%s", request_id, exc
+                "[MTSC] store_lookup: request_id=%s status=error error=%s",
+                request_id,
+                exc,
             )
             return 0
         finally:
@@ -828,7 +830,7 @@ class StoreLookupClient:
         try:
             return self._executor.submit(call).result()
         except Exception as exc:  # noqa: BLE001 - admin RPC boundary
-            logger.warning("MTSC Store reset failed: error=%s", exc)
+            logger.warning("[MTSC] store_reset: status=error error=%s", exc)
             return False
 
     def close(self) -> None:
@@ -872,7 +874,7 @@ class StoreLookupServer:
                 except Exception:
                     # Keep REP alive after a backend failure; the scheduler
                     # client degrades query errors to a cache miss.
-                    logger.exception("MTSC Pool lookup failed")
+                    logger.exception("[MTSC] store_lookup: status=error")
                     self._socket.send(_ERR)
             elif kind == _RESET:
                 try:
@@ -880,7 +882,7 @@ class StoreLookupServer:
                     self._owner.store.remove_all(force=True)
                     self._socket.send(_OK)
                 except Exception:
-                    logger.exception("MTSC Store reset failed")
+                    logger.exception("[MTSC] store_reset: status=error")
                     self._socket.send(_ERR)
             else:
                 self._socket.send(_ERR)
@@ -909,6 +911,10 @@ class _SaveState:
     running: Future[None] | None = None
     pending: list[SaveEvent] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Cover the saves collected by one SaveResult, including merged work.
+    started_at: float = field(default_factory=time.monotonic)
+    start_token: int = 0
+    end_token: int = 0
 
 
 @dataclass(frozen=True)
@@ -943,6 +949,11 @@ class MooncakeKVCachePool:
             raise ImportError("Mooncake Python store bindings are required") from exc
 
         assert config.kv_transfer_config is not None
+        self.role = {
+            "kv_producer": "P",
+            "kv_consumer": "D",
+            "kv_both": "PD",
+        }[config.kv_transfer_config.kv_role]
         model_config = config.model_config
         parallel_config = config.parallel_config
         extra = config.kv_transfer_config.kv_connector_extra_config
@@ -1099,8 +1110,8 @@ class MooncakeKVCachePool:
                 raise ValueError(
                     "num_gpu_blocks must be initialized before MooncakeKVCachePool"
                 )
-            logger.info(
-                "MTSC Store inferred num_blocks=%d from KV cache tensors",
+            logger.debug(
+                "[MTSC] store_register: num_blocks=%d source=kv_cache_tensors",
                 self.num_blocks,
             )
         seen: set[int] = set()
@@ -1150,7 +1161,7 @@ class MooncakeKVCachePool:
         for database in self.databases:
             database.set_kv_caches_base_addr(addresses)
             database.set_block_len(block_lengths)
-        logger.info("MTSC Store registered %d regions", len(addresses))
+        logger.debug("[MTSC] store_register: regions=%d status=ok", len(addresses))
         self.kv_caches = dict(kv_caches)
         self._registered = True
 
@@ -1269,7 +1280,15 @@ class MooncakeKVCachePool:
     def save(self, event: SaveEvent) -> None:
         self._validate(event, event.start_save, event.end_save)
         with self._task_lock:
-            state = self._save_states.setdefault(event.request_id, _SaveState())
+            state = self._save_states.get(event.request_id)
+            if state is None:
+                state = _SaveState(
+                    start_token=event.start_save, end_token=event.end_save
+                )
+                self._save_states[event.request_id] = state
+            else:
+                state.start_token = min(state.start_token, event.start_save)
+                state.end_token = max(state.end_token, event.end_save)
             if state.pending:
                 merged = self._merge(
                     state.pending[-1],
@@ -1344,6 +1363,20 @@ class MooncakeKVCachePool:
                 result.loads.append(
                     LoadResult(request_id, outcome.loaded_tokens, outcome.error)
                 )
+                logger.log(
+                    logging.INFO if self.role != "D" else logging.DEBUG,
+                    "[MTSC] store_load: role=%s request_id=%s tp_rank=%d "
+                    "elapsed_ms=%.3f start_token=%d end_token=%d "
+                    "loaded_tokens=%d status=%s",
+                    self.role,
+                    request_id,
+                    self.tp_rank,
+                    (time.monotonic() - state.started_at) * 1000,
+                    event.start_load,
+                    event.end_load,
+                    outcome.loaded_tokens - event.start_load,
+                    "error" if outcome.error else "ok",
+                )
                 del self._loads[request_id]
             for request_id, state in list(self._save_states.items()):
                 self._advance_save(state)
@@ -1353,6 +1386,18 @@ class MooncakeKVCachePool:
                             request_id,
                             "; ".join(state.errors) or None,
                         )
+                    )
+                    logger.debug(
+                        "[MTSC] store_save: role=%s request_id=%s tp_rank=%d "
+                        "scope=batch elapsed_ms=%.3f start_token=%d "
+                        "end_token=%d status=%s",
+                        self.role,
+                        request_id,
+                        self.tp_rank,
+                        (time.monotonic() - state.started_at) * 1000,
+                        state.start_token,
+                        state.end_token,
+                        "error" if state.errors else "ok",
                     )
                     del self._save_states[request_id]
         return result
@@ -1373,7 +1418,10 @@ class MooncakeKVCachePool:
                         state.running.result()
                     except Exception as exc:  # noqa: BLE001 - preemption I/O fence
                         # Failed persistence does not invalidate source KV.
-                        logger.debug("MTSC PUT failed during preemption: %s", exc)
+                        logger.debug(
+                            "[MTSC] store_save: scope=preemption status=error error=%s",
+                            exc,
+                        )
             self._fence_loads({request_id})
             self._invalid.pop(request_id, None)
 
@@ -1567,7 +1615,7 @@ class MooncakeKVCachePool:
             except Exception as exc:  # noqa: BLE001 - Mooncake binding boundary
                 failed.update(block_ids)
                 logger.warning(
-                    "MTSC Store GET failed: request_id=%s error=%s",
+                    "[MTSC] store_load: request_id=%s status=error error=%s",
                     event.request_id,
                     exc,
                 )
@@ -1619,7 +1667,8 @@ class MooncakeKVCachePool:
         )
         if any(status < 0 for status in result):
             logger.warning(
-                "MTSC Store PUT partially failed: request_id=%s", event.request_id
+                "[MTSC] store_save: request_id=%s status=partial_failure",
+                event.request_id,
             )
             raise RuntimeError("Mooncake Store PUT partially failed")
 
@@ -1632,8 +1681,7 @@ class MooncakeKVCachePool:
                     state.future.result()
                 except Exception as exc:  # noqa: BLE001 - I/O fence
                     logger.warning(
-                        "MTSC Store GET failed while fencing preemption: "
-                        "request_id=%s error=%s",
+                        "[MTSC] store_load: request_id=%s scope=preemption status=error error=%s",
                         request_id,
                         exc,
                     )

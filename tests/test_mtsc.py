@@ -185,6 +185,7 @@ class FailureFallbackTest(unittest.TestCase):
             self.receives: list[tuple] = []
             self.reformatted: list[tuple[list[list[int]], int]] = []
             self.tp_size = 1
+            self.tp_rank = 0
 
         def recv(self, events) -> None:
             self.receives.extend(events)
@@ -779,6 +780,8 @@ class PreemptionLifecycleTest(unittest.TestCase):
         store = object.__new__(MooncakeKVCachePool)
         store._task_lock = threading.RLock()
         store.load_timeout = 1.0
+        store.role = "P"
+        store.tp_rank = 0
         store.databases = [SimpleNamespace(block_size=16)]
         store._loads = {
             "r1": _LoadState(
@@ -837,12 +840,16 @@ class ProxySpecTest(unittest.TestCase):
             "prompt": "hello",
             "stream": True,
             "max_tokens": 8,
+            "min_tokens": 8,
             "stream_options": {"include_usage": True},
         }
         p_body = self.proxy._prefill_body(original, Session())
         d_body = self.proxy._decode_body(original, Session())
         self.assertFalse(p_body["stream"])
         self.assertEqual(p_body["max_tokens"], 1)
+        self.assertEqual(p_body["min_tokens"], 1)
+        self.assertEqual(d_body["min_tokens"], 8)
+        self.assertEqual(original["min_tokens"], 8)
         self.assertNotIn("stream_options", p_body)
         self.assertTrue(p_body["kv_transfer_params"]["do_remote_decode"])
         self.assertTrue(d_body["kv_transfer_params"]["do_remote_prefill"])

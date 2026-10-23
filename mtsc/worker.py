@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(envs.VLLM_LOGGING_LEVEL)
 
 
 def _backend(config, key: str) -> str:
@@ -54,6 +55,10 @@ class _TransferState:
     plan: KVTransferPlan
     stage: str
     suffix_block_ids: list[list[int]] = field(default_factory=list)
+    load_started_at: float = field(default_factory=time.monotonic)
+    store_ms: float = 0.0
+    store_status: str = "skipped"
+    pd_started_at: float = 0.0
 
 
 @dataclass
@@ -105,7 +110,7 @@ class MTSCWorker:
             finally:
                 self.pool.close()
             raise
-        logger.info("MTSC registered pool and transfer data planes")
+        logger.debug("[MTSC] register: pool=ready transfer=ready")
 
     def handle_preemptions(self, metadata: MTSCConnectorMetadata) -> None:
         request_ids = metadata.preempted_request_ids
@@ -173,8 +178,9 @@ class MTSCWorker:
         )
         recv_events.append(event)
         state.stage = "TRANSFER_LOADING"
+        state.pd_started_at = time.monotonic()
         logger.debug(
-            "MTSC transfer suffix started: request_id=%s A=%d T=%d blocks=%d",
+            "[MTSC] pd_recv_start: request_id=%s A=%d T=%d suffix_blocks=%d",
             plan.request_id,
             actual_pool_prefix,
             plan.target_tokens,
@@ -220,10 +226,19 @@ class MTSCWorker:
         for request_id, state in list(self._on_transfer.items()):
             if state.stage == "POOL_DONE":
                 actual_pool_prefix = state.plan.computed_tokens
-            elif state.stage == "POOL_LOADING" and request_id in pool_load_results_dict:
-                actual_pool_prefix = pool_load_results_dict[request_id].loaded_tokens
                 logger.debug(
-                    "MTSC pool load finished: request_id=%s computed=%d pool_hit=%d actual=%d",
+                    "[MTSC] store_load: role=D request_id=%s tp_rank=%d "
+                    "elapsed_ms=0.000 loaded_tokens=0 status=skipped",
+                    request_id,
+                    self.transfer.tp_rank,
+                )
+            elif state.stage == "POOL_LOADING" and request_id in pool_load_results_dict:
+                load_result = pool_load_results_dict[request_id]
+                actual_pool_prefix = load_result.loaded_tokens
+                state.store_ms = (time.monotonic() - state.load_started_at) * 1000
+                state.store_status = "error" if load_result.error else "ok"
+                logger.debug(
+                    "[MTSC] store_load_complete: request_id=%s L=%d H=%d A=%d",
                     request_id,
                     state.plan.computed_tokens,
                     state.plan.pool_hit_tokens,
@@ -240,6 +255,21 @@ class MTSCWorker:
             request_id = result.request_id
             state = self._on_transfer.pop(request_id, None)
             if state is not None:
+                finished_at = time.monotonic()
+                logger.info(
+                    "[MTSC] load_complete: role=D request_id=%s transfer_id=%s "
+                    "tp_rank=%d store_ms=%.3f pd_ms=%.3f total_ms=%.3f "
+                    "store_status=%s suffix_blocks=%d status=%s",
+                    request_id,
+                    state.plan.transfer_id,
+                    self.transfer.tp_rank,
+                    state.store_ms,
+                    (finished_at - state.pd_started_at) * 1000,
+                    (finished_at - state.load_started_at) * 1000,
+                    state.store_status,
+                    sum(len(group) for group in state.suffix_block_ids),
+                    "error" if result.error else "ok",
+                )
                 if result.error is not None:
                     # Record suffix blocks as load errors when transfer fails
                     self._load_errors.update(
@@ -253,6 +283,7 @@ class MTSCWorker:
         return finished_recv
 
     def update_load_metadata(self, metadata: MTSCConnectorMetadata) -> None:
+        load_started_at = time.monotonic()
         for load_meta in metadata.pool_loads:
             self.pool.load(
                 LoadEvent(
@@ -269,7 +300,7 @@ class MTSCWorker:
         for transfer_plan in metadata.transfer_plans:
             if transfer_plan.request_id in self._on_transfer:
                 logger.warning(
-                    "MTSC duplicate transfer_plan ignored: request_id=%s",
+                    "[MTSC] pd_plan: request_id=%s status=duplicate_ignored",
                     transfer_plan.request_id,
                 )
                 continue
@@ -279,10 +310,10 @@ class MTSCWorker:
                 else "POOL_DONE"
             )
             self._on_transfer[transfer_plan.request_id] = _TransferState(
-                transfer_plan, stage
+                transfer_plan, stage, load_started_at=load_started_at
             )
             logger.debug(
-                "MTSC transfer state created: request_id=%s stage=%s computed=%d pool_hit=%d target=%d",
+                "[MTSC] pd_plan: request_id=%s stage=%s L=%d H=%d T=%d",
                 transfer_plan.request_id,
                 stage,
                 transfer_plan.computed_tokens,

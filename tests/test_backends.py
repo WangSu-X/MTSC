@@ -122,6 +122,7 @@ def _pool():
     pool.replicate_config = None
     pool.put_step = 1
     pool.tp_rank = 0
+    pool.role = "P"
     pool.tp_size = 1
     pool.num_blocks = 100
     pool.kv_caches = {}

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(envs.VLLM_LOGGING_LEVEL)
 
 
 def _config_bool(value: Any, default: bool) -> bool:
@@ -81,8 +81,8 @@ class MTSCConnector(KVConnectorBase_V1, SupportsHMA):
             self.scheduler = MTSCScheduler(vllm_config, kv_cache_config, decode_save)
         else:
             self.worker = MTSCWorker(vllm_config, kv_cache_config)
-        logger.info(
-            "Initialized MTSC connector: process_role=%s kv_role=%s",
+        logger.debug(
+            "[MTSC] init: process_role=%s kv_role=%s",
             role.name,
             vllm_config.kv_transfer_config.kv_role,
         )

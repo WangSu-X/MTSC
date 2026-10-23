@@ -188,7 +188,7 @@ class JsonlMetricsWriter:
                     await asyncio.to_thread(self._append, self.path, line)
                 except Exception:
                     self.write_failures += 1
-                    logger.exception("MTSC metrics write failed")
+                    logger.exception("[MTSC] metrics_write: status=error")
             finally:
                 self._queue.task_done()
 
@@ -284,6 +284,8 @@ class PDProxy:
         result["stream"] = False
         result.pop("stream_options", None)
         result["max_tokens"] = 1
+        if "min_tokens" in result:
+            result["min_tokens"] = min(result["min_tokens"], 1)
         if "max_completion_tokens" in result:
             result["max_completion_tokens"] = 1
         result["kv_transfer_params"] = {
@@ -445,7 +447,7 @@ class PDProxy:
                 prefill_task.cancel()
             await asyncio.gather(prefill_task, return_exceptions=True)
             logger.warning(
-                "MTSC proxy request failed: request_id=%s error=%s",
+                "[MTSC] proxy_request: request_id=%s status=error error=%s",
                 session.request_id,
                 exc,
             )
