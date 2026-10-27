@@ -132,6 +132,7 @@ class MetadataFlowTest(unittest.TestCase):
         second = replace(first, request_id="request-2", transfer_id="transfer-2")
         metadata.transfer_plans = [first, second]
         worker = _worker(config)
+        worker.start_load_kv(metadata)
         worker.get_finished(set(), metadata)
         worker.transfer.recv.assert_not_called()
         worker.pool.poll.return_value = PoolPollResult(
@@ -225,6 +226,7 @@ class MetadataFlowTest(unittest.TestCase):
         self.assertEqual(metadata.pool_saves, [])
         worker = _worker(config)
 
+        worker.start_load_kv(metadata)
         self.assertEqual(worker.get_finished(set(), metadata), (None, None))
         load = worker.pool.load.call_args.args[0]
         self.assertEqual((load.start_load, load.end_load), (32, 80))
@@ -263,6 +265,7 @@ class MetadataFlowTest(unittest.TestCase):
         metadata = scheduler.build_connector_meta(_output())
         self.assertEqual(metadata.transfer_plans, [])
         worker = _worker(config)
+        worker.start_load_kv(metadata)
         worker.get_finished(set(), metadata)
         self.assertIn(request.request_id, worker._on_load_requests)
         worker.pool.poll.return_value = PoolPollResult(
@@ -285,6 +288,7 @@ class MetadataFlowTest(unittest.TestCase):
         metadata = scheduler.build_connector_meta(_output())
         self.assertEqual(metadata.pool_loads, [])
         worker = _worker(config)
+        worker.start_load_kv(metadata)
         worker.get_finished(set(), metadata)
         (recv,) = worker.transfer.recv.call_args.args[0]
         self.assertEqual(recv.block_ids, ((),))
@@ -308,6 +312,7 @@ class MetadataFlowTest(unittest.TestCase):
             loads=[LoadResult("request-1", 48)]
         )
         worker.pool.take_errors.return_value = {13, 14}
+        worker.start_load_kv(metadata)
         self.assertEqual(worker.get_finished(set(), metadata), (None, {"request-1"}))
         self.assertEqual(worker.get_block_ids_with_load_errors(), {13, 14})
         worker.transfer.recv.assert_not_called()
@@ -323,6 +328,7 @@ class MetadataFlowTest(unittest.TestCase):
     def test_worker_preemption_clears_active_load_and_transfer(self):
         _, config, metadata = self._decode_metadata()
         worker = _worker(config)
+        worker.start_load_kv(metadata)
         worker.get_finished(set(), metadata)
         self.assertIn("request-1", worker._on_load_requests)
         self.assertIn("request-1", worker._on_transfer)
@@ -351,6 +357,7 @@ class MetadataFlowTest(unittest.TestCase):
             _output(finished_req_ids={request.request_id})
         )
         self.assertTrue(metadata.transfer_states[0].cancelled)
+        worker.start_load_kv(metadata)
         worker.get_finished({request.request_id}, metadata)
         worker.transfer.cancel.assert_called_once_with(request.request_id, "transfer-1")
         self.assertEqual(scheduler._tracked_requests, {})
@@ -376,6 +383,7 @@ class MetadataFlowTest(unittest.TestCase):
         self.assertEqual(save.prompt_tokens, 50)
         worker = _worker(config)
         with patch("mtsc.worker.new_device_event", return_value=Mock()):
+            worker.start_load_kv(metadata)
             worker.get_finished(set(), metadata)
         event = worker.pool.save.call_args.args[0]
         self.assertEqual(
@@ -447,6 +455,7 @@ class MetadataFlowTest(unittest.TestCase):
                     scheduler._tracked_requests[request.request_id].saved_tokens, 112
                 )
                 worker = _worker(config)
+                worker.start_load_kv(metadata)
                 worker.get_finished(set(), metadata)
                 worker.pool.save.assert_not_called()
 
@@ -467,6 +476,7 @@ class MetadataFlowTest(unittest.TestCase):
                 self.assertEqual(save.block_hashes, request.block_hashes)
                 self.assertEqual(len(save.block_hashes), 8)
                 with patch("mtsc.worker.new_device_event", return_value=Mock()):
+                    worker.start_load_kv(metadata)
                     worker.get_finished(set(), metadata)
                 event = worker.pool.save.call_args.args[0]
                 self.assertEqual((event.start_save, event.end_save), (112, 128))
@@ -561,6 +571,7 @@ class MetadataFlowTest(unittest.TestCase):
             metadata.finished_waits[request.request_id], FinishedWait(True, True)
         )
         with patch("mtsc.worker.new_device_event", return_value=Mock()):
+            worker.start_load_kv(metadata)
             self.assertEqual(
                 worker.get_finished({request.request_id}, metadata), (None, None)
             )

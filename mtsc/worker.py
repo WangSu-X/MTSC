@@ -214,6 +214,37 @@ class MTSCWorker:
                 del self._finished_waits[request_id]
         return send_finished
 
+    def _advance_transfers(self, pool_load_results: dict[str, LoadResult]) -> None:
+        """Start PD for Store misses or terminal Store loads without waiting."""
+        recv_events: list[RecvEvent] = []
+        for request_id, state in list(self._on_transfer.items()):
+            if state.stage == "POOL_DONE":
+                actual_pool_prefix = state.plan.computed_tokens
+                logger.debug(
+                    "[MTSC] store_load: role=D request_id=%s tp_rank=%d "
+                    "elapsed_ms=0.000 loaded_tokens=0 status=skipped",
+                    request_id,
+                    self.transfer.tp_rank,
+                )
+            elif state.stage == "POOL_LOADING" and request_id in pool_load_results:
+                load_result = pool_load_results[request_id]
+                actual_pool_prefix = load_result.loaded_tokens
+                state.store_ms = load_result.elapsed_ms
+                state.store_status = "error" if load_result.error else "ok"
+                logger.debug(
+                    "[MTSC] store_load_complete: request_id=%s L=%d H=%d A=%d",
+                    request_id,
+                    state.plan.computed_tokens,
+                    state.plan.pool_hit_tokens,
+                    actual_pool_prefix,
+                )
+            else:
+                continue
+            self._start_transfer(state, actual_pool_prefix, recv_events)
+
+        if recv_events:
+            self.transfer.recv(recv_events)
+
     def _aggregate_recv_finished(
         self,
         pool_load_results: list[LoadResult],
@@ -245,34 +276,7 @@ class MTSCWorker:
                     )
                 finished_recv.add(request_id)
 
-        recv_events: list[RecvEvent] = []
-        for request_id, state in list(self._on_transfer.items()):
-            if state.stage == "POOL_DONE":
-                actual_pool_prefix = state.plan.computed_tokens
-                logger.debug(
-                    "[MTSC] store_load: role=D request_id=%s tp_rank=%d "
-                    "elapsed_ms=0.000 loaded_tokens=0 status=skipped",
-                    request_id,
-                    self.transfer.tp_rank,
-                )
-            elif state.stage == "POOL_LOADING" and request_id in pool_load_results_dict:
-                load_result = pool_load_results_dict[request_id]
-                actual_pool_prefix = load_result.loaded_tokens
-                state.store_ms = load_result.elapsed_ms
-                state.store_status = "error" if load_result.error else "ok"
-                logger.debug(
-                    "[MTSC] store_load_complete: request_id=%s L=%d H=%d A=%d",
-                    request_id,
-                    state.plan.computed_tokens,
-                    state.plan.pool_hit_tokens,
-                    actual_pool_prefix,
-                )
-            else:
-                continue
-            self._start_transfer(state, actual_pool_prefix, recv_events)
-
-        if recv_events:
-            self.transfer.recv(recv_events)
+        self._advance_transfers(pool_load_results_dict)
 
         for result in transfer_recv_result:
             request_id = result.request_id
@@ -308,7 +312,8 @@ class MTSCWorker:
                     finished_recv.add(request_id)
         return finished_recv
 
-    def update_load_metadata(self, metadata: MTSCConnectorMetadata) -> None:
+    def start_load_kv(self, metadata: MTSCConnectorMetadata) -> None:
+        """Submit asynchronous loads before forward, including empty steps."""
         load_started_at = time.monotonic()
         for load_meta in metadata.pool_loads:
             self.pool.load(
@@ -346,6 +351,10 @@ class MTSCWorker:
                 transfer_plan.pool_hit_tokens,
                 transfer_plan.target_tokens,
             )
+
+        # A Store miss can request P immediately; Store hits wait for poll()
+        # to establish the actual loaded prefix before requesting the suffix.
+        self._advance_transfers({})
 
     def update_save_metadata(self, metadata: MTSCConnectorMetadata) -> None:
         save_event = None
@@ -406,8 +415,8 @@ class MTSCWorker:
     def get_finished(
         self, finished_req_ids: set[str], metadata: MTSCConnectorMetadata
     ) -> tuple[set[str] | None, set[str] | None]:
-        # step 1 update metadata & send or save
-        self.update_load_metadata(metadata)
+        # Loads were submitted in start_load_kv(), before model execution.
+        # Saves and source publication must follow the current device writes.
         self.update_save_metadata(metadata)
         self.update_finished_metadata(metadata)
 

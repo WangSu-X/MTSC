@@ -69,7 +69,7 @@ def _copy(sender, receiver, source_blocks, destination_blocks):
 
 
 @pytest.mark.parametrize(
-    "decode_save,expected", [(None, True), ("false", False), (True, True)]
+    "decode_save,expected", [(None, False), ("false", False), (True, True)]
 )
 def test_scheduler_connector_initializes_with_decode_save_setting(
     decode_save, expected

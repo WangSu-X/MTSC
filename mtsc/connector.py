@@ -77,7 +77,7 @@ class MTSCConnector(KVConnectorBase_V1, SupportsHMA):
 
         if role == KVConnectorRole.SCHEDULER:
             extra = vllm_config.kv_transfer_config.kv_connector_extra_config
-            decode_save = _config_bool(extra.get("mtsc_decode_save"), True)
+            decode_save = _config_bool(extra.get("mtsc_decode_save"), False)
             self.scheduler = MTSCScheduler(vllm_config, kv_cache_config, decode_save)
         else:
             self.worker = MTSCWorker(vllm_config, kv_cache_config)
@@ -161,8 +161,11 @@ class MTSCConnector(KVConnectorBase_V1, SupportsHMA):
         self.worker.handle_preemptions(kv_connector_metadata)
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
-        # Store and PD publication are ordered in get_finished().
-        return
+        assert self.worker is not None
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, MTSCConnectorMetadata):
+            raise TypeError(f"Expected MTSCConnectorMetadata, got {type(metadata)!r}")
+        self.worker.start_load_kv(metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return

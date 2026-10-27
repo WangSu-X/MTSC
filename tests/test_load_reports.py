@@ -138,6 +138,7 @@ def test_preempted_rank_record_does_not_complete_new_load_attempt():
 def test_p_load_report_keeps_elapsed_time_and_actual_prefix():
     _, config, request, metadata = _allocated(consumer=False)
     worker = _worker(config)
+    worker.start_load_kv(metadata)
     worker.get_finished(set(), metadata)
     worker.pool.poll.return_value = PoolPollResult(
         loads=[LoadResult(request.request_id, 64, "partial", elapsed_ms=12.5)]
@@ -157,6 +158,7 @@ def test_p_load_report_keeps_elapsed_time_and_actual_prefix():
 def test_d_report_uses_actual_store_result_and_logical_pd_suffix(loaded, error):
     _, config, request, metadata = _allocated()
     worker = _worker(config)
+    worker.start_load_kv(metadata)
     worker.get_finished(set(), metadata)
     worker.pool.poll.return_value = PoolPollResult(
         loads=[LoadResult(request.request_id, loaded, error, elapsed_ms=7.5)]

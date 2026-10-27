@@ -403,9 +403,7 @@ P Proxy 将 `max_tokens=1`，因此正常 P 请求以 length-capped 状态结束
 
 vLLM 在 model forward context 进入时调用该 hook。
 
-MVP 与 Mooncake Store Connector 保持一致：`start_load_kv()` 为 no-op，bulk Store GET 不在此处发布，而是在同一 execute-model lifecycle 末尾的 `get_finished()` 中入队。这样可以与本 step 的 GPU compute 重叠，也与当前 Store Connector 行为一致。
-
-这是实现选择，不是 vLLM hook 的强制限制。未来如果改为 layerwise load，可以在 `start_load_kv()` 真正启动 I/O。
+`MTSCConnector.start_load_kv()` 调用 `MTSCWorker.start_load_kv()`，在 forward 前登记加载计划并将 bulk Store GET 入队。该 hook 不等待 GET 完成，允许加载与本 step 中其他请求的计算重叠；没有 forward 的 connector-only step 也经过该 hook。每个 metadata delta 只提交一次，`get_finished()` 不再提交 GET。
 
 #### 3.2.3 `wait_for_layer_load(layer_name)`
 
@@ -425,7 +423,7 @@ MVP async save 不阻塞 forward 退出，该 hook 为 no-op。block lifetime �
 
 P 侧执行顺序：
 
-1. 从当前 `MTSCConnectorMetadata` 中将未发布的 Store GET 加入 recv queue；
+1. Store GET 已在 `start_load_kv()` 中提交，此处不重复发布；
 2. 为可保存的 blocks record CUDA event，将 Store PUT 加入 save queue；
 3. 通过 `MooncakeKVTransfer.prepare()/send()/cancel()` 同步 PD placeholder/source-ready/abort deltas；
 4. 轮询 Store GET completion 和 failed block IDs；
@@ -517,12 +515,12 @@ Connector lookup pending 时还没有 destination blocks，只是 scheduler 暂�
 
 #### 3.4.2 Worker Async Load
 
-P worker 在第一个携带 `store_load` 的 metadata step 末尾执行：
+P worker 在第一个携带 `store_load` 的 metadata step 的 forward 前执行：
 
 ```text
-get_finished()
+start_load_kv()
   -> enqueue Store GET once
-  -> return no finished_recving yet
+  -> return immediately; completion is reported by get_finished()
 ```
 
 后续 step：
@@ -713,9 +711,13 @@ Proxy P request
         -> queue KVPoolLoadRequest and KVTransferSourceState placeholder
   -> MTSCConnector.build_connector_meta()
      -> MTSCScheduler.build_connector_meta()
+  -> MTSCConnector.start_load_kv()
+     -> MTSCWorker.start_load_kv()
+        -> MooncakeKVCachePool.load()
+  -> model forward (other scheduled requests)
   -> MTSCConnector.get_finished()
      -> MTSCWorker.get_finished()
-        -> MooncakeKVCachePool.load() / poll()
+        -> MooncakeKVCachePool.poll()
         -> MooncakeKVTransfer.prepare()/send()/cancel() / poll()
   -> MTSCScheduler.request_finished()
      -> KVTransferSourceState(ready or cancelled)
@@ -732,7 +734,7 @@ Proxy P request
 - Store hit 后分配 blocks，请求进入 `WAITING_FOR_REMOTE_KVS`；
 - `update_state_after_alloc()` 调用两次不重复创建 load/PD placeholder；
 - `build_connector_meta()` 每 step 同时打包多个 requests 的 Store/PD deltas；
-- `start_load_kv()` no-op，`get_finished()` 只入队一次 Store GET；
+- `start_load_kv()` 在 forward 前入队一次 Store GET，`get_finished()` 不重复提交；
 - Store GET 成功后 `finished_recving` 解除 P waiting；
 - Store GET 失败同时返回 invalid blocks 和 `finished_recving`；
 - Store 零命中仍注册 PD placeholder；

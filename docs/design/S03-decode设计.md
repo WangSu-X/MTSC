@@ -418,11 +418,7 @@ Store 与 PD 使用各自底层对象，但 buffer 注册、preemption fence、s
 
 #### 3.2.2 `start_load_kv(forward_context)`
 
-MVP 中保持 no-op。
-
-原生 Mooncake PD Connector 在该 hook 发布 PD request；MTSC 为保证 Store GET 与 P WRITE 严格串行，将两阶段 load 统一放到 `get_finished()` 发布和推进。这样只有在 Store completion 已确定实际边界 `A` 后，才会产生最终 MTSC `KVTransferRequest`。
-
-未来支持 layerwise load 时，可以重新划分发布点，但不能破坏同一 destination block 的单写者时序。
+在 forward 前登记两阶段计划并异步提交 `[L,H)` 的 Store GET。若没有需要加载的 Store 前缀，直接令 `A=L` 并发起 PD 接收。若有 Store GET，仍由 `get_finished()` 收集终态、确定实际边界 `A` 后才发起 `[A,T)` 的 PD 接收，保持同一 destination block 的单写者时序。没有 forward 的 connector-only step 同样提交加载。
 
 #### 3.2.3 `wait_for_layer_load(layer_name)`
 
@@ -438,13 +434,13 @@ MVP 不在 forward 尾部同步等待 Store PUT，该 hook 为 no-op。D blocks 
 
 #### 3.2.6 `get_finished(finished_req_ids)`
 
-该 hook 是 D worker 两阶段 load 的发布、状态推进和完成聚合点。
+该 hook 是 D worker 两阶段 load 的状态推进和完成聚合点。计划登记和首次加载提交已在 `start_load_kv()` 完成。
 
 每次调用按以下顺序执行：
 
-1. 接收当前 metadata 中尚未发布的 `KVTransferPlan`；
-2. 对 `[L,H)` 非空的请求，将 Store GET 加入 recv queue；
-3. 对 Store 区间为空的请求，直接令 `A=L`；
+1. 使用 `start_load_kv()` 已登记的 `KVTransferPlan`；
+2. 不重复发布 Store GET；
+3. Store 区间为空的 PD 请求已在 forward 前提交；
 4. 轮询 Store GET completion 和 failed block IDs；
 5. 对 Store 已终止的请求计算本 worker 的实际连续边界 `A`；
 6. 固化 `A`，构造 `[A,T)` 的 PD destination block IDs；
@@ -965,10 +961,10 @@ lookup 未完成时没有 destination blocks；进入 `WAITING_FOR_REMOTE_KVS` �
 
 #### 3.5.2 Store Async Load
 
-第一个携带 `two_stage_load` metadata 的 step 末尾：
+第一个携带 `two_stage_load` metadata 的 step 的 forward 前：
 
 ```text
-get_finished()
+start_load_kv()
   -> enqueue Store GET [L,H) once
   -> keep request in WAITING_FOR_REMOTE_KVS
 ```
@@ -1111,7 +1107,7 @@ D Worker 的拉取协程运行在独立 `receiver_loop` 线程；P Worker 的 li
 
 ### 3.9 D 侧 Async Save
 
-D async save 是辅助路径，不属于两阶段 load 的完成条件。默认策略是：
+D async save 是辅助路径，不属于两阶段 load 的完成条件。`kv_connector_extra_config.mtsc_decode_save` 默认 `false`；需要保存 D 生成 KV 时显式设为 `true`。P 保存和 D 的 Store/PD 加载不受该开关影响。启用后的策略是：
 
 - 不重复保存从 Store 加载的 prompt blocks；
 - 不把 P 写入 D 的 prompt blocks 隐式保存为新 replica；
@@ -1217,9 +1213,13 @@ Proxy D request
         -> build KVTransferPlan for [L,T)
   -> MTSCConnector.build_connector_meta()
      -> MTSCScheduler.build_connector_meta()
+  -> MTSCConnector.start_load_kv()
+     -> MTSCWorker.start_load_kv()
+        -> MooncakeKVCachePool.load() (or immediate PD for Store miss)
+  -> model forward (other scheduled requests)
   -> MTSCConnector.get_finished()
      -> MTSCWorker.get_finished()
-        -> MooncakeKVCachePool.load() / poll()
+        -> MooncakeKVCachePool.poll()
         -> LoadResult.loaded_tokens freezes A
         -> _suffix_blocks() maps [A,T)
         -> _start_transfer()
