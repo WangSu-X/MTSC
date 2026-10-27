@@ -171,7 +171,7 @@ class _CompatBlobBlockHashes(Sequence[BlockHash]):
 
 BlobBlockHashes = _CompatBlobBlockHashes
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.mtsc.kv_cache_pool")
 logger.setLevel(envs.VLLM_LOGGING_LEVEL)
 
 

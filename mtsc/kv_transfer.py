@@ -172,7 +172,7 @@ class _ReceiveFenceError(RuntimeError):
     """The worker must stop: a published destination may still be written."""
 
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.mtsc.kv_transfer")
 logger.setLevel(envs.VLLM_LOGGING_LEVEL)
 
 

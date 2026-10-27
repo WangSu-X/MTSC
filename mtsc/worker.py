@@ -28,7 +28,7 @@ from .utils import new_device_event
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.mtsc.worker")
 logger.setLevel(envs.VLLM_LOGGING_LEVEL)
 
 
