@@ -9,6 +9,7 @@ import inspect
 import json
 import math
 import os
+import queue
 import socket
 import threading
 import time
@@ -47,6 +48,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
+from . import lifecycle
 from .utils import (
     BlockIds,
     cache_tensors,
@@ -743,27 +745,56 @@ class StoreLookupClient:
                 "mtsc_store_lookup_timeout_seconds exceeds ZMQ's millisecond limit"
             )
         self._timeout_ms = max(1, int(timeout * 1000))
+        workers = int(extra.get("mtsc_store_lookup_workers", 1))
+        if workers < 1:
+            raise ValueError("mtsc_store_lookup_workers must be >= 1")
         self._ctx = zmq.Context()  # type: ignore[attr-defined]
-        self._socket = self._make_socket()
+        # One REQ socket per worker thread: a REQ socket cannot be shared and a
+        # single in-flight lookup serialises every request behind the slowest
+        # one (that is what pushed the queue to p99 ~4.6 s at c10).
+        self._tls = threading.local()
+        self._sockets: list = []
+        self._sockets_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mtsc-lookup"
+            max_workers=workers, thread_name_prefix="mtsc-lookup"
         )
         self._futures: dict[str, Future[int]] = {}
 
     def _make_socket(self):
-        socket = make_zmq_socket(self._ctx, self._path, zmq.REQ, bind=False)
+        # DEALER: one socket per worker thread, each with at most one in-flight
+        # request, so replies stay in order without REQ's send/recv lockstep.
+        socket = make_zmq_socket(self._ctx, self._path, zmq.DEALER, bind=False)
         socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
         socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
         return socket
 
+    def _socket(self):
+        socket = getattr(self._tls, "socket", None)
+        if socket is None:
+            socket = self._make_socket()
+            self._tls.socket = socket
+            with self._sockets_lock:
+                self._sockets.append(socket)
+        return socket
+
     def _reset_socket(self) -> None:
-        self._socket.close(linger=0)
-        self._socket = self._make_socket()
+        """Drop this thread's socket; the next call on it reconnects."""
+        sock = getattr(self._tls, "socket", None)
+        if sock is None:
+            return
+        with self._sockets_lock:
+            if sock in self._sockets:
+                self._sockets.remove(sock)
+        try:
+            sock.close(linger=0)
+        finally:
+            self._tls.socket = None
 
     def _lookup(self, token_count: int, hashes: list[BlockHash]) -> int:
         hash_len = len(hashes[0]) if hashes else 0
+        socket = self._socket()
         try:
-            self._socket.send_multipart(
+            socket.send_multipart(
                 (
                     _LOOKUP,
                     token_count.to_bytes(4, "big"),
@@ -772,7 +803,7 @@ class StoreLookupClient:
                 ),
                 copy=False,
             )
-            response = self._socket.recv()
+            response = socket.recv()
             if response == _ERR:
                 raise RuntimeError("Pool lookup backend failed")
             hit = int.from_bytes(response, "big")
@@ -818,9 +849,10 @@ class StoreLookupClient:
 
     def reset(self) -> bool:
         def call() -> bool:
+            socket = self._socket()
             try:
-                self._socket.send(_RESET)
-                return self._socket.recv() == _OK
+                socket.send(_RESET)
+                return socket.recv() == _OK
             except zmq.Again as exc:
                 self._reset_socket()
                 raise TimeoutError(
@@ -835,62 +867,132 @@ class StoreLookupClient:
 
     def close(self) -> None:
         self._executor.shutdown(wait=True, cancel_futures=True)
-        self._socket.close(linger=0)
+        with self._sockets_lock:
+            sockets, self._sockets = self._sockets, []
+        for sock in sockets:
+            try:
+                sock.close(linger=0)
+            except Exception:  # noqa: BLE001 - teardown boundary
+                continue
         self._ctx.term()
 
 
 class StoreLookupServer:
+    """ROUTER-based lookup service.
+
+    ``REP`` would force every scheduler request through one thread; the Store
+    probe is a blocking C++ call, so a single slow scan stalled every other
+    request (p99 ~4.6 s at c10).  A ROUTER plus a worker pool lets N scans run
+    concurrently, while the socket is still only touched by the poll loop.
+    """
+
     def __init__(self, owner: MooncakeKVCachePool, vllm_config: VllmConfig) -> None:
+        assert vllm_config.kv_transfer_config is not None
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config
         self._owner = owner
         self._ctx = zmq.Context()  # type: ignore[attr-defined]
         self._path = lookup_rpc_path(vllm_config)
         ipc_path = self._path.removeprefix("ipc://")
         if os.path.exists(ipc_path):
             os.unlink(ipc_path)
-        self._socket = make_zmq_socket(self._ctx, self._path, zmq.REP, bind=True)
-        self._socket.setsockopt(zmq.RCVTIMEO, 200)
+        self._socket = make_zmq_socket(self._ctx, self._path, zmq.ROUTER, bind=True)
+        workers = max(1, int(extra.get("mtsc_store_lookup_server_workers", 1)))
+        self._pool = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="mtsc-store-lookup-worker"
+        )
+        self._results: queue.Queue[tuple[bytes, bytes]] = queue.Queue()
+        self._wake_recv = self._ctx.socket(zmq.PAIR)
+        self._wake_send = self._ctx.socket(zmq.PAIR)
+        self._wake_recv.bind("inproc://mtsc-store-lookup-wake")
+        self._wake_send.connect("inproc://mtsc-store-lookup-wake")
+        self._poller = zmq.Poller()
+        self._poller.register(self._socket, zmq.POLLIN)
+        self._poller.register(self._wake_recv, zmq.POLLIN)
         self._running = True
         self._thread = threading.Thread(
             target=self._serve, name="mtsc-store-lookup", daemon=True
         )
         self._thread.start()
 
+    def _handle(self, identity: bytes, kind: bytes, frames: list) -> None:
+        if kind == _LOOKUP:
+            token_count = int.from_bytes(frames[1], "big")
+            hash_len = int.from_bytes(frames[2], "big")
+            hashes = BlobBlockHashes(frames[3].buffer, hash_len)
+            try:
+                reply = self._owner.lookup(token_count, hashes).to_bytes(4, "big")
+            except Exception:
+                # Keep the server alive after a backend failure; the scheduler
+                # client degrades query errors to a cache miss.
+                logger.exception("[MTSC] store_lookup: status=error")
+                reply = _ERR
+        elif kind == _RESET:
+            try:
+                self._owner.wait_for_all_saves()
+                self._owner.store.remove_all(force=True)
+                # The Store is empty again: forget the write index so the next
+                # requests can repopulate it.
+                self._owner.forget_written_keys()
+                reply = _OK
+            except Exception:
+                logger.exception("[MTSC] store_reset: status=error")
+                reply = _ERR
+        else:
+            reply = _ERR
+        self._results.put((bytes(identity), bytes(reply)))
+        try:
+            self._wake_send.send(b"", copy=False)
+        except zmq.ZMQError:
+            return
+
+    def _drain_results(self) -> None:
+        while True:
+            try:
+                identity, reply = self._results.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._socket.send_multipart([identity, reply], copy=False)
+            except zmq.ZMQError:
+                return
+
     def _serve(self) -> None:
         while self._running:
             try:
-                frames = self._socket.recv_multipart(copy=False)
-            except zmq.Again:
-                continue
+                ready = dict(self._poller.poll(timeout=200))
             except zmq.ZMQError:
                 return
-            kind = bytes(frames[0])
-            if kind == _LOOKUP:
-                token_count = int.from_bytes(frames[1], "big")
-                hash_len = int.from_bytes(frames[2], "big")
-                hashes = BlobBlockHashes(frames[3].buffer, hash_len)
+            if self._wake_recv in ready:
                 try:
-                    hit = self._owner.lookup(token_count, hashes)
-                    self._socket.send(hit.to_bytes(4, "big"))
-                except Exception:
-                    # Keep REP alive after a backend failure; the scheduler
-                    # client degrades query errors to a cache miss.
-                    logger.exception("[MTSC] store_lookup: status=error")
-                    self._socket.send(_ERR)
-            elif kind == _RESET:
+                    while True:
+                        self._wake_recv.recv(copy=False, flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    pass
+                except zmq.ZMQError:
+                    return
+                self._drain_results()
+            if self._socket in ready:
                 try:
-                    self._owner.wait_for_all_saves()
-                    self._owner.store.remove_all(force=True)
-                    self._socket.send(_OK)
-                except Exception:
-                    logger.exception("[MTSC] store_reset: status=error")
-                    self._socket.send(_ERR)
-            else:
-                self._socket.send(_ERR)
+                    frames = self._socket.recv_multipart(copy=False)
+                except zmq.Again:
+                    continue
+                except zmq.ZMQError:
+                    return
+                if len(frames) < 2:
+                    continue
+                identity = bytes(frames[0])
+                kind = bytes(frames[1])
+                self._pool.submit(self._handle, identity, kind, frames[1:])
 
     def close(self) -> None:
         self._running = False
         self._thread.join(timeout=2)
-        self._socket.close(linger=0)
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        for sock in (self._socket, self._wake_recv, self._wake_send):
+            try:
+                sock.close(linger=0)
+            except Exception:  # noqa: BLE001 - teardown boundary
+                continue
         self._ctx.term()
         ipc_path = self._path.removeprefix("ipc://")
         if os.path.exists(ipc_path):
@@ -965,6 +1067,32 @@ class MooncakeKVCachePool:
             )
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        # Per-request lifecycle tracing (no-op unless the env var is set).
+        self._life = lifecycle.recorder(component="worker-pool", role=self.role)
+        # Write bookkeeping (mirrors UCS): a Store key is written at most once
+        # per process, and keys already queued for a PUT are not re-submitted.
+        # Keys embed the head-group rank and the put parity, so exactly one
+        # process ever owns a key and a local set is a complete dedup index.
+        # Without it, every Store eviction turns the next request into a
+        # full-prefix rewrite (write amplification -> more eviction).
+        self._written_lock = threading.Lock()
+        self._written_keys: set[str] = set()
+        self._pending_keys: set[str] = set()
+        # Diagnostics: re-check written keys once (MTSC_SAVE_VERIFY=1).
+        self._save_verify = os.getenv("MTSC_SAVE_VERIFY", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        # Short-lived key existence cache for the lookup path (0 disables).
+        self._exist_ttl = max(
+            0.0, float(extra.get("mtsc_store_exist_cache_seconds", 0.0))
+        )
+        self._exist_cache_limit = int(
+            extra.get("mtsc_store_exist_cache_max_keys", 300_000)
+        )
+        self._exist_cache: dict[str, tuple[bool, float]] = {}
         self.pp_size = parallel_config.pipeline_parallel_size
         self.pp_rank = (parallel_config.rank // self.tp_size) % self.pp_size
         self.pcp_size = get_pcp_group().world_size
@@ -1188,12 +1316,20 @@ class MooncakeKVCachePool:
                 candidates.append((group_index, bytes(block_hash)))
         if not keys:
             return 0
-        result = self.store.batch_is_exist(keys)
+        flags, queried, cached = self._exist_flags(keys)
+        if self._life is not None:
+            self._life.record(
+                "lookup_scan",
+                keys=len(keys),
+                queried=queried,
+                cached=cached,
+                ttl_s=self._exist_ttl,
+            )
         present = {
             candidate
             for index, candidate in enumerate(candidates)
             if all(
-                result[index * self._lookup_rank_count + rank] == 1
+                flags[index * self._lookup_rank_count + rank]
                 for rank in range(self._lookup_rank_count)
             )
         }
@@ -1203,6 +1339,47 @@ class MooncakeKVCachePool:
             _make_external_cached_pool(self.hash_block_size, present),
         )
         return hit
+
+    def _exist_flags(self, keys: list[str]) -> tuple[list[bool], int, int]:
+        """Per-key existence (flags, queried, cached) with a short TTL cache.
+
+        The same prefix is queried again and again (retries of one request,
+        sibling requests sharing a prefix), and every query costs a full
+        ``batch_is_exist`` round trip.  A 1-2 s cache turns those repeats into
+        a dictionary lookup.  A stale positive is harmless (the load path falls
+        back to recompute), a stale negative only delays a fresh hit.
+        """
+        ttl = self._exist_ttl
+        if ttl <= 0:
+            result = self.store.batch_is_exist(keys)
+            return [status == 1 for status in result], len(keys), 0
+        now = time.monotonic()
+        cache = self._exist_cache
+        flags: list[bool] = []
+        missing: list[str] = []
+        index_by_key: dict[str, int] = {}
+        for key in keys:
+            entry = cache.get(key)
+            if entry is not None and now - entry[1] < ttl:
+                flags.append(entry[0])
+                continue
+            flags.append(False)
+            index_by_key.setdefault(key, len(missing))
+            missing.append(key)
+        if missing:
+            result = self.store.batch_is_exist(missing)
+            for offset, key in enumerate(missing):
+                ok = result[offset] == 1
+                cache[key] = (ok, now)
+            for position, key in enumerate(keys):
+                if key in index_by_key:
+                    flags[position] = result[index_by_key[key]] == 1
+        if len(cache) > self._exist_cache_limit:
+            cutoff = now - ttl
+            for key, (_ok, stamp) in list(cache.items()):
+                if stamp < cutoff:
+                    cache.pop(key, None)
+        return flags, len(missing), len(keys) - len(missing)
 
     def _validate(self, event, start: int, end: int) -> None:
         self._check_open()
@@ -1224,6 +1401,17 @@ class MooncakeKVCachePool:
             started_at = time.monotonic()
             future = self._load_pool.submit(self._load_work, event)
             self._loads[event.request_id] = _LoadState(event, future, started_at)
+            if self._life is not None:
+                self._life.record(
+                    "store_load_submit",
+                    [event.request_id],
+                    start_token=event.start_load,
+                    end_token=event.end_load,
+                    tokens=max(0, event.end_load - event.start_load),
+                    blocks=cdiv(
+                        max(0, event.end_load - event.start_load), self.block_size
+                    ),
+                )
 
     def _load_work(self, event: LoadEvent) -> _LoadOutcome:
         error = None
@@ -1363,6 +1551,21 @@ class MooncakeKVCachePool:
                         request_id, outcome.loaded_tokens, outcome.error, elapsed_ms
                     )
                 )
+                if self._life is not None:
+                    self._life.record(
+                        "store_load_done",
+                        [request_id],
+                        load_ms=elapsed_ms,
+                        start_token=event.start_load,
+                        end_token=event.end_load,
+                        tokens=max(0, outcome.loaded_tokens - event.start_load),
+                        blocks=cdiv(
+                            max(0, outcome.loaded_tokens - event.start_load),
+                            self.block_size,
+                        ),
+                        timed_out=bool(state.timed_out),
+                        status="error" if outcome.error else "ok",
+                    )
                 logger.debug(
                     "[MTSC] store_load: role=%s request_id=%s tp_rank=%d "
                     "elapsed_ms=%.3f start_token=%d end_token=%d "
@@ -1406,6 +1609,11 @@ class MooncakeKVCachePool:
             errors = {block for blocks in self._invalid.values() for block in blocks}
             self._invalid.clear()
             return errors
+
+    def forget_written_keys(self) -> None:
+        """Drop the write index after the Store was wiped (``reset_cache``)."""
+        with self._written_lock:
+            self._written_keys.clear()
 
     def preempt(self, request_id: str) -> None:
         with self._task_lock:
@@ -1620,15 +1828,8 @@ class MooncakeKVCachePool:
                 )
         return failed
 
-    def _save(self, event: SaveEvent) -> None:
-        token_count = (
-            event.end_save
-            // self.coordinator.lcm_block_size
-            * self.coordinator.lcm_block_size
-        )
-        save_from = event.start_save
-        if token_count <= save_from:
-            return
+    def _save_lists(self, event: SaveEvent, token_count: int, save_from: int):
+        """Keys/addrs/sizes for the save range, after masks and PUT striping."""
         masks = self._store_masks(token_count, save_from, event.prompt_tokens)
         keys: list[str] = []
         addresses: list[list[int]] = []
@@ -1650,26 +1851,118 @@ class MooncakeKVCachePool:
                 keys.append(key.to_string())
                 addresses.append(address)
                 sizes.append(size)
+        return keys, addresses, sizes
+
+    def _save(self, event: SaveEvent) -> None:
+        token_count = (
+            event.end_save
+            // self.coordinator.lcm_block_size
+            * self.coordinator.lcm_block_size
+        )
+        save_from = event.start_save
+        if token_count <= save_from:
+            return
+        keys, addresses, sizes = self._save_lists(event, token_count, save_from)
         if not keys:
             return
-        exists = self.store.batch_is_exist(keys)
-        missing = [index for index, status in enumerate(exists) if status != 1]
-        if not missing:
-            return
-        if event.ready_event is not None:
-            event.ready_event.synchronize()
-        result = self.store.batch_put_from_multi_buffers(
-            [keys[i] for i in missing],
-            [addresses[i] for i in missing],
-            [sizes[i] for i in missing],
-            self.replicate_config,
-        )
-        if any(status < 0 for status in result):
-            logger.warning(
-                "[MTSC] store_save: request_id=%s status=partial_failure",
-                event.request_id,
-            )
-            raise RuntimeError("Mooncake Store PUT partially failed")
+        candidates = len(keys)
+        save_started = lifecycle.now_ns() if self._life is not None else 0
+
+        # Drop keys this process already wrote (or is writing right now).  The
+        # Store only serves as the source of truth for keys we never wrote, so
+        # an evicted object is not rewritten on the next request.
+        with self._written_lock:
+            keep = [
+                index
+                for index, key in enumerate(keys)
+                if key not in self._written_keys and key not in self._pending_keys
+            ]
+            if not keep:
+                if self._life is not None:
+                    self._life.record(
+                        "store_save",
+                        [event.request_id],
+                        candidates=candidates,
+                        deduped=candidates,
+                        present=0,
+                        written=0,
+                        save_ms=lifecycle.elapsed_ms(save_started),
+                        start_token=save_from,
+                        end_token=token_count,
+                        status="deduped",
+                    )
+                return
+            selected = [keys[index] for index in keep]
+            self._pending_keys.update(selected)
+        addresses = [addresses[index] for index in keep]
+        sizes = [sizes[index] for index in keep]
+        keys = selected
+        present = 0
+        written = 0
+        try:
+            # Still ask the Store once for freshly-seen keys: a restart or a
+            # peer rank may already have persisted them.
+            exists = self.store.batch_is_exist(keys)
+            missing = [index for index, status in enumerate(exists) if status != 1]
+            present = len(keys) - len(missing)
+            written = len(missing)
+            if event.ready_event is not None and missing:
+                event.ready_event.synchronize()
+            if missing:
+                result = self.store.batch_put_from_multi_buffers(
+                    [keys[i] for i in missing],
+                    [addresses[i] for i in missing],
+                    [sizes[i] for i in missing],
+                    self.replicate_config,
+                )
+                if any(status < 0 for status in result):
+                    logger.warning(
+                        "[MTSC] store_save: request_id=%s status=partial_failure",
+                        event.request_id,
+                    )
+                    with self._written_lock:
+                        self._written_keys.update(
+                            keys[index]
+                            for index, status in zip(missing, result, strict=True)
+                            if status >= 0
+                        )
+                    raise RuntimeError("Mooncake Store PUT partially failed")
+            with self._written_lock:
+                self._written_keys.update(keys)
+            if self._save_verify:
+                verify = self.store.batch_is_exist(keys)
+                verified = sum(1 for status in verify if status == 1)
+                if verified != len(keys):
+                    logger.warning(
+                        "[MTSC] store_save: request_id=%s status=unverified "
+                        "written=%d verified=%d",
+                        event.request_id,
+                        len(keys),
+                        verified,
+                    )
+                if self._life is not None:
+                    self._life.record(
+                        "store_verify",
+                        [event.request_id],
+                        checked=len(keys),
+                        verified=verified,
+                    )
+        finally:
+            with self._written_lock:
+                self._pending_keys.difference_update(selected)
+            if self._life is not None:
+                self._life.record(
+                    "store_save",
+                    [event.request_id],
+                    candidates=candidates,
+                    deduped=candidates - len(keep),
+                    present=present,
+                    written=written,
+                    save_ms=lifecycle.elapsed_ms(save_started),
+                    start_token=save_from,
+                    end_token=token_count,
+                    status="ok",
+                )
 
     def _fence_loads(self, request_ids: set[str]) -> None:
         """Fence Store writes before a preempted request's blocks are reused."""

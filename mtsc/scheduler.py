@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.request import RequestStatus
 
+from . import lifecycle
 from .kv_cache_pool import StoreLookupClient
 from .protocol import (
     FinishedWait,
@@ -52,6 +53,9 @@ class _TrackedRequest:
     block_ids: tuple[list[int], ...]
     saved_tokens: int = 0
     is_decode: bool = False
+    # Tokens this request obtained from the Store. They are already persisted,
+    # so the save path starts after them instead of walking the whole prefix.
+    external_tokens: int = 0
 
 
 @dataclass
@@ -132,6 +136,16 @@ class MTSCScheduler:
         self._transferring_requests: set[str] = set()
         self._delayed_releases: set[str] = set()
 
+        # Lifecycle tracing is a no-op unless MTSC_LIFECYCLE_PROFILE_FILE is
+        # set; the per-request anchors live here so hooks stay branch-only.
+        self._life = lifecycle.recorder(
+            component="scheduler", role="P" if self.is_producer else "D"
+        )
+        self._life_match_started: set[str] = set()
+        self._life_lookup_started: dict[str, int] = {}
+        self._life_polls: dict[str, int] = {}
+        self._life_prefill_start: dict[str, int] = {}
+
     def _truncate_mamba_prefill(self, request: Request) -> None:
         params = request.kv_transfer_params or {}
         if (
@@ -179,10 +193,31 @@ class MTSCScheduler:
             1 if self.has_mamba and request.num_prompt_tokens > 1 else 0
         )
 
+        life = self._life
+        rid = request.request_id
+        if life is not None and rid not in self._life_match_started:
+            self._life_match_started.add(rid)
+            life.record(
+                "queued",
+                [rid],
+                queue_ms=lifecycle.queue_ms(request.arrival_time),
+                arrival_wall=float(request.arrival_time or 0.0),
+                prompt_tokens=request.num_prompt_tokens,
+                target_tokens=target,
+                prompt_blocks=cdiv(target, self.block_size),
+                remote_decode=bool(params.get("do_remote_decode")),
+                remote_prefill=bool(params.get("do_remote_prefill")),
+                num_computed_tokens=int(num_computed_tokens),
+                transfer_id=params.get("transfer_id"),
+            )
+
         lookup_tokens = target // self.block_size * self.block_size
         if lookup_tokens < self.block_size:
             pool_hit = 0
         else:
+            if life is not None:
+                self._life_polls[rid] = self._life_polls.get(rid, 0) + 1
+                self._life_lookup_started.setdefault(rid, lifecycle.now_ns())
             pool_hit = self.lookup_client.lookup(
                 request.request_id,
                 lookup_tokens,
@@ -195,6 +230,19 @@ class MTSCScheduler:
                     request.request_id,
                 )
                 return None, False
+            if life is not None:
+                life.record(
+                    "query_done",
+                    [rid],
+                    transfer_id=params.get("transfer_id"),
+                    query_ms=lifecycle.elapsed_ms(
+                        self._life_lookup_started.pop(rid, 0)
+                    ),
+                    hit_tokens=int(pool_hit),
+                    hit_blocks=cdiv(int(pool_hit), self.block_size),
+                    lookup_tokens=lookup_tokens,
+                    polls=self._life_polls.pop(rid, 0),
+                )
 
         # A retry may resolve to a different hit before allocation.
         self._load_decisions.pop(request.request_id, None)
@@ -206,6 +254,16 @@ class MTSCScheduler:
             )
         if not (self.is_consumer and params.get("do_remote_prefill")):
             external = max(0, pool_hit - num_computed_tokens)
+            if life is not None:
+                life.record(
+                    "match_done",
+                    [rid],
+                    transfer_id=params.get("transfer_id"),
+                    external_tokens=external,
+                    hit_tokens=int(pool_hit),
+                    target_tokens=target,
+                    path="store" if external > 0 else "local",
+                )
             return external, external > 0
 
         # for decode side pd transfer
@@ -223,6 +281,16 @@ class MTSCScheduler:
             target,
         )
         external = target - num_computed_tokens
+        if life is not None:
+            life.record(
+                "stage2_planned",
+                [rid],
+                transfer_id=params.get("transfer_id"),
+                external_tokens=external,
+                hit_tokens=int(pool_hit),
+                target_tokens=target,
+                computed_tokens=int(num_computed_tokens),
+            )
         return external, external > 0
 
     def update_state_after_alloc(
@@ -232,6 +300,20 @@ class MTSCScheduler:
         if request.request_id in self._transfer_decisions:
             self._validate_transfer_params(request)
         all_blocks = blocks.get_block_ids()
+        life = self._life
+        if life is not None:
+            rid = request.request_id
+            life.record(
+                "alloc",
+                [rid],
+                transfer_id=params.get("transfer_id"),
+                prompt_tokens=request.num_prompt_tokens,
+                blocks=sum(len(group) for group in all_blocks),
+                external_tokens=int(num_external_tokens),
+            )
+            # P's prefill starts with the step that first schedules it.
+            if self.is_producer and params.get("do_remote_decode"):
+                self._life_prefill_start.setdefault(rid, lifecycle.now_ns())
         tracked = self._tracked_requests.get(request.request_id)
         if tracked is None:
             tracked = _TrackedRequest(
@@ -245,6 +327,14 @@ class MTSCScheduler:
 
         load_spec = self._load_decisions.pop(request.request_id, None)
         transfer_spec = self._transfer_decisions.pop(request.request_id, None)
+        if load_spec is not None:
+            tracked.external_tokens = max(
+                tracked.external_tokens, load_spec.pool_hit_tokens
+            )
+        elif transfer_spec is not None:
+            tracked.external_tokens = max(
+                tracked.external_tokens, transfer_spec.pool_hit_tokens
+            )
         load_id = 0
         if load_spec is not None or transfer_spec is not None:
             self._next_load_id += 1
@@ -429,6 +519,10 @@ class MTSCScheduler:
             self.lookup_client.discard(request_id)
             self._load_decisions.pop(request_id, None)
             self._transfer_decisions.pop(request_id, None)
+            self._life_match_started.discard(request_id)
+            self._life_lookup_started.pop(request_id, None)
+            self._life_polls.pop(request_id, None)
+            self._life_prefill_start.pop(request_id, None)
         for request_id in preempted:
             self._load_traces.pop(request_id, None)
             self._finished_waits.pop(request_id, None)
@@ -476,6 +570,20 @@ class MTSCScheduler:
                         ready=True,
                     )
                 )
+                if self._life is not None:
+                    self._life.record(
+                        "prefill_done",
+                        [request.request_id],
+                        transfer_id=str(params["transfer_id"]),
+                        prefill_ms=lifecycle.elapsed_ms(
+                            self._life_prefill_start.pop(request.request_id, 0)
+                        ),
+                        prompt_tokens=request.num_prompt_tokens,
+                        blocks=sum(
+                            len(group) for group in block_ids if group
+                        ),
+                        status="ready",
+                    )
                 transfer_delay = True
             else:
                 self._batch_transfer_state.append(

@@ -46,6 +46,7 @@ from vllm.utils.network_utils import get_ip, make_zmq_path
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.worker.utils import select_common_block_size
 
+from . import lifecycle
 from .protocol import (
     KVTransferRequest,
     KVTransferResponse,
@@ -647,6 +648,12 @@ class MooncakeKVTransfer:
         self._invalid: dict[str, set[int]] = {}
         self._registered = False
         self._closed = False
+        # Lifecycle tracing anchors (empty dicts when tracing is disabled).
+        self._life = lifecycle.recorder(
+            component="worker-transfer", role="P" if self.is_producer else "D"
+        )
+        self._life_recv_submit: dict[str, int] = {}
+        self._life_pull_arrive: dict[str, int] = {}
 
     def _bind_sender_thread_device(self) -> None:
         current_platform.set_device(self.device_id)
@@ -834,6 +841,17 @@ class MooncakeKVTransfer:
                 event.remote_engine_id,
                 event.bootstrap_addr,
             )
+            if self._life is not None:
+                self._life_recv_submit[event.request_id] = lifecycle.now_ns()
+                self._life.record(
+                    "stage2_submit",
+                    [event.request_id],
+                    transfer_id=event.transfer_id,
+                    blocks=sum(
+                        1 for ids in event.block_ids for block in ids if block >= 0
+                    ),
+                    remote_engine_id=event.remote_engine_id,
+                )
         await self._start_load_kv(reqs_to_recv)
 
     async def _start_load_kv(self, reqs_to_recv: dict[str, dict[str, PullReqMeta]]):
@@ -874,6 +892,21 @@ class MooncakeKVTransfer:
             pending_reqs[d_req_id] = self.reqs_need_send.setdefault(
                 transfer_id, SendBlockMeta("", transfer_id)
             )
+        if self._life is not None:
+            for d_req_id, send_meta in pending_reqs.items():
+                self._life_pull_arrive.setdefault(
+                    d_req_id, lifecycle.now_ns()
+                )
+                # Key the row by P's own request id so the P side aggregates
+                # prefill/permit/send into one line; D's id stays as a field.
+                self._life.record(
+                    "pull_arrive",
+                    [send_meta.p_req_id or d_req_id],
+                    transfer_id=send_meta.transfer_id,
+                    d_request_id=d_req_id,
+                    remote_tp_rank=int(meta.remote_tp_rank),
+                    ready=send_meta.ready.is_set(),
+                )
 
         async def wait_and_ret(d_req_id, send_meta):
             await send_meta.ready.wait()
@@ -919,6 +952,17 @@ class MooncakeKVTransfer:
                         if not send_meta.need_send:
                             self.resolve_need_send(send_meta, remote_tp_ranks)
                         ready_reqs.append((d_req_id, send_meta))
+                        if self._life is not None:
+                            self._life.record(
+                                "send_permit",
+                                [send_meta.p_req_id or d_req_id],
+                                transfer_id=send_meta.transfer_id,
+                                d_request_id=d_req_id,
+                                wait_ms=lifecycle.elapsed_ms(
+                                    self._life_pull_arrive.pop(d_req_id, 0)
+                                ),
+                                remote_tp_rank=int(meta.remote_tp_rank),
+                            )
                     else:
                         # MTSC cancel() wakes an early receiver after removing
                         # its source metadata. No source memory is published.
@@ -937,12 +981,34 @@ class MooncakeKVTransfer:
                     err_req_set = set(err_reqs)
                     ok_reqs = [rid for rid, _ in ready_reqs if rid not in err_req_set]
                     if src:
+                        send_started = (
+                            lifecycle.now_ns() if self._life is not None else 0
+                        )
                         ret = await self._write_buffers(
                             f"{meta.remote_hostname}:{meta.remote_port}",
                             src,
                             dst,
                             lengths,
                         )
+                        if self._life is not None:
+                            self._life.record(
+                                "te_send",
+                                [
+                                    send_meta.p_req_id or d_req_id
+                                    for d_req_id, send_meta in ready_reqs
+                                    if d_req_id not in err_req_set
+                                ],
+                                d_request_ids=[
+                                    d_req_id
+                                    for d_req_id, _ in ready_reqs
+                                    if d_req_id not in err_req_set
+                                ],
+                                send_ms=lifecycle.elapsed_ms(send_started),
+                                ops=len(src),
+                                bytes=int(sum(lengths)),
+                                remote_tp_rank=int(meta.remote_tp_rank),
+                                status="error" if ret != 0 else "ok",
+                            )
                         if ret != 0:
                             err_msg = f"Mooncake transfer engine returned {ret}"
                             err_reqs.extend(ok_reqs)
@@ -1411,6 +1477,17 @@ class MooncakeKVTransfer:
         logger.debug(
             "[MTSC] pd_recv_ack: request_id=%s failed=%s", event.request_id, failed
         )
+        if self._life is not None:
+            self._life.record(
+                "stage2_done",
+                [event.request_id],
+                transfer_id=event.transfer_id,
+                stage2_ms=lifecycle.elapsed_ms(
+                    self._life_recv_submit.pop(event.request_id, 0)
+                ),
+                blocks=sum(1 for ids in event.block_ids for block in ids if block >= 0),
+                status="error" if failed else "ok",
+            )
         if failed:
             self._failed_recv.add(event.request_id)
         self.finished_recving_reqs.add(event.request_id)
