@@ -145,6 +145,10 @@ class MTSCScheduler:
         self._life_lookup_started: dict[str, int] = {}
         self._life_polls: dict[str, int] = {}
         self._life_prefill_start: dict[str, int] = {}
+        # Per-step view: tokens scheduled, request mix, and the wall time since
+        # the previous step (scheduler + forward + connector harvest).
+        self._life_step = 0
+        self._life_step_ns = 0
 
     def _truncate_mamba_prefill(self, request: Request) -> None:
         params = request.kv_transfer_params or {}
@@ -451,6 +455,28 @@ class MTSCScheduler:
         )
 
     def build_connector_meta(self, output: SchedulerOutput) -> MTSCConnectorMetadata:
+        if self._life is not None:
+            now = lifecycle.now_ns()
+            step_ms = (
+                lifecycle.elapsed_ms(self._life_step_ns)
+                if self._life_step_ns
+                else -1.0
+            )
+            self._life_step_ns = now
+            self._life_step += 1
+            scheduled = output.num_scheduled_tokens or {}
+            cached_ids = getattr(output.scheduled_cached_reqs, "req_ids", ()) or ()
+            self._life.record(
+                "step",
+                step=self._life_step,
+                tokens=int(sum(int(value) for value in scheduled.values())),
+                reqs=len(scheduled),
+                new_reqs=len(output.scheduled_new_reqs or ()),
+                cached_reqs=len(cached_ids),
+                preempted=len(output.preempted_req_ids or ()),
+                finished=len(output.finished_req_ids or ()),
+                step_ms=step_ms,
+            )
         pool_loading_req_ids = {request.request_id for request in self._batch_pool_loads}
         allow_save = self.is_producer or self.decode_save
         if allow_save:

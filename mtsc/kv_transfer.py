@@ -61,6 +61,13 @@ from .utils import (
 TransferId = str
 
 
+def elapsed_or_neg(start_ns: int, end_ns: int) -> float:
+    """Millis between two monotonic_ns stamps, or -1.0 when unavailable."""
+    if not start_ns or not end_ns or end_ns < start_ns:
+        return -1.0
+    return (end_ns - start_ns) / 1e6
+
+
 def _resolve_transfer_transport(extra: Mapping[str, Any]) -> tuple[str, str]:
     """Resolve PD transport: explicit extra config > Store JSON > defaults.
 
@@ -969,27 +976,27 @@ class MooncakeKVTransfer:
                         expired_reqs.append(d_req_id)
 
                 try:
-                    (
-                        src,
-                        dst,
-                        lengths,
-                        err_reqs,
-                        err_msg,
-                    ) = await self._build_transfer_params(
-                        ready_reqs, meta, remote_regions
+                    dispatch_ns = (
+                        lifecycle.now_ns() if self._life is not None else 0
                     )
+                    # One executor hop does both the parameter build and the TE
+                    # write: the loop only dispatches, so a request no longer
+                    # pays a Python build pass (hundreds of region x block
+                    # iterations) in front of the actual byte move.
+                    batch = await self.sender_loop.run_in_executor(
+                        self._sender_executor,
+                        self._transfer_ready_batch,
+                        ready_reqs,
+                        meta,
+                        remote_regions,
+                        f"{meta.remote_hostname}:{meta.remote_port}",
+                        dispatch_ns,
+                    )
+                    err_reqs = batch["err_reqs"]
+                    err_msg = batch["err_msg"]
                     err_req_set = set(err_reqs)
                     ok_reqs = [rid for rid, _ in ready_reqs if rid not in err_req_set]
-                    if src:
-                        send_started = (
-                            lifecycle.now_ns() if self._life is not None else 0
-                        )
-                        ret = await self._write_buffers(
-                            f"{meta.remote_hostname}:{meta.remote_port}",
-                            src,
-                            dst,
-                            lengths,
-                        )
+                    if batch["ops"]:
                         if self._life is not None:
                             self._life.record(
                                 "te_send",
@@ -1003,14 +1010,19 @@ class MooncakeKVTransfer:
                                     for d_req_id, _ in ready_reqs
                                     if d_req_id not in err_req_set
                                 ],
-                                send_ms=lifecycle.elapsed_ms(send_started),
-                                ops=len(src),
-                                bytes=int(sum(lengths)),
+                                queue_ms=batch["queue_ms"],
+                                build_ms=batch["build_ms"],
+                                write_ms=batch["write_ms"],
+                                ops=batch["ops"],
+                                bytes=batch["bytes"],
                                 remote_tp_rank=int(meta.remote_tp_rank),
-                                status="error" if ret != 0 else "ok",
+                                status="ok" if batch["ok"] else "error",
                             )
-                        if ret != 0:
-                            err_msg = f"Mooncake transfer engine returned {ret}"
+                        if not batch["ok"]:
+                            err_msg = (
+                                "Mooncake transfer engine returned "
+                                f"{batch['ret']}"
+                            )
                             err_reqs.extend(ok_reqs)
                             err_req_set.update(ok_reqs)
                             ok_reqs = []
@@ -1302,7 +1314,8 @@ class MooncakeKVTransfer:
             finally:
                 self.sender_worker_queue.task_done()
 
-    async def _build_transfer_params(self, ready_reqs, request, remote_regions):
+    def _build_transfer_params(self, ready_reqs, request, remote_regions):
+        """Pure Python: runs on the sender executor, never on the loop."""
         src, dst, lengths, err_reqs = [], [], [], []
         err_msg = None
         for d_req_id, send_meta in ready_reqs:
@@ -1407,16 +1420,54 @@ class MooncakeKVTransfer:
                         sizes.append(length)
         return src, dst, sizes
 
-    async def _write_buffers(self, session, src, dst, sizes) -> int:
-        assert self.sender_loop is not None
-        return await self.sender_loop.run_in_executor(
-            self._sender_executor,
-            self.engine.batch_transfer_sync_write,
-            session,
-            src,
-            dst,
-            sizes,
-        )
+    def _transfer_ready_batch(
+        self,
+        ready_reqs,
+        meta,
+        remote_regions,
+        session: str,
+        dispatch_ns: int,
+    ) -> dict:
+        """Build the transfer params and issue the TE write in one executor hop.
+
+        Everything here touches only frozen per-batch state, so it is safe off
+        the sender loop: the loop keeps `sending` fenced and only awaits the
+        returned summary.
+        """
+        started_ns = lifecycle.now_ns()
+        try:
+            src, dst, lengths, err_reqs, err_msg = self._build_transfer_params(
+                ready_reqs, meta, remote_regions
+            )
+        except Exception as exc:  # noqa: BLE001 - per-batch build boundary
+            logger.warning("[MTSC] pd_plan: status=batch_build_error error=%s", exc)
+            return {
+                "err_reqs": [rid for rid, _ in ready_reqs],
+                "err_msg": str(exc),
+                "ops": 0,
+                "bytes": 0,
+                "ret": 0,
+                "ok": True,
+                "queue_ms": elapsed_or_neg(dispatch_ns, started_ns),
+                "build_ms": (lifecycle.now_ns() - started_ns) / 1e6,
+                "write_ms": 0.0,
+            }
+        build_ns = lifecycle.now_ns()
+        ret = 0
+        if src:
+            ret = self.engine.batch_transfer_sync_write(session, src, dst, lengths)
+        write_ns = lifecycle.now_ns()
+        return {
+            "err_reqs": err_reqs,
+            "err_msg": err_msg,
+            "ops": len(src),
+            "bytes": int(sum(lengths)),
+            "ret": ret,
+            "ok": ret == 0,
+            "queue_ms": elapsed_or_neg(dispatch_ns, started_ns),
+            "build_ms": (build_ns - started_ns) / 1e6,
+            "write_ms": (write_ns - build_ns) / 1e6,
+        }
 
     async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
         try:

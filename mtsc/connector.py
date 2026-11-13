@@ -168,7 +168,9 @@ class MTSCConnector(KVConnectorBase_V1, SupportsHMA):
         self.worker.start_load_kv(metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        return
+        assert self.worker is not None
+        # Bounded wait for this step's Store loads; see MTSCWorker.
+        self.worker.wait_for_pool_load()
 
     def save_kv_layer(
         self,

@@ -12,7 +12,13 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 
-from .kv_cache_pool import LoadEvent, LoadResult, MooncakeKVCachePool, SaveEvent
+from .kv_cache_pool import (
+    LoadEvent,
+    LoadResult,
+    MooncakeKVCachePool,
+    SaveEvent,
+    SaveResult,
+)
 from .kv_transfer import MooncakeKVTransfer, RecvEvent, SendEvent, TransferResult
 from .protocol import (
     FinishedWait,
@@ -98,6 +104,26 @@ class MTSCWorker:
         self._load_errors: set[int] = set()
         self._worker_rank = config.parallel_config.rank
         self._completed_load_reports: list[MTSCLoadReport] = []
+        # Loads harvested in start_load_kv() are reported on the next
+        # get_finished(), so the same result is never reported twice.  Save
+        # completions picked up by that early poll are carried over as well.
+        self._early_finished_recv: set[str] = set()
+        self._early_saves: list[SaveResult] = []
+        # Requests whose Store load was submitted this step.  vLLM parks such a
+        # request in WAITING_FOR_REMOTE_KVS until get_finished() reports it,
+        # i.e. at least one step later; waiting for it inside the step keeps the
+        # request runnable now.
+        extra = config.kv_transfer_config.kv_connector_extra_config
+        try:
+            # Default off: blocking the forward for the Store load removes the
+            # cross-step wait but does not help end to end at c10 (measured),
+            # because the queue in front of P absorbs it.
+            self._load_wait_timeout = max(
+                0.0, float(extra.get("mtsc_wait_pool_load_seconds", 0.0))
+            )
+        except (TypeError, ValueError):
+            self._load_wait_timeout = 0.0
+        self._load_wait_ids: set[str] = set()
         self._closed = False
 
     def register_kv_caches(
@@ -354,7 +380,45 @@ class MTSCWorker:
 
         # A Store miss can request P immediately; Store hits wait for poll()
         # to establish the actual loaded prefix before requesting the suffix.
+        # Harvest whatever already completed so that pull starts in this step
+        # instead of at the next get_finished() boundary.
+        early = self.pool.poll()
+        if early.loads:
+            self._early_finished_recv.update(
+                self._aggregate_recv_finished(early.loads, [])
+            )
+        if early.saves:
+            self._early_saves.extend(early.saves)
+        self._load_wait_ids = {meta.request_id for meta in metadata.pool_loads}
         self._advance_transfers({})
+
+    def wait_for_pool_load(self) -> None:
+        """Block (bounded) until this step's Store loads are in the pool.
+
+        vLLM keeps a request in WAITING_FOR_REMOTE_KVS until ``get_finished()``
+        reports its load, so without this the request costs at least one extra
+        step of latency and occupies an in-flight slot while doing nothing.
+        The wait is capped by ``mtsc_wait_pool_load_seconds`` (0 disables) so a
+        slow Store can never stall the forward.
+        """
+        if not self._load_wait_ids or self._load_wait_timeout <= 0.0:
+            self._load_wait_ids.clear()
+            return
+        deadline = time.monotonic() + self._load_wait_timeout
+        while self._load_wait_ids & set(self._on_load_requests):
+            early = self.pool.poll()
+            if early.saves:
+                self._early_saves.extend(early.saves)
+            if early.loads:
+                self._early_finished_recv.update(
+                    self._aggregate_recv_finished(early.loads, [])
+                )
+            if not self._load_wait_ids & set(self._on_load_requests):
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.001)
+        self._load_wait_ids.clear()
 
     def update_save_metadata(self, metadata: MTSCConnectorMetadata) -> None:
         save_event = None
@@ -422,6 +486,9 @@ class MTSCWorker:
 
         # step 2 poll results
         pool_results = self.pool.poll()
+        if self._early_saves:
+            pool_results.saves.extend(self._early_saves)
+            self._early_saves.clear()
         load_errors_block_ids = self.pool.take_errors()
         transfer_results = self.transfer.poll()
         transfer_errors = self.transfer.take_errors()
@@ -437,6 +504,9 @@ class MTSCWorker:
         finished_recv = self._aggregate_recv_finished(
             pool_results.loads, transfer_results.recvs
         )
+        # Loads already harvested in start_load_kv() are reported here once.
+        finished_recv |= self._early_finished_recv
+        self._early_finished_recv.clear()
 
         # step4 process save and send
         finished_send = self._aggregate_send_finished(
